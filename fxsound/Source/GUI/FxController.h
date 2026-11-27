@@ -144,6 +144,11 @@ public:
     bool isNewOutputPrioritized();
     void setNewOutputPrioritized(bool prioritize_new_devices);
 
+	// BetterFxSound: additional outputs that play the processed sound together with the main output.
+	std::vector<AdditionalOutputConfig> getAdditionalOutputs();
+	void setAdditionalOutput(const String& device_id, bool enabled, int delay_ms);
+	void applyAdditionalOutputs();
+
 	FxThemeMode getThemeMode();
 	void setThemeMode(FxThemeMode mode);
 

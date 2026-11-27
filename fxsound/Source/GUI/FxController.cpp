@@ -20,6 +20,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
 #include "FxController.h"
+#include <algorithm>
 #include "FxMainWindow.h"
 #include "FxSystemTrayView.h"
 #include "FxMessage.h"
@@ -739,6 +740,7 @@ void FxController::init(FxMainWindow* main_window, FxSystemTrayView* system_tray
 		audio_passthru_->setDspProcessingModule(&dfx_dsp_);
 		output_devices_ = audio_passthru_->getSoundDevices(false);
 		initOutputs(output_devices_);
+		applyAdditionalOutputs();
 
 		if (!dfx_enabled_ && !SysInfo::isRemoteSession())
 		{
@@ -2825,6 +2827,71 @@ bool FxController::isNewOutputPrioritized()
 void FxController::setNewOutputPrioritized(bool prioritize)
 {
 	settings_.setBool("prioritize_new_output", prioritize);
+}
+
+// BetterFxSound: the additional outputs are stored as a JSON array of
+// { "id": <endpoint id>, "delay_ms": <0..500> } objects.
+std::vector<AdditionalOutputConfig> FxController::getAdditionalOutputs()
+{
+	std::vector<AdditionalOutputConfig> outputs;
+
+	auto json = settings_.getJson("additional_outputs");
+	if (auto* array = json.getArray())
+	{
+		for (auto& item : *array)
+		{
+			auto id = item.getProperty("id", "").toString();
+			if (id.isEmpty())
+				continue;
+
+			AdditionalOutputConfig output;
+			output.device_id = id.toWideCharPointer();
+			output.delay_ms = jlimit(0, 500, static_cast<int>(item.getProperty("delay_ms", 0)));
+			outputs.push_back(output);
+		}
+	}
+
+	return outputs;
+}
+
+void FxController::setAdditionalOutput(const String& device_id, bool enabled, int delay_ms)
+{
+	if (device_id.isEmpty())
+		return;
+
+	auto outputs = getAdditionalOutputs();
+	auto id = std::wstring(device_id.toWideCharPointer());
+
+	outputs.erase(std::remove_if(outputs.begin(), outputs.end(),
+		[&id](const AdditionalOutputConfig& output) { return output.device_id == id; }), outputs.end());
+
+	if (enabled)
+	{
+		AdditionalOutputConfig output;
+		output.device_id = id;
+		output.delay_ms = jlimit(0, 500, delay_ms);
+		outputs.push_back(output);
+	}
+
+	Array<var> array;
+	for (const auto& output : outputs)
+	{
+		auto* object = new DynamicObject();
+		object->setProperty("id", String(output.device_id.c_str()));
+		object->setProperty("delay_ms", output.delay_ms);
+		array.add(var(object));
+	}
+	settings_.setJson("additional_outputs", var(array));
+
+	applyAdditionalOutputs();
+}
+
+void FxController::applyAdditionalOutputs()
+{
+	if (audio_passthru_ != nullptr)
+	{
+		audio_passthru_->setAdditionalOutputs(getAdditionalOutputs());
+	}
 }
 
 FxThemeMode FxController::getThemeMode()

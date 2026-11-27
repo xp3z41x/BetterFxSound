@@ -124,6 +124,52 @@ private:
 		juce::Rectangle<float> output_preference_bounds_;
 	};
 
+	// BetterFxSound: choose additional outputs that play together with the main output.
+	class OutputsSettingsPane : public SettingsPane
+	{
+	public:
+		OutputsSettingsPane();
+		~OutputsSettingsPane() = default;
+
+		void resized() override;
+		void paint(Graphics& g) override;
+
+	private:
+		static constexpr int DESCRIPTION_Y = 40;
+		static constexpr int DESCRIPTION_HEIGHT = 100;
+		static constexpr int ROW_HEIGHT = 64;
+
+		class OutputRow : public Component
+		{
+		public:
+			OutputRow(const SoundDevice& device, bool is_main_output, bool enabled, int delay_ms);
+			~OutputRow() = default;
+
+			void resized() override;
+			void paint(Graphics& g) override;
+
+		private:
+			void updateDelayState();
+			void save();
+
+			String device_id_;
+			bool is_main_output_;
+			ToggleButton toggle_;
+			Label delay_label_;
+			Slider delay_slider_;
+		};
+
+		void visibilityChanged() override;
+		void rebuild();
+		void setText();
+
+		Label description_;
+		Label empty_label_;
+		Viewport viewport_;
+		Component rows_container_;
+		std::vector<std::unique_ptr<OutputRow>> rows_;
+	};
+
 	class GeneralSettingsPane : public SettingsPane
 	{
 	public:
@@ -206,11 +252,15 @@ private:
 		static constexpr int BUTTON_HEIGHT = 40;
 		static constexpr int SEPARATOR_X = 152;
 
+		void showPane(Button* button);
+
 		std::unique_ptr<SettingsButton> audio_button_;
+		std::unique_ptr<SettingsButton> outputs_button_;
 		std::unique_ptr<SettingsButton> general_button_;
 		std::unique_ptr<SettingsButton> help_button_;
 
 		AudioSettingsPane audio_settings_pane_;
+		OutputsSettingsPane outputs_settings_pane_;
 		GeneralSettingsPane general_settings_pane_;
 		HelpSettingsPane help_settings_pane_;
 	};

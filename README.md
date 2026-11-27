@@ -1,3 +1,15 @@
+# BetterFxSound
+
+BetterFxSound is an **unofficial fork** of [FxSound](https://github.com/fxsound2/fxsound-app). It is not made, endorsed or supported by FxSound LLC. "FxSound" is used here only to say where the code comes from.
+
+What BetterFxSound adds:
+
+* **Multiple simultaneous outputs.** Play the enhanced sound on two or more devices at the same time (for example speakers and headphones). Choose them in Settings > Outputs. The main output works as before; each additional output gets its own delay slider (0 to 500 ms) to line the devices up, and its clock drift is corrected automatically so the devices stay in sync.
+
+BetterFxSound is distributed under the same license as FxSound, the GNU Affero General Public License v3 (see [LICENSE](LICENSE)). Files changed or added by BetterFxSound say so in their headers.
+
+---
+
 # FxSound
 
 FxSound is a digital audio program built for Windows PC's. The background processing, built on a high-fidelity audio engine, acts as a sort of digital soundcard for your system. This means that your signals will have the clean passthrough when FxSound is active. There are active effects for shaping and boosting your sound's volume, timbre, and equalization included on top of this clean processing, allowing you to customize and enhance your sound.
