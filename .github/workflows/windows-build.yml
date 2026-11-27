@@ -26,22 +26,8 @@ jobs:
         shell: pwsh
         run: git clone --depth 1 --branch 9.0.5 https://github.com/juce-framework/JUCE.git C:\JUCE
 
+      # The projects use the VS 2026 toolset (v145), which windows-latest provides.
       - uses: microsoft/setup-msbuild@v2
-
-      # The projects target the VS 2026 toolset (v145). Fall back to the
-      # newest installed toolset if the runner image does not have it yet.
-      - name: Pick platform toolset
-        id: toolset
-        shell: pwsh
-        run: |
-          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
-          Write-Host "Visual Studio: $vs"
-          $toolsets = Get-ChildItem "$vs\MSBuild\Microsoft\VC\*\Platforms\x64\PlatformToolsets" -Directory -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name | Sort-Object -Unique
-          Write-Host "Toolsets: $($toolsets -join ', ')"
-          $pick = @('v145','v143') | Where-Object { $toolsets -contains $_ } | Select-Object -First 1
-          if (-not $pick) { $pick = ($toolsets | Where-Object { $_ -match '^v\d+$' } | Sort-Object | Select-Object -Last 1) }
-          Write-Host "Using $pick"
-          "toolset=$pick" >> $env:GITHUB_OUTPUT
 
       - name: Build
         shell: pwsh
@@ -50,7 +36,6 @@ jobs:
           /m /nologo /v:minimal
           /p:Configuration=Release
           /p:Platform=${{ matrix.platform }}
-          /p:PlatformToolset=${{ steps.toolset.outputs.toolset }}
 
       - name: Collect binaries
         shell: pwsh
