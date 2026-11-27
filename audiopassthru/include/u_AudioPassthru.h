@@ -22,6 +22,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #endif //WIN32
 #include "AudioPassthru.h"
 #include "sndDevices.h"
+#include "MultiOutput.h"
 #include <Mmdeviceapi.h>
 #include <vector> 
 #include <map>
@@ -52,8 +53,11 @@ public:
     bool isPlaybackDeviceAvailable();
 	bool checkDeviceChanges();
 	void restoreDefaultPlaybackDevice();
+	void setAdditionalOutputs(const std::vector<AdditionalOutputConfig>& outputs);
 
 private:
+	void applyAdditionalOutputs();
+
 	int sndDeviceHandleToSoundDevices(bool active_devices = true);
 	static void onDeviceChange();
 
@@ -71,5 +75,9 @@ private:
 	bool mute_;
 	DfxDsp *p_dfx_dsp_;
 	static AudioPassthruCallback *s_callback_;
+
+	// BetterFxSound: additional outputs, as requested by the UI and as currently applied.
+	std::vector<AdditionalOutputConfig> additional_outputs_;
+	MultiOutputRouter multi_output_;
 };
 

@@ -54,6 +54,9 @@ AudioPassthruPrivate::~AudioPassthruPrivate()
 	if (hp_sndDevices_ == NULL)
 		return;
 
+	/* BetterFxSound: close the additional outputs first */
+	multi_output_.stopAll();
+
 	/* If the processing thread is running, kill it */
 	if (killProcessingThread(&i_timed_out) != OKAY)
 		return;
@@ -437,6 +440,9 @@ int AudioPassthruPrivate::processTimer()
 		if ((numRealDevices > 0) && (DfxDeviceEnabledFlag == IS_TRUE))
 		{
 			hProcessingThread_ = CreateThread(NULL, 0, processingThread, (LPVOID)this, 0L, &ProcessingThreadID_);
+
+			/* BetterFxSound: the main output may have changed, re-check the additional outputs against it */
+			applyAdditionalOutputs();
 		}
 		else
 		{
@@ -547,6 +553,16 @@ DWORD AudioPassthruPrivate::threadWorker(void)
 				p_dfx_dsp_->processAudio((short int *)fp_buffer, (short int *)fp_buffer, numSampleSets, i_check_for_duplicate_buffers);
 			}
 
+			/*
+			* BetterFxSound: queue the processed block for the additional outputs. This copies the
+			* data and never blocks, so it has to happen here, before sndDevicesDoPlayback() reuses
+			* the buffer for upsampling.
+			*/
+			if (!mute_)
+			{
+				multi_output_.write(fp_buffer, (UINT32)numSampleSets, pwfx->nChannels, pwfx->nSamplesPerSec);
+			}
+
 			/* Check if thread has been signaled to end */
 			if (i_kill_processing_thread_)
 				goto KillProcessingThread;
@@ -654,4 +670,46 @@ int AudioPassthruPrivate::setTargetedRealPlaybackDevice(const std::wstring sound
 		return(NOT_OKAY);
 
 	return(OKAY);
+}
+/*
+* FUNCTION: setAdditionalOutputs()
+* DESCRIPTION: BetterFxSound. Stores the additional outputs requested by the UI and applies them.
+*/
+void AudioPassthruPrivate::setAdditionalOutputs(const std::vector<AdditionalOutputConfig>& outputs)
+{
+	additional_outputs_ = outputs;
+	applyAdditionalOutputs();
+}
+
+/*
+* FUNCTION: applyAdditionalOutputs()
+* DESCRIPTION: BetterFxSound. Opens the requested additional outputs, leaving out the device that is
+* currently the main output (it already plays the audio) and the FxSound virtual device (playing
+* into it would feed the output back into the capture).
+*/
+void AudioPassthruPrivate::applyAdditionalOutputs()
+{
+	int i_resultFlag;
+	wchar_t wcp_targeted_guid[PT_MAX_GENERIC_STRLEN];
+	wchar_t wcp_dfx_guid[PT_MAX_GENERIC_STRLEN];
+
+	wcp_targeted_guid[0] = L'\0';
+	wcp_dfx_guid[0] = L'\0';
+
+	if (sndDevicesGetID(hp_sndDevices_, SND_DEVICES_TARGETED_REAL_PLAYBACK, wcp_targeted_guid, &i_resultFlag) != OKAY)
+		wcp_targeted_guid[0] = L'\0';
+	if (sndDevicesGetID(hp_sndDevices_, SND_DEVICES_VIRTUAL_PLAYBACK_DFX, wcp_dfx_guid, &i_resultFlag) != OKAY)
+		wcp_dfx_guid[0] = L'\0';
+
+	std::vector<AdditionalOutputConfig> effective;
+	for (const auto& output : additional_outputs_)
+	{
+		if (output.device_id.empty())
+			continue;
+		if (output.device_id == wcp_targeted_guid || output.device_id == wcp_dfx_guid)
+			continue;
+		effective.push_back(output);
+	}
+
+	multi_output_.configure(effective);
 }

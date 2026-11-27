@@ -27,6 +27,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #endif //WIN32
 #include <Mmdeviceapi.h>
 #include <vector> 
+#include <string>
 #include "DfxDsp.h"
 
 struct SoundDevice {
@@ -52,6 +53,13 @@ struct SoundDevice {
 	int deviceNumChannel; // Number of channels for all devices.
 };
 
+// BetterFxSound: an additional output device that plays the processed audio at the same
+// time as the main output.
+struct AdditionalOutputConfig {
+	std::wstring device_id;	// Endpoint ID string, same as SoundDevice::pwszID
+	int delay_ms = 0;		// Extra delay for this output, 0 to 500 ms, used to line it up with the others
+};
+
 class AudioPassthruCallback
 {
 public:
@@ -75,6 +83,9 @@ public:
     bool isPlaybackDeviceAvailable();
 	bool checkDeviceChanges();
 	void restoreDefaultPlaybackDevice();
+	// BetterFxSound: sets the additional output devices. The main output and the FxSound
+	// virtual device are ignored if they appear in the list.
+	void setAdditionalOutputs(const std::vector<AdditionalOutputConfig>& outputs);
 
 private:
 	AudioPassthruPrivate *data_;

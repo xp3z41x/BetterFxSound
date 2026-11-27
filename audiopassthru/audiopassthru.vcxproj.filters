@@ -108,6 +108,9 @@
     <ClCompile Include="src\sndDevices\sndDevicesDoPlayback.cpp">
       <Filter>Source Files\ptutil\sndDevices</Filter>
     </ClCompile>
+    <ClCompile Include="src\MultiOutput\MultiOutput.cpp">
+      <Filter>Source Files\ptutil\sndDevices</Filter>
+    </ClCompile>
     <ClCompile Include="src\sndDevices\sndDevicesGet.cpp">
       <Filter>Source Files\ptutil\sndDevices</Filter>
     </ClCompile>
