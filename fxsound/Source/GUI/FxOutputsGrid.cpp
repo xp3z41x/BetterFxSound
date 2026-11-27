@@ -37,7 +37,7 @@ namespace
 // FxOutputSettingsPanel
 //==============================================================================
 FxOutputSettingsPanel::FxOutputSettingsPanel(const FxController::OutputState& output) :
-	output_(output)
+	output_(output), tooltip_window_(this)
 {
 	title_.setText(output_.name, NotificationType::dontSendNotification);
 	title_.setJustificationType(Justification::centredLeft);
@@ -57,7 +57,10 @@ FxOutputSettingsPanel::FxOutputSettingsPanel(const FxController::OutputState& ou
 	};
 
 	delay_label_.setText(TRANS("Delay"), NotificationType::dontSendNotification);
-	setupSlider(delay_slider_, 500.0, 5.0, " ms");
+	// 1 ms steps: delays come from the microphone sync to the millisecond (12, 69, 185...). A
+	// coarser step would show a rounded value and, as the panel saves the shown value when it
+	// closes, overwrite the measured delay just by opening and closing the panel.
+	setupSlider(delay_slider_, 500.0, 1.0, " ms");
 	delay_slider_.setValue(output_.delay_ms, NotificationType::dontSendNotification);
 	delay_slider_.setDoubleClickReturnValue(true, 0.0);
 	delay_slider_.setTooltip(TRANS("Delays this output to line it up with the others"));
