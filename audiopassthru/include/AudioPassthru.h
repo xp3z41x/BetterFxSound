@@ -55,9 +55,18 @@ struct SoundDevice {
 
 // BetterFxSound: an additional output device that plays the processed audio at the same
 // time as the main output.
+// Which part of the stereo image an additional output plays.
+enum class OutputChannelMode {
+	Both = 0,	// All channels, unchanged
+	Left = 1,	// Front left on every channel of this output
+	Right = 2,	// Front right on every channel of this output
+	Mono = 3	// (Left + Right) / 2 on every channel of this output
+};
+
 struct AdditionalOutputConfig {
 	std::wstring device_id;	// Endpoint ID string, same as SoundDevice::pwszID
 	int delay_ms = 0;		// Extra delay for this output, 0 to 500 ms, used to line it up with the others
+	OutputChannelMode channel_mode = OutputChannelMode::Both;
 };
 
 class AudioPassthruCallback

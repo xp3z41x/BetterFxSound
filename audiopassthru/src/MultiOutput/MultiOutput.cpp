@@ -88,10 +88,11 @@ public:
 	static constexpr DWORD kRetryMs = 1000;                   // Retry interval when the device is missing
 	static constexpr DWORD kIdleStopMs = 2000;                // Stop the stream after this much silence
 
-	SecondaryOutput(const std::wstring& device_id, int delay_ms)
+	SecondaryOutput(const std::wstring& device_id, int delay_ms, OutputChannelMode channel_mode)
 		: device_id_(device_id), ring_(static_cast<size_t>(kRingFrames) * kMaxChannels, 0.0f)
 	{
 		setDelayMs(delay_ms);
+		setChannelMode(channel_mode);
 		stop_event_ = CreateEvent(NULL, FALSE, FALSE, NULL);
 		audio_event_ = CreateEvent(NULL, FALSE, FALSE, NULL);
 		if (stop_event_ != NULL && audio_event_ != NULL)
@@ -129,6 +130,11 @@ public:
 		delay_ms_.store(delay_ms, std::memory_order_relaxed);
 	}
 
+	void setChannelMode(OutputChannelMode mode)
+	{
+		channel_mode_.store(static_cast<int>(mode), std::memory_order_relaxed);
+	}
+
 	// Audio thread. Never blocks.
 	void write(const float* data, UINT32 frames, UINT32 channels, UINT32 sample_rate)
 	{
@@ -153,9 +159,31 @@ public:
 		const UINT32 free_frames = kRingFrames - (w - r);
 		const UINT32 n = frames < free_frames ? frames : free_frames;
 
+		const OutputChannelMode mode = static_cast<OutputChannelMode>(channel_mode_.load(std::memory_order_relaxed));
+
 		for (UINT32 i = 0; i < n; i++)
 		{
-			std::memcpy(&ring_[static_cast<size_t>((w + i) & kRingMask) * kMaxChannels], data + static_cast<size_t>(i) * channels, channels * sizeof(float));
+			float* dst = &ring_[static_cast<size_t>((w + i) & kRingMask) * kMaxChannels];
+			const float* src = data + static_cast<size_t>(i) * channels;
+
+			if (mode == OutputChannelMode::Both || channels < 2)
+			{
+				std::memcpy(dst, src, channels * sizeof(float));
+			}
+			else
+			{
+				// Channel 0 is front left and channel 1 is front right in every WAVEFORMATEXTENSIBLE layout.
+				float value;
+				if (mode == OutputChannelMode::Left)
+					value = src[0];
+				else if (mode == OutputChannelMode::Right)
+					value = src[1];
+				else
+					value = 0.5f * (src[0] + src[1]);
+
+				for (UINT32 c = 0; c < channels; c++)
+					dst[c] = value;
+			}
 		}
 		write_pos_.store(w + n, std::memory_order_release);
 	}
@@ -461,6 +489,7 @@ private:
 
 	const std::wstring device_id_;
 	std::atomic<int> delay_ms_{ 0 };
+	std::atomic<int> channel_mode_{ 0 };
 
 	// Ring buffer, frames are stored with a fixed stride of kMaxChannels floats.
 	std::vector<float> ring_;
@@ -532,9 +561,14 @@ void MultiOutputRouter::configure(const std::vector<AdditionalOutputConfig>& out
 		}
 
 		if (output != nullptr)
+		{
 			output->setDelayMs(config.delay_ms);
+			output->setChannelMode(config.channel_mode);
+		}
 		else
-			output.reset(new SecondaryOutput(config.device_id, config.delay_ms));
+		{
+			output.reset(new SecondaryOutput(config.device_id, config.delay_ms, config.channel_mode));
+		}
 
 		next.push_back(std::move(output));
 	}

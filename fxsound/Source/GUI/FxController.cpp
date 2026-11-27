@@ -2847,6 +2847,7 @@ std::vector<AdditionalOutputConfig> FxController::getAdditionalOutputs()
 			AdditionalOutputConfig output;
 			output.device_id = id.toWideCharPointer();
 			output.delay_ms = jlimit(0, 500, static_cast<int>(item.getProperty("delay_ms", 0)));
+			output.channel_mode = static_cast<OutputChannelMode>(jlimit(0, 3, static_cast<int>(item.getProperty("channel_mode", 0))));
 			outputs.push_back(output);
 		}
 	}
@@ -2862,6 +2863,14 @@ void FxController::setAdditionalOutput(const String& device_id, bool enabled, in
 	auto outputs = getAdditionalOutputs();
 	auto id = std::wstring(device_id.toWideCharPointer());
 
+	// Keep the channel mode the output already had.
+	auto channel_mode = OutputChannelMode::Both;
+	for (const auto& output : outputs)
+	{
+		if (output.device_id == id)
+			channel_mode = output.channel_mode;
+	}
+
 	outputs.erase(std::remove_if(outputs.begin(), outputs.end(),
 		[&id](const AdditionalOutputConfig& output) { return output.device_id == id; }), outputs.end());
 
@@ -2870,6 +2879,7 @@ void FxController::setAdditionalOutput(const String& device_id, bool enabled, in
 		AdditionalOutputConfig output;
 		output.device_id = id;
 		output.delay_ms = jlimit(0, 500, delay_ms);
+		output.channel_mode = channel_mode;
 		outputs.push_back(output);
 	}
 
@@ -2879,6 +2889,7 @@ void FxController::setAdditionalOutput(const String& device_id, bool enabled, in
 		auto* object = new DynamicObject();
 		object->setProperty("id", String(output.device_id.c_str()));
 		object->setProperty("delay_ms", output.delay_ms);
+		object->setProperty("channel_mode", static_cast<int>(output.channel_mode));
 		array.add(var(object));
 	}
 	settings_.setJson("additional_outputs", var(array));
