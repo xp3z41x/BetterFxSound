@@ -25,6 +25,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include <Audioclient.h>
 #include <Functiondiscoverykeys_devpkey.h>
 #include <endpointvolume.h>
+#include <atomic>
 #include "slout.h"
 
 #define PT_MAX_GENERIC_STRLEN          512
@@ -440,9 +441,11 @@ struct sndDevicesHdlType {
 	// BetterFxSound: the last level and mute this app set on the playback device, and when (GetTickCount()). Some
 	// drivers (Bluetooth with absolute volume) report such a change back a second time, without this app's event
 	// context; the playback volume callback must not take that for the user's own setting.
-	float engineSetPlaybackLevel;
-	BOOL engineSetPlaybackMute;
-	DWORD engineSetPlaybackTick;
+	// Written on the message thread, read on the COM thread that delivers the callback: atomics, the tick written
+	// last and read first.
+	std::atomic<float> engineSetPlaybackLevel;
+	std::atomic<BOOL> engineSetPlaybackMute;
+	std::atomic<DWORD> engineSetPlaybackTick;
 
 	int noBufferCount;			// This is a count of how many times no buffers were available in a DoRecording call.
 	int WindowsSilentBufferCount;				// This is a buffer specified by the Windows flag to be all zeros.

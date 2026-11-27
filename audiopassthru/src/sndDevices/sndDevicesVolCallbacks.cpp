@@ -227,10 +227,11 @@ HRESULT STDMETHODCALLTYPE CsndDevicesAudioEndpointVolumeCallbackPlayback::OnNoti
 	// BetterFxSound: a driver reporting back, without this app's event context, the level and mute this app has
 	// just set (Bluetooth devices with absolute volume do): not a change the user made.
 	{
-		const float levelDiff = pNotify->fMasterVolume - cast_handle->engineSetPlaybackLevel;
-		if( (GetTickCount() - cast_handle->engineSetPlaybackTick) < 3000 &&
+		const DWORD sinceEngineSet = GetTickCount() - cast_handle->engineSetPlaybackTick.load();
+		const float levelDiff = pNotify->fMasterVolume - cast_handle->engineSetPlaybackLevel.load();
+		if( (sinceEngineSet < 3000) &&
 			 (levelDiff < 0.01f) && (levelDiff > -0.01f) &&
-			 ((pNotify->bMuted != FALSE) == (cast_handle->engineSetPlaybackMute != FALSE)) )
+			 ((pNotify->bMuted != FALSE) == (cast_handle->engineSetPlaybackMute.load() != FALSE)) )
 			return S_OK;
 	}
 
