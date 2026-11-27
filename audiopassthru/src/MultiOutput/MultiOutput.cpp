@@ -489,7 +489,7 @@ private:
 
 		if (underflow)
 		{
-			// Ran dry (the main output stopped, or audio was paused). Pad with silence and
+			// Ran dry (the carrier stopped, or audio was paused). Pad with silence and
 			// wait for the buffer to fill to the target again.
 			std::memset(out + static_cast<size_t>(produced) * channels_, 0, static_cast<size_t>(space - produced) * channels_ * sizeof(float));
 			primed_ = false;
