@@ -1585,8 +1585,6 @@ void FxController::initOutputs(std::vector<SoundDevice>& sound_devices)
 	if (current != nullptr)
 	{
 		carrier_id_ = current->pwszID.c_str();
-		output_device_name_ = current->deviceFriendlyName.c_str();
-		elected_carrier_id_ = carrier_id_;
 	}
 
 	// Leaves the engine's legacy mode: from now on it plays exactly this set.
@@ -1789,10 +1787,21 @@ void FxController::syncOutputsWhileOff(std::vector<SoundDevice>& sound_devices, 
 		notifyOutputsChanged();
 	}
 
-	// Processing was stopped because no output device was present: start again now that one is.
+	// Processing was stopped because no output device was present: start again now that one is. This runs
+	// on the device notification thread (IMMNotificationClient), so the restart goes to the message thread.
 	if (no_output_ && !active_output_devices_.empty() && FxModel::getModel().getPowerState())
 	{
-		powerOn(true);
+		MessageManager::callAsync([this]() {
+			bool restart;
+			{
+				ScopedLock auto_lock(lock_);
+				restart = no_output_ && !active_output_devices_.empty() && !isTimerRunning();
+			}
+			if (restart && FxModel::getModel().getPowerState())
+			{
+				powerOn(true);
+			}
+		});
 	}
 }
 
@@ -2793,6 +2802,14 @@ void FxController::refreshOutputList()
 
 const String& FxController::getOutputName()
 {
+	ScopedLock auto_lock(lock_);
+
+	output_device_name_ = String();
+	if (auto* entry = findOutputEntry(getSoleEnabledOutputId()))
+	{
+		auto* device = findActiveOutput(entry->id);
+		output_device_name_ = device != nullptr ? String(device->deviceFriendlyName.c_str()) : entry->name;
+	}
 	return output_device_name_;
 }
 
@@ -3179,8 +3196,10 @@ void FxController::loadOutputSettings(const std::vector<SoundDevice>& sound_devi
 	}
 
 	bool save = false;
+	bool main_pending = false;	// The old main output could not be resolved: keep its keys for a later run
+	const bool has_outputs = settings_.containsKey("outputs");
 
-	if (settings_.containsKey("outputs"))
+	if (has_outputs)
 	{
 		auto json = settings_.getJson("outputs");
 		if (auto* array = json.getArray())
@@ -3189,10 +3208,13 @@ void FxController::loadOutputSettings(const std::vector<SoundDevice>& sound_devi
 				addEntry(readEntry(item, false));
 		}
 	}
-	else if (has_legacy)
+
+	if (has_legacy)
 	{
 		// One-time migration. The old main output becomes an enabled output with its delay and channel
-		// mode; the old additional outputs (the list only held enabled ones) keep their settings.
+		// mode; the old additional outputs (the list only held enabled ones) keep their settings. If the main
+		// output can't be resolved to a device id, its keys stay and every start tries again (with "outputs"
+		// already there, only the main output is added, and only if that device has no entry yet).
 		auto main_name = settings_.getString("output_device_name");
 		if (main_name.isNotEmpty())
 		{
@@ -3214,6 +3236,9 @@ void FxController::loadOutputSettings(const std::vector<SoundDevice>& sound_devi
 
 			if (main_id.isNotEmpty())
 			{
+				if (has_outputs && findOutputEntry(main_id) == nullptr)
+					logMessage("Outputs migration: output \"" + main_name + "\" resolved on a later start, added");
+
 				OutputEntry entry;
 				entry.id = main_id;
 				entry.name = main_name;
@@ -3221,27 +3246,42 @@ void FxController::loadOutputSettings(const std::vector<SoundDevice>& sound_devi
 				entry.delay_ms = jlimit(0, 500, settings_.getInt("main_output_delay_ms", 0));
 				entry.channel_mode = toOutputChannelMode(settings_.getInt("main_output_channel_mode", 0));
 				addEntry(entry);
+				save = true;
 			}
 			else
 			{
-				logMessage("Outputs migration: output \"" + main_name + "\" not found, skipped");
+				main_pending = true;
+				logMessage("Outputs migration: output \"" + main_name + "\" not found, its settings are kept to try again on the next start");
 			}
 		}
 
-		auto json = settings_.getJson("additional_outputs");
-		if (auto* array = json.getArray())
+		if (!has_outputs)
 		{
-			for (auto& item : *array)
+			auto json = settings_.getJson("additional_outputs");
+			if (auto* array = json.getArray())
 			{
-				auto entry = readEntry(item, true);
-				entry.enabled = true;
-				entry.name = realDeviceName(entry.id);
-				addEntry(entry);
+				for (auto& item : *array)
+				{
+					auto entry = readEntry(item, true);
+					entry.enabled = true;
+					entry.name = realDeviceName(entry.id);
+					addEntry(entry);
+				}
 			}
-		}
 
-		save = true;
-		logMessage("Outputs migrated from the main/additional output settings: " + String((int)output_entries_.size()) + " output(s)");
+			save = true;
+			logMessage("Outputs migrated from the main/additional output settings: " + String((int)output_entries_.size()) + " output(s)");
+
+			// Kept as migrated even if none of them is connected: the outputs stay silent and the UI shows its notice.
+			bool any_connected = false;
+			for (auto& entry : output_entries_)
+			{
+				if (entry.enabled && findActiveOutput(entry.id) != nullptr)
+					any_connected = true;
+			}
+			if (!output_entries_.empty() && !any_connected)
+				logMessage("Outputs migration: none of the migrated outputs is connected, silent until one is connected or turned on");
+		}
 	}
 
 	if (output_entries_.empty() && !settings_.containsKey("outputs"))
@@ -3274,6 +3314,9 @@ void FxController::loadOutputSettings(const std::vector<SoundDevice>& sound_devi
 
 	for (auto* key : legacy_keys)
 	{
+		// While the old main output is unresolved, its three keys stay (additional_outputs is migrated already).
+		if (main_pending && String(key) != "additional_outputs")
+			continue;
 		if (settings_.containsKey(key))
 			settings_.removeValue(key);
 	}
@@ -3383,8 +3426,18 @@ SoundDevice FxController::electCarrier()
 
 	if (!candidates.empty())
 	{
+		no_enabled_output_present_ = false;
 		sortByDeviceConfigPriority(candidates);
 		return candidates.front();
+	}
+
+	// Owner's decision: no enabled output is connected (none enabled, or the enabled ones are unplugged)
+	// means silence with a notice in the UI, never a fallback to another device. The carrier stays where
+	// the engine put it, so there is no new switch request and nothing can loop: it only plays silence.
+	if (!no_enabled_output_present_)
+	{
+		no_enabled_output_present_ = true;
+		logMessage("No enabled output is connected: silent until one is connected or turned on");
 	}
 
 	if (auto* current = findActiveOutput(carrier_id_))
@@ -3420,31 +3473,47 @@ void FxController::requestCarrier(const SoundDevice& device)
 		audio_passthru_->setAsPlaybackDevice(device);
 		requested_carrier_id_ = id;
 		output_changed_ = true;
+		logMessage("Carrier: " + name);
 	}
 
+	// No preset change here: the carrier is internal, a re-election never replaces the user's preset.
 	carrier_id_ = id;
-	output_device_name_ = name;
+}
 
-	if (id != elected_carrier_id_)
+String FxController::getSoleEnabledOutputId()
+{
+	String sole_id;
+	for (auto& entry : output_entries_)
 	{
-		elected_carrier_id_ = id;
-
-		// The preset chosen for this device in Output preferences, as when it was selected as the output.
-		// Not for a carrier that only plays silence.
-		auto* entry = findOutputEntry(id);
-		if (entry != nullptr && entry->enabled)
-		{
-			auto device_config = DeviceConfig::getDeviceConfig(settings_, name);
-			if (device_config.preset.isNotEmpty())
-			{
-				setPreset(device_config.preset, false);
-				if (FxModel::getModel().getPowerState())
-				{
-					FxModel::getModel().pushMessage(TRANS("Preset: ") + device_config.preset);
-				}
-			}
-		}
+		if (!entry.enabled)
+			continue;
+		if (sole_id.isNotEmpty())
+			return {};
+		sole_id = entry.id;
 	}
+	return sole_id;
+}
+
+// The preset chosen for a device in Output preferences is applied when the user's action (a checkbox,
+// the "next output" hotkey, --output) leaves exactly that device enabled, and it was not already the only
+// one. Returns the preset applied, or an empty string.
+String FxController::applySoleOutputPreset(const String& previous_sole_id)
+{
+	auto sole_id = getSoleEnabledOutputId();
+	if (sole_id.isEmpty() || sole_id == previous_sole_id)
+		return {};
+
+	String name;
+	if (auto* device = findActiveOutput(sole_id))
+		name = device->deviceFriendlyName.c_str();
+	else if (auto* entry = findOutputEntry(sole_id))
+		name = entry->name;
+
+	auto device_config = DeviceConfig::getDeviceConfig(settings_, name);
+	if (device_config.preset.isEmpty() || !setPreset(device_config.preset, false))
+		return {};
+
+	return device_config.preset;
 }
 
 void FxController::pushOutputsToEngine()
@@ -3501,9 +3570,13 @@ void FxController::enableNextOutput()
 		next_name = next.deviceFriendlyName.c_str();
 	}
 
-	if (enableOnlyOutput(next_id))
+	String applied_preset;
+	if (enableOnlyOutput(next_id, &applied_preset))
 	{
-		FxModel::getModel().pushMessage(TRANS("Output: ") + next_name);
+		String message = TRANS("Output: ") + next_name;
+		if (applied_preset.isNotEmpty() && FxModel::getModel().getPowerState())
+			message += "\n" + TRANS("Preset: ") + applied_preset;
+		FxModel::getModel().pushMessage(message);
 	}
 }
 
@@ -3557,12 +3630,21 @@ void FxController::setOutputEnabled(const String& id, bool enabled)
 	if (findOutputEntry(id) == nullptr && (!enabled || findActiveOutput(id) == nullptr))
 		return;
 
+	auto previous_sole_id = getSoleEnabledOutputId();
+
 	auto& entry = getOutputEntry(id);
 	if (entry.enabled == enabled)
 		return;
 
 	entry.enabled = enabled;
 	saveOutputSettings();
+
+	// Just one output left on: its device preset, if it has one.
+	auto applied_preset = applySoleOutputPreset(previous_sole_id);
+	if (applied_preset.isNotEmpty() && FxModel::getModel().getPowerState())
+	{
+		FxModel::getModel().pushMessage(TRANS("Preset: ") + applied_preset);
+	}
 
 	// The lost HDMI output was turned off: stop waiting for it.
 	if (hdmi_reconnect_pending_ && !enabled && id == failover_output_id_)
@@ -3653,10 +3735,25 @@ int FxController::getEnabledOutputCount()
 
 bool FxController::enableOnlyOutput(const String& id)
 {
+	String applied_preset;
+	if (!enableOnlyOutput(id, &applied_preset))
+		return false;
+
+	if (applied_preset.isNotEmpty() && FxModel::getModel().getPowerState())
+	{
+		FxModel::getModel().pushMessage(TRANS("Preset: ") + applied_preset);
+	}
+	return true;
+}
+
+bool FxController::enableOnlyOutput(const String& id, String* applied_preset)
+{
 	ScopedLock auto_lock(lock_);
 
 	if (findActiveOutput(id) == nullptr)
 		return false;
+
+	auto previous_sole_id = getSoleEnabledOutputId();
 
 	getOutputEntry(id);
 	for (auto& entry : output_entries_)
@@ -3664,6 +3761,10 @@ bool FxController::enableOnlyOutput(const String& id)
 		entry.enabled = (entry.id == id);
 	}
 	saveOutputSettings();
+
+	auto preset = applySoleOutputPreset(previous_sole_id);
+	if (applied_preset != nullptr)
+		*applied_preset = preset;
 
 	// An explicit choice ends any wait for a lost HDMI output.
 	if (hdmi_reconnect_pending_)
