@@ -38,9 +38,9 @@ void applyOutputChannelMode(float* buffer, UINT32 frames, UINT32 channels, Outpu
 /*
  * Fans the processed audio out to any number of additional ("secondary") output devices.
  *
- * The main output keeps working exactly as before and stays the clock master. Every
- * secondary output owns a ring buffer and its own event driven WASAPI render thread, so
- * a slow or failing secondary device can never stall the main output. Each secondary
+ * The carrier output (the original low latency path) keeps working as before and stays the
+ * clock master. Every secondary output owns a ring buffer and its own event driven WASAPI
+ * render thread, so a slow or failing secondary device can never stall the carrier. Each secondary
  * output compensates its own clock drift with an adaptive resampler.
  *
  * Threading:
@@ -63,7 +63,7 @@ public:
 
 	// Audio thread: queues one block of processed, interleaved 32 bit float audio.
 	// solo_index >= 0: only that output gets the audio, the others get silence.
-	// solo_index == -1: every output here gets silence (the main output is being measured).
+	// solo_index == -1: every output here gets silence (the carrier output is being measured).
 	// Any other negative value: normal operation.
 	void write(const float* data, UINT32 frames, UINT32 channels, UINT32 sample_rate, int solo_index);
 

@@ -151,3 +151,14 @@ void FxSound::Settings::setJson(juce::StringRef key, const juce::var& json) noex
 {
 	user_settings_->setValue(key, juce::JSON::toString(json));
 }
+
+bool FxSound::Settings::containsKey(juce::StringRef key) noexcept
+{
+	return user_settings_ != nullptr && user_settings_->containsKey(key);
+}
+
+void FxSound::Settings::removeValue(juce::StringRef key) noexcept
+{
+	if (user_settings_ != nullptr)
+		user_settings_->removeValue(key);
+}

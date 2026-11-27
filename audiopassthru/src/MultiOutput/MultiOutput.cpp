@@ -31,6 +31,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include <vector>
 
 #include "MultiOutput.h"
+#include "MasterVolume.h"
 
 namespace
 {
@@ -92,7 +93,8 @@ public:
 		: device_id_(config.device_id), ring_(static_cast<size_t>(kRingFrames) * kMaxChannels, 0.0f)
 	{
 		applyConfig(config);
-		current_gain_ = target_gain_.load(std::memory_order_relaxed);
+		// Fade in from silence: the master volume is applied on top of the trim.
+		current_gain_ = 0.0f;
 		stop_event_ = CreateEvent(NULL, FALSE, FALSE, NULL);
 		audio_event_ = CreateEvent(NULL, FALSE, FALSE, NULL);
 		if (stop_event_ != NULL && audio_event_ != NULL)
@@ -137,11 +139,7 @@ public:
 
 	void setVolumePercent(int percent)
 	{
-		if (percent < 0) percent = 0;
-		if (percent > 100) percent = 100;
-		// Squared curve so the slider feels even: 50% is about -12 dB.
-		const float level = static_cast<float>(percent) / 100.0f;
-		target_gain_.store(level * level, std::memory_order_relaxed);
+		target_gain_.store(outputTrimGain(percent), std::memory_order_relaxed);
 	}
 
 	void applyConfig(const AdditionalOutputConfig& config)
@@ -451,7 +449,8 @@ private:
 
 		float* out = reinterpret_cast<float*>(buffer);
 		UINT32 produced = 0;
-		const float gain_target = target_gain_.load(std::memory_order_relaxed);
+		// This output's own trim times the Windows master volume (level and mute), see MasterVolume.h.
+		const float gain_target = target_gain_.load(std::memory_order_relaxed) * masterVolumeGain();
 		const float gain_step = static_cast<float>(1.0 / (0.01 * rate)); // One-pole ramp, ~10 ms
 		bool underflow = false;
 
@@ -470,7 +469,7 @@ private:
 				break;
 
 			// Volume changes are ramped over about 10 ms so they do not click.
-			current_gain_ += (gain_target - current_gain_) * gain_step;
+			current_gain_ = rampGain(current_gain_, gain_target, gain_step);
 			const float gain = current_gain_;
 
 			const float t = static_cast<float>(frac_);
@@ -544,7 +543,7 @@ private:
 	double frac_ = 3.0;
 	double ratio_ = 1.0;
 	double error_avg_ = 0.0;
-	float current_gain_ = 1.0f;
+	float current_gain_ = 0.0f;
 };
 
 void applyOutputChannelMode(float* buffer, UINT32 frames, UINT32 channels, OutputChannelMode mode)

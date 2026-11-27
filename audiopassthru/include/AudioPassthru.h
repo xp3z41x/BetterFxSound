@@ -70,6 +70,17 @@ struct AdditionalOutputConfig {
 	int volume_percent = 100;	// Volume of this output, 0 to 100
 };
 
+// BetterFxSound: one output in the set passed to AudioPassthru::setOutputs(), carrier included.
+// The level actually played is master_volume * (master_mute ? 0 : 1) * trim(volume_percent), where
+// the master volume and mute are the FxSound virtual device's (the Windows volume).
+struct OutputConfig {
+	std::wstring device_id;      // SoundDevice::pwszID
+	bool enabled = false;
+	int delay_ms = 0;            // 0..500
+	int volume_percent = 100;    // 0..100, trim on top of the master volume
+	OutputChannelMode channel_mode = OutputChannelMode::Both;
+};
+
 // BetterFxSound: result of the microphone delay measurement for one output.
 struct DelayCalibrationResult {
 	std::wstring device_id;
@@ -101,17 +112,18 @@ public:
     bool isPlaybackDeviceAvailable();
 	bool checkDeviceChanges();
 	void restoreDefaultPlaybackDevice();
-	// BetterFxSound: sets the additional output devices. The main output and the FxSound
-	// virtual device are ignored if they appear in the list.
-	void setAdditionalOutputs(const std::vector<AdditionalOutputConfig>& outputs);
-	// BetterFxSound: channel mode of the main output (Both keeps the original behaviour).
-	void setMainOutputChannelMode(OutputChannelMode mode);
-	// BetterFxSound: extra delay of the main output, 0 to 500 ms.
-	void setMainOutputDelay(int delay_ms);
+	// BetterFxSound: the whole desired set of outputs, carrier included. The carrier is still
+	// chosen with setAsPlaybackDevice(). If the carrier is missing from the list or is disabled,
+	// the carrier path plays silence; no reinit is needed. Every other enabled entry whose device
+	// is present plays through the additional outputs. The FxSound virtual device is always
+	// ignored. Zero enabled outputs means silence; processing keeps running.
+	void setOutputs(const std::vector<OutputConfig>& outputs);
 
-	// BetterFxSound: measures the delay of the main and the additional outputs with the
-	// default microphone. Runs in the background; poll getDelayCalibrationState().
-	// State: 0 idle, 1 running, 2 done, 3 failed.
+	// BetterFxSound: measures the delay of every enabled output that is present (the carrier
+	// only if it is enabled) with the default microphone. Runs in the background; poll
+	// getDelayCalibrationState(). State: 0 idle, 1 running, 2 done, 3 failed.
+	// Results have one entry per measured output, keyed by device_id, in no particular order.
+	// With no enabled output the measurement fails and getDelayCalibrationError() says why.
 	bool startDelayCalibration();
 	void cancelDelayCalibration();
 	int getDelayCalibrationState(int* progress_percent);

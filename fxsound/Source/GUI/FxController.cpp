@@ -140,6 +140,7 @@ FxController::FxController() : message_window_(L"FxSoundHotkeys", (WNDPROC)event
 
 	device_count_ = 0;
 	output_device_name_ = L"";
+	no_output_ = false;
 	clearOutputRestore();
 
 	audio_process_time_ = 0;
@@ -265,7 +266,8 @@ void FxController::initConfig(const String& commandline)
 
 	if (output_device.isNotEmpty())
 	{
-		setOutputName(output_device);
+		// Applied by initOutputs(), once the devices are known: enable only this output.
+		startup_output_name_ = output_device;
 	}
 
 	if (view.isNotEmpty())
@@ -462,13 +464,13 @@ void FxController::applyConfig(const String& commandline)
 
 	if (output_device.isNotEmpty())
 	{
-		setOutputName(output_device);
-		std::vector<SoundDevice> sound_devices = audio_passthru_->getSoundDevices();
-		for (auto& sound_device : sound_devices)
+		// BetterFxSound outputs rework: --output enables only this output.
+		for (auto& output : getOutputs())
 		{
-			if (output_device == sound_device.deviceFriendlyName.c_str())
+			if (output.present && output.name == output_device)
 			{
-				setOutput(sound_device.pwszID.c_str());
+				enableOnlyOutput(output.id);
+				break;
 			}
 		}
 	}
@@ -740,7 +742,6 @@ void FxController::init(FxMainWindow* main_window, FxSystemTrayView* system_tray
 		audio_passthru_->setDspProcessingModule(&dfx_dsp_);
 		output_devices_ = audio_passthru_->getSoundDevices(false);
 		initOutputs(output_devices_);
-		applyAdditionalOutputs();
 
 		if (!dfx_enabled_ && !SysInfo::isRemoteSession())
 		{
@@ -1122,99 +1123,6 @@ bool FxController::setPreset(int selected_index, bool notify)
 	return true;
 }
 
-void FxController::setOutput(const String output_device_id, bool notify)
-{
-	std::vector<SoundDevice> sound_devices = audio_passthru_->getSoundDevices();
-
-	bool output_found = false;
-
-	for (auto sound_device : sound_devices)
-	{
-		if (sound_device.isRealDevice)
-		{
-			if (output_device_id == sound_device.pwszID.c_str())
-			{
-				output_found = true;
-				String message = TRANS("Output: ") + sound_device.deviceFriendlyName.c_str();
-
-				if (getOutputName() != sound_device.deviceFriendlyName.c_str())
-				{
-					// Auto-select preset for the output device
-					auto device_config = DeviceConfig::getDeviceConfig(settings_, sound_device.deviceFriendlyName.c_str());
-					if (device_config.preset.isNotEmpty())
-					{
-						setPreset(device_config.preset, false);
-
-						if (FxModel::getModel().getPowerState())
-						{
-							message += "\n" + TRANS("Preset: ") + device_config.preset;
-						}
-					}
-				}
-				FxModel::getModel().setSelectedOutput(sound_device, notify);
-				setOutputName(sound_device.deviceFriendlyName.c_str());
-
-				if (!isTimerRunning())
-				{
-					// FxSound is off and the selected output device is the default playback device
-					if (sound_device.isDefaultDevice)
-					{
-						break;
-					}
-				}
-				else
-				{
-					if (sound_device.isTargetedRealPlaybackDevice)
-					{
-						break;
-					}
-				}
-
-				audio_passthru_->setAsPlaybackDevice(sound_device);
-				output_changed_ = true;
-
-				FxModel::getModel().pushMessage(message);
-
-				break;
-			}
-		}
-	}
-
-	if (!output_found)
-	{
-		audio_passthru_->mute(true);
-		powerOn(false);
-
-		FxModel::getModel().pushMessage(TRANS("Output Disconnected"));
-	}
-	else
-	{
-		if (FxModel::getModel().getPowerState())
-		{
-			powerOn(true);
-			audio_passthru_->mute(false);
-		}
-	}
-
-	system_tray_view_->setStatus(FxModel::getModel().getPowerState(), isAudioProcessing());
-}
-
-void FxController::setOutput(int output, bool notify)
-{
-	auto output_devices = FxModel::getModel().getOutputDevices();
-
-	if (output < output_devices.size())
-	{
-		// Explicit user selection overrides any pending restore after sleep.
-		{
-			ScopedLock auto_lock(lock_);
-			clearOutputRestore();
-			system_sleeping_ = false;
-		}
-		setOutput(output_devices[output].pwszID.c_str(), notify);
-	}
-}
-
 bool FxController::isPlaybackDeviceAvailable()
 {
 	return playback_device_available_;
@@ -1512,10 +1420,9 @@ bool FxController::importPresets(const Array<File>& preset_files, StringArray& i
 
 void FxController::initOutputs(std::vector<SoundDevice>& sound_devices)
 {
-	dfx_enabled_ = false;
-	active_output_devices_.clear();
+	ScopedLock auto_lock(lock_);
 
-	SoundDevice default_output;
+	dfx_enabled_ = false;
 
 	auto device_configs_version = settings_.getInt("device_configs_version");
 	if (device_configs_version != 2)
@@ -1539,177 +1446,136 @@ void FxController::initOutputs(std::vector<SoundDevice>& sound_devices)
 		}
 	}
 
-
-	for (auto sound_device : sound_devices)
+	for (auto& sound_device : sound_devices)
 	{
-		if (sound_device.isRealDevice)
-		{
-			if (sound_device.isActive && sound_device.deviceNumChannel >= 2)
-			{
-				active_output_devices_.push_back(sound_device);
-
-				if (sound_device.isDefaultDevice || sound_device.isTargetedRealPlaybackDevice)
-				{
-					default_output = sound_device;
-				}
-			}
-		}
-		else if (sound_device.deviceFriendlyName.find(L"FxSound Audio Enhancer") != std::wstring::npos)
+		if (!sound_device.isRealDevice && sound_device.deviceFriendlyName.find(L"FxSound Audio Enhancer") != std::wstring::npos)
 		{
 			dfx_enabled_ = true;
 		}
 	}
 
-	sortByDeviceConfigPriority(active_output_devices_);
+	refreshActiveOutputs(sound_devices);
+	loadOutputSettings(sound_devices);
 
-	// If output is not set previously, use the system default output.
-	if (getOutputName().isEmpty() && default_output.deviceFriendlyName.size() > 0)
+	// --output on the command line: enable only this output.
+	if (startup_output_name_.isNotEmpty())
 	{
-		setOutputName(default_output.deviceFriendlyName.c_str());
-	}
-	else if (active_output_devices_.size() > 0)
-	{
-		bool found = false;
-		for (auto& output_device : active_output_devices_)
+		for (auto& device : active_output_devices_)
 		{
-			if (getOutputName() == output_device.deviceFriendlyName.c_str())
+			if (startup_output_name_ == device.deviceFriendlyName.c_str())
 			{
-				default_output = output_device;
-				found = true;
+				String id(device.pwszID.c_str());
+				getOutputEntry(id);
+				for (auto& entry : output_entries_)
+				{
+					entry.enabled = (entry.id == id);
+				}
+				saveOutputSettings();
 				break;
 			}
 		}
-		if (!found)
-		{
-			default_output = getPreferredOutput();
-			setOutputName(default_output.deviceFriendlyName.c_str());
-		}
+		startup_output_name_.clear();
 	}
 
-	FxModel::getModel().initOutputs(active_output_devices_);
-	setOutput(default_output.pwszID.c_str());
+	// The engine's carrier for now: the targeted device, or the Windows default device. powerOn() elects
+	// the real one before processing starts.
+	const SoundDevice* current = nullptr;
+	for (auto& device : active_output_devices_)
+	{
+		if (device.isTargetedRealPlaybackDevice)
+		{
+			current = &device;
+			break;
+		}
+		if (device.isDefaultDevice && current == nullptr)
+		{
+			current = &device;
+		}
+	}
+	if (current != nullptr)
+	{
+		carrier_id_ = current->pwszID.c_str();
+		output_device_name_ = current->deviceFriendlyName.c_str();
+		elected_carrier_id_ = carrier_id_;
+	}
+
+	// Leaves the engine's legacy mode: from now on it plays exactly this set.
+	pushOutputsToEngine();
+
+	// The views are built before init(); this first notification fills them.
+	notifyOutputsChanged();
 }
 
-void FxController::updateOutputs(std::vector<SoundDevice>& sound_devices)
+// Handled when FxSound processing is on, after every reinit of the engine and when the HDMI wait ends.
+void FxController::updateOutputs(std::vector<SoundDevice>& sound_devices, const StringArray& new_device_names)
 {
 	auto prev_active_devices = active_output_devices_;
 
-	active_output_devices_.clear();
-
-	for (auto sound_device : sound_devices)
+	const bool list_changed = refreshActiveOutputs(sound_devices);
+	bool outputs_changed = list_changed;
+	if (enableNewOutputs(new_device_names))
 	{
-		if (sound_device.isActive && sound_device.isRealDevice && sound_device.deviceNumChannel >= 2)
+		outputs_changed = true;
+	}
+
+	if (list_changed)
+	{
+		failed_carrier_ids_.clear();
+	}
+
+	// The carrier the engine is using after this reinit.
+	String engine_carrier_id;
+	for (auto& sound_device : sound_devices)
+	{
+		if (sound_device.isRealDevice && sound_device.isTargetedRealPlaybackDevice)
 		{
-			active_output_devices_.push_back(sound_device);
+			engine_carrier_id = sound_device.pwszID.c_str();
+			break;
 		}
 	}
 
-	sortByDeviceConfigPriority(active_output_devices_);
-
-	SoundDevice preferred_device;
-
-	// New device is connected, find the preferred device if the new device has higher priority than the current output device
-	if (sound_devices.size() > device_count_)
+	if (requested_carrier_id_.isNotEmpty())
 	{
-		auto device_configs = DeviceConfig::loadDeviceConfigs(settings_, "device_configs");
-
-		for (auto& sound_device : sound_devices)
+		// A switch asked for with setAsPlaybackDevice(). If the engine did not take it although the device
+		// is there, don't ask for it again until the devices change, so this can't loop.
+		if (engine_carrier_id != requested_carrier_id_ && findActiveOutput(requested_carrier_id_) != nullptr)
 		{
-			if (!sound_device.isRealDevice || sound_device.deviceNumChannel < 2)
-				continue;
-
-			// Check if the device is a newly connected device
-			auto it = std::find_if(prev_active_devices.begin(), prev_active_devices.end(),
-				[&](const SoundDevice& existing) {
-					return existing.pwszID == sound_device.pwszID;
-				});
-
-			if (it == prev_active_devices.end())
+			logMessage("Output switch not taken by the audio engine: " + requested_carrier_id_);
+			failed_carrier_ids_.addIfNotAlreadyThere(requested_carrier_id_);
+		}
+		requested_carrier_id_.clear();
+	}
+	else if (engine_carrier_id.isNotEmpty() && engine_carrier_id != carrier_id_ && !list_changed && !hdmi_reconnect_pending_)
+	{
+		// Same devices, another carrier: the user made this device the Windows default while FxSound was
+		// processing. As before, that selects it: it is enabled (the other enabled outputs keep playing).
+		if (findActiveOutput(engine_carrier_id) != nullptr)
+		{
+			auto& entry = getOutputEntry(engine_carrier_id);
+			if (!entry.enabled)
 			{
-				// If the new device has higher priority, select it as output
-				if (compareOutputDevicePriority(sound_device.deviceFriendlyName.c_str(), getOutputName(), device_configs) < 0)
-				{
-					preferred_device = sound_device;
-					break;
-				}
+				entry.enabled = true;
+				saveOutputSettings();
+				outputs_changed = true;
 			}
 		}
 	}
 
-	// Output device is removed or a higher priority device is not connected.
-	// If the current output device is removed, select the preferred output device.
-	// Otherwise, keep the current output device.
-	if (preferred_device.pwszID.empty() && active_output_devices_.size() > 0)
+	// HDMI output handling around sleep. The HDMI removal is notified before the system suspend, so when
+	// the enabled HDMI output that was the carrier disappears, the election is held (hdmi_reconnect_pending_)
+	// until HDMI_FAILOVER_INTERVAL ticks pass:
+	//  - HDMI reconnects in time (including after sleep): it is still enabled and is elected again.
+	//  - Not in time: physical disconnect, a new carrier is elected among the enabled outputs.
+	if (!hdmi_reconnect_pending_ && list_changed && carrier_id_.isNotEmpty() && findActiveOutput(carrier_id_) == nullptr)
 	{
-		bool found = false;
-		for (auto& output_device : active_output_devices_)
-		{
-			if (getOutputName() == output_device.deviceFriendlyName.c_str())
-			{
-				preferred_device = output_device;
-				found = true;
-				break;
-			}
-		}
-		if (!found)
-		{
-			preferred_device = getPreferredOutput();
-		}
-	}
-
-	auto previous_output_name = getOutputName();
-
-	// HDMI output handling around sleep. The HDMI removal is notified before the system suspend, so
-	// the failover is held (hdmi_reconnect_pending_) until HDMI_FAILOVER_INTERVAL ticks pass:
-	//  - HDMI reconnects in time (including after sleep): it is selected again.
-	//  - Not in time: physical disconnect, fail over as per the preferred output logic.
-	const SoundDevice* lost_hdmi = nullptr;
-	// Only the HDMI that was the selected output is restored.
-	if (failover_output_name_.isNotEmpty() && failover_output_name_ == previous_output_name)
-	{
-		for (auto& output_device : active_output_devices_)
-		{
-			if (output_device.deviceFormFactor == L"HDMI" &&
-				failover_output_name_ == output_device.deviceFriendlyName.c_str())
-			{
-				lost_hdmi = &output_device;
-				break;
-			}
-		}
-	}
-
-	if (hdmi_reconnect_pending_)
-	{
-		if (hdmi_failover_counter_ >= HDMI_FAILOVER_INTERVAL)
-		{
-			clearOutputRestore();
-		}
-		else if (lost_hdmi != nullptr)
-		{
-			preferred_device = *lost_hdmi;
-			clearOutputRestore();
-		}
-	}
-	else if (previous_output_name.isNotEmpty())
-	{
-		bool previous_still_active = false;
-		for (auto& output_device : active_output_devices_)
-		{
-			if (previous_output_name == output_device.deviceFriendlyName.c_str())
-			{
-				previous_still_active = true;
-				break;
-			}
-		}
-
-		if (!previous_still_active)
+		auto* entry = findOutputEntry(carrier_id_);
+		if (entry != nullptr && entry->enabled)
 		{
 			for (auto& prev_device : prev_active_devices)
 			{
-				if (prev_device.deviceFormFactor == L"HDMI" &&
-					previous_output_name == prev_device.deviceFriendlyName.c_str())
+				if (prev_device.deviceFormFactor == L"HDMI" && carrier_id_ == prev_device.pwszID.c_str())
 				{
-					failover_output_name_ = previous_output_name;
+					failover_output_id_ = carrier_id_;
 					hdmi_failover_counter_ = 0;
 					hdmi_reconnect_pending_ = true;
 					break;
@@ -1718,32 +1584,62 @@ void FxController::updateOutputs(std::vector<SoundDevice>& sound_devices)
 		}
 	}
 
-	// Initialize the model to update the output devices in the UI.
-	FxModel::getModel().initOutputs(active_output_devices_);
+	if (hdmi_reconnect_pending_ &&
+		(findActiveOutput(failover_output_id_) != nullptr || hdmi_failover_counter_ >= HDMI_FAILOVER_INTERVAL))
+	{
+		clearOutputRestore();
+	}
 
-	// Waiting for the lost HDMI output to reconnect: stay muted and keep the current selection.
-	// timerCallback() fails over when the wait ends.
+	carrier_id_ = engine_carrier_id;
+
+	// Waiting for the lost HDMI output to reconnect: stay muted and keep the outputs as they are.
+	// timerCallback() ends the wait.
 	if (hdmi_reconnect_pending_)
 	{
 		if (FxModel::getModel().getPowerState())
 		{
 			audio_passthru_->mute(true);
 		}
+		pushOutputsToEngine();
+		if (outputs_changed)
+		{
+			notifyOutputsChanged();
+		}
 		return;
 	}
 
-	// Set the output to select the new output and update the UI.
-	// If the output has not changed, still output has to be set to update the UI.
-	setOutput(preferred_device.pwszID.c_str());
+	if (active_output_devices_.empty())
+	{
+		pushOutputsToEngine();
+		if (outputs_changed)
+		{
+			notifyOutputsChanged();
+		}
+		handleNoOutput();
+		return;
+	}
+
+	// Zero enabled outputs is fine here: the carrier plays silence and processing goes on.
+	applyCarrier();
+
+	if (outputs_changed)
+	{
+		notifyOutputsChanged();
+	}
+
+	if (FxModel::getModel().getPowerState() && !system_sleeping_)
+	{
+		audio_passthru_->mute(false);
+	}
 }
 
 // Handled when FxSound processing is on
-void FxController::selectProcessingOutput(std::vector<SoundDevice>& sound_devices)
+void FxController::selectProcessingOutput(std::vector<SoundDevice>& sound_devices, const StringArray& new_device_names)
 {
-	// New device is added or removed, so update the output device list and select a preferred output device based on the updated device list.
+	updateOutputs(sound_devices, new_device_names);
+
 	if (sound_devices.size() != device_count_)
 	{
-		updateOutputs(sound_devices);
 		device_count_ = (uint32_t)sound_devices.size();
 
 		if (!dfx_enabled_)
@@ -1758,29 +1654,6 @@ void FxController::selectProcessingOutput(std::vector<SoundDevice>& sound_device
                     JUCEApplication::getInstance()->systemRequestedQuit();
                 }), true);
 				return;
-			}
-		}
-	}
-	else
-	{
-		if (!hdmi_reconnect_pending_)
-		{
-			for (auto sound_device : sound_devices)
-			{
-				// If the selected output device is different from the output device selected in application UI, update the application UI.
-				if (sound_device.isRealDevice && sound_device.isTargetedRealPlaybackDevice && getOutputName() != sound_device.deviceFriendlyName.c_str())
-				{
-					setOutputName(sound_device.deviceFriendlyName.c_str());
-					FxModel::getModel().setSelectedOutput(sound_device);
-
-					auto device_config = DeviceConfig::getDeviceConfig(settings_, getOutputName());
-					if (device_config.preset.isNotEmpty())
-					{
-						setPreset(device_config.preset, false);
-					}
-
-					break;
-				}
 			}
 		}
 	}
@@ -1807,53 +1680,70 @@ void FxController::syncPlaybackAvailability()
 	}
 }
 
-// Handled when FxSound processing is off
-void FxController::syncOutputWithSystemDefault(std::vector<SoundDevice>& sound_devices)
+// Handled when FxSound processing is off. The outputs are only shown and stored; the Windows default
+// device is left alone. powerOn() elects the carrier when processing starts again.
+void FxController::syncOutputsWhileOff(std::vector<SoundDevice>& sound_devices, const StringArray& new_device_names)
 {
-	active_output_devices_.clear();
-
-	for (auto sound_device : sound_devices)
+	bool changed = refreshActiveOutputs(sound_devices);
+	if (enableNewOutputs(new_device_names))
 	{
-		if (sound_device.isRealDevice && sound_device.deviceNumChannel >= 2)
-		{
-			active_output_devices_.push_back(sound_device);
-		}
+		changed = true;
 	}
 
-	sortByDeviceConfigPriority(active_output_devices_);
+	device_count_ = (uint32_t)sound_devices.size();
 
-	// Update the configuration as per the change in active devices and update the output device list in UI
-	if (sound_devices.size() != device_count_)
+	if (changed)
 	{
-		FxModel::getModel().initOutputs(active_output_devices_);
-
-		device_count_ = (uint32_t)sound_devices.size();
+		failed_carrier_ids_.clear();
+		pushOutputsToEngine();
+		notifyOutputsChanged();
 	}
 
-	bool default_device_found = false;
-	for (auto& output_device : active_output_devices_)
+	// Processing was stopped because no output device was present: start again now that one is.
+	if (no_output_ && !active_output_devices_.empty() && FxModel::getModel().getPowerState())
 	{
-		// Change the selected device in UI
-		if (output_device.isDefaultDevice)
-		{
-			setOutputName(output_device.deviceFriendlyName.c_str());
-			FxModel::getModel().setSelectedOutput(output_device);
+		powerOn(true);
+	}
+}
 
-			auto device_config = DeviceConfig::getDeviceConfig(settings_, getOutputName());
-			if (device_config.preset.isNotEmpty())
+// No real output device is present at all: nothing can play, stop processing until one comes back
+// (syncOutputsWhileOff() starts it again). Zero *enabled* outputs does not come here.
+void FxController::handleNoOutput()
+{
+	no_output_ = true;
+	audio_passthru_->mute(true);
+	powerOn(false);
+
+	FxModel::getModel().pushMessage(TRANS("Output Disconnected"));
+}
+
+StringArray FxController::findNewDeviceNames(const std::vector<SoundDevice>& sound_devices)
+{
+	StringArray names;
+	auto device_configs = DeviceConfig::loadDeviceConfigs(settings_, "device_configs");
+
+	for (auto& sound_device : sound_devices)
+	{
+		if (!sound_device.isRealDevice)
+			continue;
+
+		String name(sound_device.deviceFriendlyName.c_str());
+		bool known = false;
+		for (auto& device_config : device_configs)
+		{
+			if (device_config.device_name == name)
 			{
-				setPreset(device_config.preset, false);
+				known = true;
+				break;
 			}
-
-			default_device_found = true;
-			break;
+		}
+		if (!known)
+		{
+			names.addIfNotAlreadyThere(name);
 		}
 	}
 
-	if (!default_device_found)
-	{
-		setOutput(getPreferredOutput().pwszID.c_str());
-	}
+	return names;
 }
 
 void FxController::sortByDeviceConfigPriority(std::vector<SoundDevice>& devices)
@@ -1877,6 +1767,37 @@ void FxController::powerOn(bool on)
 
 		if (!isTimerRunning())
 		{
+			// BetterFxSound outputs rework: elect the carrier before processing starts, so the first
+			// reinit already uses it. While off, the engine takes the Windows default device when it starts.
+			if (audio_passthru_ != nullptr)
+			{
+				ScopedLock auto_lock(lock_);
+
+				auto sound_devices = audio_passthru_->getSoundDevices(true);
+				if (refreshActiveOutputs(sound_devices))
+				{
+					notifyOutputsChanged();
+				}
+
+				requested_carrier_id_.clear();
+				failed_carrier_ids_.clear();
+
+				if (!active_output_devices_.empty())
+				{
+					applyCarrier();
+				}
+				else
+				{
+					pushOutputsToEngine();
+				}
+
+				if (no_output_)
+				{
+					no_output_ = false;
+					audio_passthru_->mute(false);
+				}
+			}
+
 			startTimer(100);
 		}
 	}
@@ -2147,34 +2068,8 @@ LRESULT CALLBACK FxController::eventCallback(HWND hwnd, const UINT message, cons
 		}
 		if (w_param == CMD_NEXT_OUTPUT)
 		{
-			auto output_index = 0;
-			for (auto& output_device : controller->active_output_devices_)
-			{
-				if (FxModel::getModel().getSelectedOutput().pwszID == output_device.pwszID)
-				{
-					break;
-				}
-				output_index++;
-			}
-			int count = 0;
-			while (count < controller->active_output_devices_.size())
-			{
-				count++;
-				if (output_index < controller->active_output_devices_.size() - 1)
-				{
-					output_index++;
-				}
-				else
-				{
-					output_index = 0;
-				}
-
-				if (controller->active_output_devices_[output_index].deviceNumChannel >= 2)
-				{
-					controller->setOutput(output_index);
-					break;
-				}
-			}
+			// BetterFxSound outputs rework: enable only the next output, cycling.
+			controller->enableNextOutput();
 		}
 	}
 	break;
@@ -2231,16 +2126,9 @@ void FxController::timerCallback()
 		// actually sleeps. Don't count that time; the wait starts again on resume.
 		if (!system_sleeping_ && (hdmi_reconnect_pending_ && ++hdmi_failover_counter_ >= HDMI_FAILOVER_INTERVAL))
 		{
-			clearOutputRestore();
+			// updateOutputs() ends the wait, elects a new carrier among the enabled outputs and unmutes.
 			auto sound_devices = audio_passthru_->getSoundDevices(true);
-			updateOutputs(sound_devices);
-
-			// The hold in updateOutputs() muted the audio; make sure it is unmuted once the wait is over
-			// and an output is available (setOutput() keeps it muted when no output is available).
-			if (FxModel::getModel().getPowerState() && !active_output_devices_.empty())
-			{
-				audio_passthru_->mute(false);
-			}
+			updateOutputs(sound_devices, StringArray());
 		}
 	}
 
@@ -2321,17 +2209,20 @@ void FxController::onSoundDeviceChange(bool processing)
 		if (processing)
 		{
 			output_devices_ = audio_passthru_->getSoundDevices(false);
+			// Before updateDeviceConfigs() learns them: devices never seen before.
+			auto new_device_names = findNewDeviceNames(output_devices_);
 			DeviceConfig::updateDeviceConfigs(settings_, output_devices_);
 			auto sound_devices = audio_passthru_->getSoundDevices(true);
-			selectProcessingOutput(sound_devices);
+			selectProcessingOutput(sound_devices, new_device_names);
 		}
 	}
 	else
 	{
 		output_devices_ = audio_passthru_->getSoundDevices(false);
+		auto new_device_names = findNewDeviceNames(output_devices_);
 		DeviceConfig::updateDeviceConfigs(settings_, output_devices_);
 		auto sound_devices = audio_passthru_->getSoundDevices(true);
-		syncOutputWithSystemDefault(sound_devices);
+		syncOutputsWhileOff(sound_devices, new_device_names);
 	}
 }
 
@@ -2367,7 +2258,7 @@ void FxController::onSystemResume()
 
 void FxController::clearOutputRestore()
 {
-	failover_output_name_ = String();
+	failover_output_id_ = String();
 	hdmi_failover_counter_ = 0;
 	hdmi_reconnect_pending_ = false;
 }
@@ -2727,6 +2618,8 @@ void FxController::saveDeviceConfigs(const juce::Array<DeviceConfig>& device_con
 
 bool FxController::isOutputDeviceConnected(const String& output_device_name)
 {
+	ScopedLock auto_lock(lock_);
+
 	for (auto& output_device : active_output_devices_)
 	{
 		if (output_device_name == output_device.deviceFriendlyName.c_str())
@@ -2798,25 +2691,19 @@ int FxController::compareOutputDevicePriority(const String& output_device_name1,
 
 void FxController::refreshOutputList()
 {
-	sortByDeviceConfigPriority(active_output_devices_);
-	FxModel::getModel().initOutputs(active_output_devices_);
-	FxModel::getModel().setSelectedOutput(FxModel::getModel().getSelectedOutput());
+	// The device priority may have changed in Output preferences: elect the carrier again.
+	ScopedLock auto_lock(lock_);
+
+	if (isTimerRunning() && !hdmi_reconnect_pending_ && !active_output_devices_.empty())
+	{
+		applyCarrier();
+	}
+	notifyOutputsChanged();
 }
 
 const String& FxController::getOutputName()
 {
-	if (output_device_name_.isEmpty())
-	{
-		output_device_name_ = settings_.getString("output_device_name");
-	}
-
 	return output_device_name_;
-}
-
-void FxController::setOutputName(const String& output_device_name)
-{
-	output_device_name_ = output_device_name;
-	settings_.setString("output_device_name", output_device_name);
 }
 
 bool FxController::isNewOutputPrioritized()
@@ -2827,91 +2714,6 @@ bool FxController::isNewOutputPrioritized()
 void FxController::setNewOutputPrioritized(bool prioritize)
 {
 	settings_.setBool("prioritize_new_output", prioritize);
-}
-
-// BetterFxSound: the additional outputs are stored as a JSON array of
-// { "id": <endpoint id>, "delay_ms": <0..500>, "volume": <0..100>, "channel_mode": <0..3> } objects.
-std::vector<AdditionalOutputConfig> FxController::getAdditionalOutputs()
-{
-	std::vector<AdditionalOutputConfig> outputs;
-
-	auto json = settings_.getJson("additional_outputs");
-	if (auto* array = json.getArray())
-	{
-		for (auto& item : *array)
-		{
-			auto id = item.getProperty("id", "").toString();
-			if (id.isEmpty())
-				continue;
-
-			AdditionalOutputConfig output;
-			output.device_id = id.toWideCharPointer();
-			output.delay_ms = jlimit(0, 500, static_cast<int>(item.getProperty("delay_ms", 0)));
-			output.channel_mode = static_cast<OutputChannelMode>(jlimit(0, 3, static_cast<int>(item.getProperty("channel_mode", 0))));
-			output.volume_percent = jlimit(0, 100, static_cast<int>(item.getProperty("volume", 100)));
-			outputs.push_back(output);
-		}
-	}
-
-	return outputs;
-}
-
-void FxController::setAdditionalOutput(const String& device_id, bool enabled, int delay_ms, int volume_percent, OutputChannelMode channel_mode)
-{
-	if (device_id.isEmpty())
-		return;
-
-	auto outputs = getAdditionalOutputs();
-	auto id = std::wstring(device_id.toWideCharPointer());
-
-	outputs.erase(std::remove_if(outputs.begin(), outputs.end(),
-		[&id](const AdditionalOutputConfig& output) { return output.device_id == id; }), outputs.end());
-
-	if (enabled)
-	{
-		AdditionalOutputConfig output;
-		output.device_id = id;
-		output.delay_ms = jlimit(0, 500, delay_ms);
-		output.volume_percent = jlimit(0, 100, volume_percent);
-		output.channel_mode = channel_mode;
-		outputs.push_back(output);
-	}
-
-	Array<var> array;
-	for (const auto& output : outputs)
-	{
-		auto* object = new DynamicObject();
-		object->setProperty("id", String(output.device_id.c_str()));
-		object->setProperty("delay_ms", output.delay_ms);
-		object->setProperty("volume", output.volume_percent);
-		object->setProperty("channel_mode", static_cast<int>(output.channel_mode));
-		array.add(var(object));
-	}
-	settings_.setJson("additional_outputs", var(array));
-
-	applyAdditionalOutputs();
-}
-
-OutputChannelMode FxController::getMainOutputChannelMode()
-{
-	return static_cast<OutputChannelMode>(jlimit(0, 3, settings_.getInt("main_output_channel_mode", 0)));
-}
-
-void FxController::setMainOutputChannelMode(OutputChannelMode channel_mode)
-{
-	settings_.setInt("main_output_channel_mode", static_cast<int>(channel_mode));
-	applyAdditionalOutputs();
-}
-
-int FxController::getMainOutputDelay()
-{
-	return jlimit(0, 500, settings_.getInt("main_output_delay_ms", 0));
-}
-
-void FxController::setMainOutputDelay(int delay_ms)
-{
-	settings_.setInt("main_output_delay_ms", jlimit(0, 500, delay_ms));
-	applyAdditionalOutputs();
 }
 
 bool FxController::startDelayCalibration()
@@ -2944,45 +2746,46 @@ String FxController::applyDelayCalibrationResults()
 	if (audio_passthru_ == nullptr)
 		return {};
 
+	// One result per measured output, keyed by device_id, in no particular order. There is no main output:
+	// the measured outputs are aligned to the slowest one.
 	auto results = audio_passthru_->getDelayCalibrationResults();
 	if (results.empty())
 		return TRANS("Nothing was measured.");
 
-	// The first result is always the main output.
-	auto main_id = results.front().device_id;
-	auto outputs = getAdditionalOutputs();
+	ScopedLock auto_lock(lock_);
 
-	auto deviceName = [](const std::wstring& id) {
-		for (auto& device : FxModel::getModel().getOutputDevices())
+	auto nameOf = [this](const String& id) -> String {
+		if (auto* device = findActiveOutput(id))
+			return String(device->deviceFriendlyName.c_str());
+		if (auto* entry = findOutputEntry(id))
 		{
-			if (device.pwszID == id)
-				return String(device.deviceFriendlyName.c_str());
+			if (entry->name.isNotEmpty())
+				return entry->name;
 		}
-		return String(id.c_str());
+		return id;
 	};
 
-	auto currentDelay = [&](const std::wstring& id) {
-		if (id == main_id)
-			return getMainOutputDelay();
-		for (auto& output : outputs)
-		{
-			if (output.device_id == id)
-				return output.delay_ms;
-		}
-		return 0;
+	auto currentDelay = [this](const String& id) {
+		auto* entry = findOutputEntry(id);
+		return entry != nullptr ? entry->delay_ms : 0;
 	};
 
-	if (!results.front().measured)
-		return TRANS("The main output could not be heard clearly, so no delay was changed. Turn the volume up, move the microphone closer and try again.");
-
-	// Each measurement includes the delay the output already had. Remove it to get the output's
-	// own latency, then delay every output so they all match the slowest one.
+	// Each measurement includes the delay the output already had. Remove it to get the output's own
+	// latency, then delay every measured output so they all match the slowest one.
+	bool any_measured = false;
 	double slowest = 0.0;
 	for (auto& result : results)
 	{
-		if (result.measured)
-			slowest = jmax(slowest, result.latency_ms - currentDelay(result.device_id));
+		if (!result.measured)
+			continue;
+
+		auto own_latency = result.latency_ms - currentDelay(String(result.device_id.c_str()));
+		slowest = any_measured ? jmax(slowest, own_latency) : own_latency;
+		any_measured = true;
 	}
+
+	if (!any_measured)
+		return TRANS("No output could be heard clearly, so no delay was changed. Turn the volume up, move the microphone closer and try again.");
 
 	StringArray lines;
 	StringArray not_heard;
@@ -2990,14 +2793,17 @@ String FxController::applyDelayCalibrationResults()
 
 	for (auto& result : results)
 	{
-		auto name = deviceName(result.device_id);
+		String id(result.device_id.c_str());
+		auto name = nameOf(id);
+
 		if (!result.measured)
 		{
+			// Keeps its delay.
 			not_heard.add(name);
 			continue;
 		}
 
-		auto own_latency = result.latency_ms - currentDelay(result.device_id);
+		auto own_latency = result.latency_ms - currentDelay(id);
 		auto delay = roundToInt(slowest - own_latency);
 		if (delay > 500)
 		{
@@ -3006,36 +2812,14 @@ String FxController::applyDelayCalibrationResults()
 		}
 		delay = jmax(0, delay);
 
-		if (result.device_id == main_id)
-		{
-			settings_.setInt("main_output_delay_ms", delay);
-		}
-		else
-		{
-			for (auto& output : outputs)
-			{
-				if (output.device_id == result.device_id)
-					output.delay_ms = delay;
-			}
-		}
+		getOutputEntry(id).delay_ms = delay;
 
 		lines.add(name + ": " + String(delay) + " ms");
 	}
 
-	// Save the additional outputs with their new delays.
-	Array<var> array;
-	for (const auto& output : outputs)
-	{
-		auto* object = new DynamicObject();
-		object->setProperty("id", String(output.device_id.c_str()));
-		object->setProperty("delay_ms", output.delay_ms);
-		object->setProperty("volume", output.volume_percent);
-		object->setProperty("channel_mode", static_cast<int>(output.channel_mode));
-		array.add(var(object));
-	}
-	settings_.setJson("additional_outputs", var(array));
-
-	applyAdditionalOutputs();
+	saveOutputSettings();
+	pushOutputsToEngine();
+	notifyOutputsChanged();
 
 	String summary = TRANS("Delays set:") + " " + lines.joinIntoString(", ") + ".";
 	if (not_heard.size() > 0)
@@ -3043,16 +2827,6 @@ String FxController::applyDelayCalibrationResults()
 	if (clamped)
 		summary += " " + TRANS("Some devices differ by more than 500 ms, the maximum delay.");
 	return summary;
-}
-
-void FxController::applyAdditionalOutputs()
-{
-	if (audio_passthru_ != nullptr)
-	{
-		audio_passthru_->setAdditionalOutputs(getAdditionalOutputs());
-		audio_passthru_->setMainOutputChannelMode(getMainOutputChannelMode());
-		audio_passthru_->setMainOutputDelay(getMainOutputDelay());
-	}
 }
 
 FxThemeMode FxController::getThemeMode()
@@ -3217,31 +2991,609 @@ String FxController::FormatString(const String& format, const String& arg)
 }
 
 // ---------------------------------------------------------------------------------------------
-// BetterFxSound outputs rework: CONTRACT STUBS (docs/OUTPUTS_REWORK.md).
-// The "Backend - controller" session replaces this whole block with the real implementation.
+// BetterFxSound outputs rework (docs/OUTPUTS_REWORK.md).
+//
+// Every output the user enabled or configured is an OutputEntry, saved as the "outputs" settings
+// key. The engine always gets the whole set through AudioPassthru::setOutputs(). There is no main
+// output: internally one present output is the carrier, the device on the original low latency
+// path, switched with setAsPlaybackDevice(). The carrier is the enabled, present output that comes
+// first in the device priority (Output preferences), so a given set of outputs always gets the same
+// carrier and a delay calibration stays valid after a device leaves and comes back. With no enabled
+// output present, the current carrier (or the preferred device) stays and plays silence.
 // ---------------------------------------------------------------------------------------------
+
+static OutputChannelMode toOutputChannelMode(int value)
+{
+	return static_cast<OutputChannelMode>(jlimit(0, 3, value));
+}
+
+FxController::OutputEntry* FxController::findOutputEntry(const String& id)
+{
+	if (id.isEmpty())
+		return nullptr;
+
+	for (auto& entry : output_entries_)
+	{
+		if (entry.id == id)
+			return &entry;
+	}
+	return nullptr;
+}
+
+// The entry for this id, added (disabled, default settings) if there is none. The reference is only
+// valid until the next entry is added.
+FxController::OutputEntry& FxController::getOutputEntry(const String& id)
+{
+	if (auto* existing = findOutputEntry(id))
+		return *existing;
+
+	OutputEntry entry;
+	entry.id = id;
+	if (auto* device = findActiveOutput(id))
+		entry.name = device->deviceFriendlyName.c_str();
+	output_entries_.push_back(entry);
+	return output_entries_.back();
+}
+
+const SoundDevice* FxController::findActiveOutput(const String& id) const
+{
+	if (id.isEmpty())
+		return nullptr;
+
+	for (auto& device : active_output_devices_)
+	{
+		if (id == device.pwszID.c_str())
+			return &device;
+	}
+	return nullptr;
+}
+
+// Reads the "outputs" key, or migrates the old main output + additional outputs keys once, or on a first
+// run enables the Windows default device. The old keys are removed afterwards.
+void FxController::loadOutputSettings(const std::vector<SoundDevice>& sound_devices)
+{
+	static const char* const legacy_keys[] = { "output_device_name", "main_output_delay_ms", "main_output_channel_mode", "additional_outputs" };
+
+	output_entries_.clear();
+
+	auto addEntry = [this](const OutputEntry& entry) {
+		if (entry.id.isNotEmpty() && findOutputEntry(entry.id) == nullptr)
+			output_entries_.push_back(entry);
+	};
+
+	auto readEntry = [](const var& item, bool enabled_by_default) {
+		OutputEntry entry;
+		entry.id = item.getProperty("id", "").toString();
+		entry.name = item.getProperty("name", "").toString();
+		entry.enabled = static_cast<bool>(item.getProperty("enabled", enabled_by_default));
+		entry.delay_ms = jlimit(0, 500, static_cast<int>(item.getProperty("delay_ms", 0)));
+		entry.volume_percent = jlimit(0, 100, static_cast<int>(item.getProperty("volume", 100)));
+		entry.channel_mode = toOutputChannelMode(static_cast<int>(item.getProperty("channel_mode", 0)));
+		return entry;
+	};
+
+	auto realDeviceName = [&sound_devices](const String& id) -> String {
+		for (auto& device : sound_devices)
+		{
+			if (device.isRealDevice && id == device.pwszID.c_str())
+				return String(device.deviceFriendlyName.c_str());
+		}
+		return {};
+	};
+
+	bool has_legacy = false;
+	for (auto* key : legacy_keys)
+	{
+		if (settings_.containsKey(key))
+			has_legacy = true;
+	}
+
+	bool save = false;
+
+	if (settings_.containsKey("outputs"))
+	{
+		auto json = settings_.getJson("outputs");
+		if (auto* array = json.getArray())
+		{
+			for (auto& item : *array)
+				addEntry(readEntry(item, false));
+		}
+	}
+	else if (has_legacy)
+	{
+		// One-time migration. The old main output becomes an enabled output with its delay and channel
+		// mode; the old additional outputs (the list only held enabled ones) keep their settings.
+		auto main_name = settings_.getString("output_device_name");
+		if (main_name.isNotEmpty())
+		{
+			String main_id;
+			for (int pass = 0; pass < 2 && main_id.isEmpty(); pass++)
+			{
+				for (auto& device : sound_devices)
+				{
+					// Active devices first, as several endpoints can share a name.
+					if (device.isRealDevice && (pass == 1 || device.isActive) && main_name == device.deviceFriendlyName.c_str())
+					{
+						main_id = device.pwszID.c_str();
+						break;
+					}
+				}
+			}
+			if (main_id.isEmpty())
+				main_id = DeviceConfig::getDeviceConfig(settings_, main_name).device_id;
+
+			if (main_id.isNotEmpty())
+			{
+				OutputEntry entry;
+				entry.id = main_id;
+				entry.name = main_name;
+				entry.enabled = true;
+				entry.delay_ms = jlimit(0, 500, settings_.getInt("main_output_delay_ms", 0));
+				entry.channel_mode = toOutputChannelMode(settings_.getInt("main_output_channel_mode", 0));
+				addEntry(entry);
+			}
+			else
+			{
+				logMessage("Outputs migration: output \"" + main_name + "\" not found, skipped");
+			}
+		}
+
+		auto json = settings_.getJson("additional_outputs");
+		if (auto* array = json.getArray())
+		{
+			for (auto& item : *array)
+			{
+				auto entry = readEntry(item, true);
+				entry.enabled = true;
+				entry.name = realDeviceName(entry.id);
+				addEntry(entry);
+			}
+		}
+
+		save = true;
+		logMessage("Outputs migrated from the main/additional output settings: " + String((int)output_entries_.size()) + " output(s)");
+	}
+
+	if (output_entries_.empty() && !settings_.containsKey("outputs"))
+	{
+		// First run, or nothing could be migrated: start on the Windows default device, else the preferred one.
+		SoundDevice first;
+		for (auto& device : active_output_devices_)
+		{
+			if (device.isDefaultDevice || device.isTargetedRealPlaybackDevice)
+			{
+				first = device;
+				break;
+			}
+		}
+		if (first.pwszID.empty())
+			first = getPreferredOutput();
+
+		if (!first.pwszID.empty())
+		{
+			OutputEntry entry;
+			entry.id = first.pwszID.c_str();
+			entry.name = first.deviceFriendlyName.c_str();
+			entry.enabled = true;
+			addEntry(entry);
+		}
+
+		// With no device at all, try again on the next start rather than saving an empty set (= silence).
+		save = !output_entries_.empty();
+	}
+
+	for (auto* key : legacy_keys)
+	{
+		if (settings_.containsKey(key))
+			settings_.removeValue(key);
+	}
+
+	if (save)
+		saveOutputSettings();
+}
+
+void FxController::saveOutputSettings()
+{
+	Array<var> array;
+	for (const auto& entry : output_entries_)
+	{
+		auto* object = new DynamicObject();
+		object->setProperty("id", entry.id);
+		object->setProperty("name", entry.name);
+		object->setProperty("enabled", entry.enabled);
+		object->setProperty("delay_ms", entry.delay_ms);
+		object->setProperty("volume", entry.volume_percent);
+		object->setProperty("channel_mode", static_cast<int>(entry.channel_mode));
+		array.add(var(object));
+	}
+	settings_.setJson("outputs", var(array));
+}
+
+// Rebuilds the list of present outputs (real, active, stereo or more) in Windows device order. Returns true
+// if the list changed.
+bool FxController::refreshActiveOutputs(const std::vector<SoundDevice>& sound_devices)
+{
+	std::vector<SoundDevice> active;
+	for (auto& sound_device : sound_devices)
+	{
+		if (sound_device.isActive && sound_device.isRealDevice && sound_device.deviceNumChannel >= 2)
+			active.push_back(sound_device);
+	}
+
+	bool changed = active.size() != active_output_devices_.size();
+	for (size_t i = 0; !changed && i < active.size(); i++)
+	{
+		changed = active[i].pwszID != active_output_devices_[i].pwszID ||
+			active[i].deviceFriendlyName != active_output_devices_[i].deviceFriendlyName;
+	}
+
+	active_output_devices_ = active;
+
+	// Keep the stored names current (shown for outputs that are not connected).
+	bool renamed = false;
+	for (auto& entry : output_entries_)
+	{
+		if (auto* device = findActiveOutput(entry.id))
+		{
+			String name(device->deviceFriendlyName.c_str());
+			if (entry.name != name)
+			{
+				entry.name = name;
+				renamed = true;
+			}
+		}
+	}
+	if (renamed)
+		saveOutputSettings();
+
+	return changed;
+}
+
+// "Prioritize new devices": a device never seen before is enabled when it is connected. Otherwise it
+// shows up disabled.
+bool FxController::enableNewOutputs(const StringArray& new_device_names)
+{
+	if (new_device_names.isEmpty() || !isNewOutputPrioritized())
+		return false;
+
+	bool changed = false;
+	for (auto& device : active_output_devices_)
+	{
+		String name(device.deviceFriendlyName.c_str());
+		if (!new_device_names.contains(name))
+			continue;
+
+		auto& entry = getOutputEntry(String(device.pwszID.c_str()));
+		if (!entry.enabled)
+		{
+			entry.enabled = true;
+			changed = true;
+			logMessage("New output enabled: " + name);
+		}
+	}
+
+	if (changed)
+		saveOutputSettings();
+
+	return changed;
+}
+
+// The carrier for the current outputs: the enabled, present output first in the device priority. With
+// none, the current carrier if present (it plays silence), else the preferred device.
+SoundDevice FxController::electCarrier()
+{
+	std::vector<SoundDevice> candidates;
+	for (auto& device : active_output_devices_)
+	{
+		String id(device.pwszID.c_str());
+		auto* entry = findOutputEntry(id);
+		if (entry != nullptr && entry->enabled && !failed_carrier_ids_.contains(id))
+			candidates.push_back(device);
+	}
+
+	if (!candidates.empty())
+	{
+		sortByDeviceConfigPriority(candidates);
+		return candidates.front();
+	}
+
+	if (auto* current = findActiveOutput(carrier_id_))
+		return *current;
+
+	return getPreferredOutput();
+}
+
+// Elects the carrier, switches the engine to it if needed, then gives the engine the whole set of outputs.
+// setAsPlaybackDevice() goes first, so the new carrier is not opened as an additional output for a moment.
+void FxController::applyCarrier()
+{
+	if (audio_passthru_ == nullptr)
+		return;
+
+	auto carrier = electCarrier();
+	if (!carrier.pwszID.empty())
+		requestCarrier(carrier);
+
+	pushOutputsToEngine();
+}
+
+void FxController::requestCarrier(const SoundDevice& device)
+{
+	String id(device.pwszID.c_str());
+	String name(device.deviceFriendlyName.c_str());
+
+	// While processing, the carrier is the targeted device. While off, the engine takes the Windows default
+	// device when it starts.
+	bool in_place = isTimerRunning() ? (id == carrier_id_) : device.isDefaultDevice;
+	if (!in_place)
+	{
+		audio_passthru_->setAsPlaybackDevice(device);
+		requested_carrier_id_ = id;
+		output_changed_ = true;
+	}
+
+	carrier_id_ = id;
+	output_device_name_ = name;
+
+	if (id != elected_carrier_id_)
+	{
+		elected_carrier_id_ = id;
+
+		// The preset chosen for this device in Output preferences, as when it was selected as the output.
+		// Not for a carrier that only plays silence.
+		auto* entry = findOutputEntry(id);
+		if (entry != nullptr && entry->enabled)
+		{
+			auto device_config = DeviceConfig::getDeviceConfig(settings_, name);
+			if (device_config.preset.isNotEmpty())
+			{
+				setPreset(device_config.preset, false);
+				if (FxModel::getModel().getPowerState())
+				{
+					FxModel::getModel().pushMessage(TRANS("Preset: ") + device_config.preset);
+				}
+			}
+		}
+	}
+}
+
+void FxController::pushOutputsToEngine()
+{
+	if (audio_passthru_ == nullptr)
+		return;
+
+	std::vector< ::OutputConfig> outputs;
+	outputs.reserve(output_entries_.size());
+	for (const auto& entry : output_entries_)
+	{
+		::OutputConfig config;
+		config.device_id = entry.id.toWideCharPointer();
+		config.enabled = entry.enabled;
+		config.delay_ms = entry.delay_ms;
+		config.volume_percent = entry.volume_percent;
+		config.channel_mode = entry.channel_mode;
+		outputs.push_back(config);
+	}
+
+	audio_passthru_->setOutputs(outputs);
+}
+
+void FxController::notifyOutputsChanged()
+{
+	FxModel::getModel().notifyOutputListUpdated();
+}
+
+// "Next output" hotkey: enables only the present output after the first enabled one, cycling.
+void FxController::enableNextOutput()
+{
+	String next_id;
+	String next_name;
+	{
+		ScopedLock auto_lock(lock_);
+
+		const auto count = active_output_devices_.size();
+		if (count == 0)
+			return;
+
+		size_t current = count - 1;	// None enabled: start with the first one
+		for (size_t i = 0; i < count; i++)
+		{
+			auto* entry = findOutputEntry(String(active_output_devices_[i].pwszID.c_str()));
+			if (entry != nullptr && entry->enabled)
+			{
+				current = i;
+				break;
+			}
+		}
+
+		const auto& next = active_output_devices_[(current + 1) % count];
+		next_id = next.pwszID.c_str();
+		next_name = next.deviceFriendlyName.c_str();
+	}
+
+	if (enableOnlyOutput(next_id))
+	{
+		FxModel::getModel().pushMessage(TRANS("Output: ") + next_name);
+	}
+}
+
 std::vector<FxController::OutputState> FxController::getOutputs()
 {
-	return {};
+	ScopedLock auto_lock(lock_);
+
+	auto fill = [](OutputState& state, const OutputEntry& entry) {
+		state.enabled = entry.enabled;
+		state.volume_percent = entry.volume_percent;
+		state.delay_ms = entry.delay_ms;
+		state.channel_mode = entry.channel_mode;
+	};
+
+	std::vector<OutputState> outputs;
+
+	// Every present output, in Windows device order...
+	for (auto& device : active_output_devices_)
+	{
+		OutputState state;
+		state.id = device.pwszID.c_str();
+		state.name = device.deviceFriendlyName.c_str();
+		state.present = true;
+		if (auto* entry = findOutputEntry(state.id))
+			fill(state, *entry);
+		outputs.push_back(state);
+	}
+
+	// ...then the enabled outputs whose device is not connected.
+	for (auto& entry : output_entries_)
+	{
+		if (!entry.enabled || findActiveOutput(entry.id) != nullptr)
+			continue;
+
+		OutputState state;
+		state.id = entry.id;
+		state.name = entry.name.isNotEmpty() ? entry.name : entry.id;
+		state.present = false;
+		fill(state, entry);
+		outputs.push_back(state);
+	}
+
+	return outputs;
 }
 
-void FxController::setOutputEnabled(const String& /*id*/, bool /*enabled*/)
+void FxController::setOutputEnabled(const String& id, bool enabled)
 {
+	ScopedLock auto_lock(lock_);
+
+	// An unknown device can only be enabled while it is present.
+	if (findOutputEntry(id) == nullptr && (!enabled || findActiveOutput(id) == nullptr))
+		return;
+
+	auto& entry = getOutputEntry(id);
+	if (entry.enabled == enabled)
+		return;
+
+	entry.enabled = enabled;
+	saveOutputSettings();
+
+	// The lost HDMI output was turned off: stop waiting for it.
+	if (hdmi_reconnect_pending_ && !enabled && id == failover_output_id_)
+	{
+		clearOutputRestore();
+		if (FxModel::getModel().getPowerState() && !system_sleeping_ && audio_passthru_ != nullptr)
+		{
+			audio_passthru_->mute(false);
+		}
+	}
+
+	if (isTimerRunning() && !hdmi_reconnect_pending_ && !active_output_devices_.empty())
+	{
+		applyCarrier();
+	}
+	else
+	{
+		pushOutputsToEngine();
+	}
+
+	notifyOutputsChanged();
 }
 
-void FxController::setOutputVolume(const String& /*id*/, int /*volume_percent*/)
+void FxController::setOutputVolume(const String& id, int volume_percent)
 {
+	ScopedLock auto_lock(lock_);
+
+	if (findOutputEntry(id) == nullptr && findActiveOutput(id) == nullptr)
+		return;
+
+	auto& entry = getOutputEntry(id);
+	volume_percent = jlimit(0, 100, volume_percent);
+	if (entry.volume_percent == volume_percent)
+		return;
+
+	entry.volume_percent = volume_percent;
+	saveOutputSettings();
+	pushOutputsToEngine();
 }
 
-void FxController::setOutputDelay(const String& /*id*/, int /*delay_ms*/)
+void FxController::setOutputDelay(const String& id, int delay_ms)
 {
+	ScopedLock auto_lock(lock_);
+
+	if (findOutputEntry(id) == nullptr && findActiveOutput(id) == nullptr)
+		return;
+
+	auto& entry = getOutputEntry(id);
+	delay_ms = jlimit(0, 500, delay_ms);
+	if (entry.delay_ms == delay_ms)
+		return;
+
+	entry.delay_ms = delay_ms;
+	saveOutputSettings();
+	pushOutputsToEngine();
 }
 
-void FxController::setOutputChannelMode(const String& /*id*/, OutputChannelMode /*channel_mode*/)
+void FxController::setOutputChannelMode(const String& id, OutputChannelMode channel_mode)
 {
+	ScopedLock auto_lock(lock_);
+
+	if (findOutputEntry(id) == nullptr && findActiveOutput(id) == nullptr)
+		return;
+
+	auto& entry = getOutputEntry(id);
+	channel_mode = toOutputChannelMode(static_cast<int>(channel_mode));
+	if (entry.channel_mode == channel_mode)
+		return;
+
+	entry.channel_mode = channel_mode;
+	saveOutputSettings();
+	pushOutputsToEngine();
 }
 
+// Enabled outputs, connected or not: the same outputs getOutputs() shows as enabled.
 int FxController::getEnabledOutputCount()
 {
-	return 0;
+	ScopedLock auto_lock(lock_);
+
+	int count = 0;
+	for (auto& entry : output_entries_)
+	{
+		if (entry.enabled)
+			count++;
+	}
+	return count;
+}
+
+bool FxController::enableOnlyOutput(const String& id)
+{
+	ScopedLock auto_lock(lock_);
+
+	if (findActiveOutput(id) == nullptr)
+		return false;
+
+	getOutputEntry(id);
+	for (auto& entry : output_entries_)
+	{
+		entry.enabled = (entry.id == id);
+	}
+	saveOutputSettings();
+
+	// An explicit choice ends any wait for a lost HDMI output.
+	if (hdmi_reconnect_pending_)
+	{
+		clearOutputRestore();
+		if (FxModel::getModel().getPowerState() && !system_sleeping_ && audio_passthru_ != nullptr)
+		{
+			audio_passthru_->mute(false);
+		}
+	}
+
+	if (isTimerRunning())
+	{
+		applyCarrier();
+	}
+	else
+	{
+		pushOutputsToEngine();
+	}
+
+	notifyOutputsChanged();
+	return true;
 }

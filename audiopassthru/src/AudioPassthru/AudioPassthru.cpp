@@ -112,20 +112,10 @@ void AudioPassthru::restoreDefaultPlaybackDevice()
 {
     data_->restoreDefaultPlaybackDevice();
 }
-// BetterFxSound: additional simultaneous outputs.
-void AudioPassthru::setAdditionalOutputs(const std::vector<AdditionalOutputConfig>& outputs)
+// BetterFxSound: multiple simultaneous outputs.
+void AudioPassthru::setOutputs(const std::vector<OutputConfig>& outputs)
 {
-	data_->setAdditionalOutputs(outputs);
-}
-
-void AudioPassthru::setMainOutputChannelMode(OutputChannelMode mode)
-{
-	data_->setMainOutputChannelMode(mode);
-}
-
-void AudioPassthru::setMainOutputDelay(int delay_ms)
-{
-	data_->setMainOutputDelay(delay_ms);
+	data_->setOutputs(outputs);
 }
 
 bool AudioPassthru::startDelayCalibration()

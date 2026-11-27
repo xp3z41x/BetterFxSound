@@ -26,21 +26,6 @@ FxModel::FxModel()
 	hotkey_support_ = true;
 	language_ = 1;
 	debug_logging_ = false;
-
-	selected_output_device_ = {};
-}
-
-void FxModel::initOutputs(const std::vector<SoundDevice>& output_devices)
-{
-	output_names_.clear();
-	output_devices_ = output_devices;
-
-	for (auto output_device : output_devices_)
-	{
-		output_names_.add(output_device.deviceFriendlyName.c_str());
-	}
-	
-	notifyListeners(Event::OutputListUpdated);
 }
 
 void FxModel::initPresets(const Array<Preset>& presets)

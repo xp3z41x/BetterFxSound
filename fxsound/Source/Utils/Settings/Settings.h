@@ -49,6 +49,11 @@ namespace FxSound
 		void setBool(StringRef key, bool value, bool default_value=false) noexcept;
 		void setJson(juce::StringRef key, const juce::var& json) noexcept;
 
+		// True if the key is stored in the user settings (the defaults are not checked).
+		bool   containsKey(juce::StringRef key) noexcept;
+		// Removes the key from the user settings.
+		void   removeValue(juce::StringRef key) noexcept;
+
 	private:
 		ApplicationProperties app_default_properties_;
 		ApplicationProperties app_user_properties_;

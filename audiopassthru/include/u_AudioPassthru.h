@@ -28,6 +28,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include <vector> 
 #include <map>
 #include <atomic>
+#include <mutex>
+#include <string>
 
 class DspProcessingModule
 {
@@ -55,9 +57,7 @@ public:
     bool isPlaybackDeviceAvailable();
 	bool checkDeviceChanges();
 	void restoreDefaultPlaybackDevice();
-	void setAdditionalOutputs(const std::vector<AdditionalOutputConfig>& outputs);
-	void setMainOutputChannelMode(OutputChannelMode mode);
-	void setMainOutputDelay(int delay_ms);
+	void setOutputs(const std::vector<OutputConfig>& outputs);
 	bool startDelayCalibration();
 	void cancelDelayCalibration();
 	int getDelayCalibrationState(int* progress_percent);
@@ -66,8 +66,12 @@ public:
 
 private:
 	void applyMainDelay(float* buffer, UINT32 frames, UINT32 channels, UINT32 sample_rate);
+	void applyCarrierGain(float* buffer, UINT32 frames, UINT32 channels, UINT32 sample_rate);
 
+	// Recomputes the carrier settings and the additional outputs from the requested outputs and the
+	// current carrier. Called after every change and after every reinit (the carrier may have changed).
 	void applyAdditionalOutputs();
+	bool isDevicePresent(const std::wstring& device_id) const;
 
 	int sndDeviceHandleToSoundDevices(bool active_devices = true);
 	static void onDeviceChange();
@@ -87,12 +91,27 @@ private:
 	DfxDsp *p_dfx_dsp_;
 	static AudioPassthruCallback *s_callback_;
 
-	// BetterFxSound: additional outputs, as requested by the UI and as currently applied.
-	std::vector<AdditionalOutputConfig> additional_outputs_;
-	MultiOutputRouter multi_output_;
-	std::atomic<int> main_channel_mode_{ 0 };	// OutputChannelMode of the main output
+	// BetterFxSound: requested outputs (UI/timer threads only, guarded by config_mutex_, never
+	// touched by the audio threads).
+	std::mutex config_mutex_;
+	bool legacy_mode_ = true;					// setOutputs() not called yet
+	std::vector<OutputConfig> outputs_;			// As passed to setOutputs()
+	std::vector<AdditionalOutputConfig> additional_outputs_;	// Legacy: as passed to setAdditionalOutputs()
+	int legacy_main_delay_ms_ = 0;
+	OutputChannelMode legacy_main_channel_mode_ = OutputChannelMode::Both;
+	std::wstring pending_carrier_id_;			// Asked for by setAsPlaybackDevice(), until the next reinit
+	bool apply_pending_ = false;				// A change arrived during a measurement, apply it afterwards
 
-	// Main output delay line (processing thread only, except main_delay_ms_).
+	MultiOutputRouter multi_output_;
+
+	// Carrier output, the device on the original low latency path. Written by the UI/timer threads,
+	// read by the processing thread.
+	std::atomic<bool> carrier_enabled_{ true };
+	std::atomic<float> carrier_trim_{ 1.0f };
+	std::atomic<int> main_channel_mode_{ 0 };	// OutputChannelMode of the carrier
+	float carrier_gain_ = 0.0f;					// Processing thread only: current, ramped gain
+
+	// Carrier delay line (processing thread only, except main_delay_ms_).
 	static constexpr UINT32 kMainDelayFrames = 1u << 16;	// ~1.36 s at 48 kHz
 	static constexpr UINT32 kMainDelayChannels = 8;
 	std::atomic<int> main_delay_ms_{ 0 };
@@ -100,10 +119,10 @@ private:
 	UINT32 main_delay_write_ = 0;
 	UINT32 main_delay_format_ = 0;
 
-	// Delay measurement. While it runs only one output plays: -1 = main, k = additional output k.
+	// Delay measurement. While it runs only one output plays: -1 = carrier, k = additional output k.
 	// solo_ is declared before calibration_ so it outlives the measurement thread that sets it.
 	std::atomic<int> solo_{ DelayCalibration::kSoloNone };
-	std::vector<AdditionalOutputConfig> effective_outputs_;	// As passed to multi_output_
+	std::vector<AdditionalOutputConfig> effective_outputs_;	// As passed to multi_output_ (guarded by config_mutex_)
 	DelayCalibration calibration_;
 };
 
