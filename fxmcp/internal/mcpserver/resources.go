@@ -34,7 +34,7 @@ func (a *App) registerResources(s *mcp.Server) {
 		URI:  uriStatus,
 		Name: "status",
 		Description: "The running FxSound instance's current state: power, presets, selected preset, " +
-			"output devices, selected output, equalizer, and effect levels (0-10 scale). Requires FxSound " +
+			"output devices, per-output state (enabled, volume, delay, channel mode), selected output (first enabled), equalizer, and effect levels (0-10 scale). Requires FxSound " +
 			"to be running -- read fxsound://diagnostics or call fxsound_is_running to check first.",
 		MIMEType: "application/json",
 	}, a.readStatus)

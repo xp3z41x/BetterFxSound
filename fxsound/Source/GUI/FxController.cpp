@@ -368,6 +368,10 @@ void FxController::applyConfig(const String& commandline)
 	auto power_state = arg_list.getValueForOption("--power");
 	auto view = arg_list.getValueForOption("--view");
 	auto output_device = arg_list.getValueForOption("--output").unquoted();
+	auto enable_output = arg_list.getValueForOption("--enable-output").unquoted();
+	auto disable_output = arg_list.getValueForOption("--disable-output").unquoted();
+	auto output_volume = arg_list.getValueForOption("--output-volume").unquoted();
+	auto output_delay = arg_list.getValueForOption("--output-delay").unquoted();
 	auto language = arg_list.getValueForOption("--language");
 	auto numbands = arg_list.getValueForOption("--num_bands");
 	auto balance = arg_list.getValueForOption("--balance");
@@ -473,6 +477,62 @@ void FxController::applyConfig(const String& commandline)
 				break;
 			}
 		}
+	}
+
+	// BetterFxSound outputs rework: per-output options. Outputs are matched by friendly name, as with
+	// --output. A connected output wins over a disconnected one with the same name. Enabling needs the
+	// device to be connected; the other options also work on an enabled output that is not connected.
+	auto findOutputByName = [this](const String& name, String& id) -> bool
+	{
+		bool found = false;
+		for (auto& output : getOutputs())
+		{
+			if (output.name == name && (output.present || !found))
+			{
+				id = output.id;
+				found = true;
+				if (output.present)
+					break;
+			}
+		}
+		return found;
+	};
+
+	// "<name>:<number>": the name may contain ':', so split on the last one.
+	auto parseNameAndValue = [](const String& arg, String& name, int& value) -> bool
+	{
+		auto colon = arg.lastIndexOfChar(':');
+		if (colon <= 0)
+			return false;
+		auto number = arg.substring(colon + 1).trim();
+		if (number.isEmpty() || !number.containsOnly("0123456789"))
+			return false;
+		name = arg.substring(0, colon);
+		value = number.getIntValue();
+		return true;
+	};
+
+	String output_id;
+	if (enable_output.isNotEmpty() && findOutputByName(enable_output, output_id))
+	{
+		setOutputEnabled(output_id, true);
+	}
+	if (disable_output.isNotEmpty() && findOutputByName(disable_output, output_id))
+	{
+		setOutputEnabled(output_id, false);
+	}
+
+	String output_arg_name;
+	int output_arg_value = 0;
+	if (output_volume.isNotEmpty() && parseNameAndValue(output_volume, output_arg_name, output_arg_value) &&
+		output_arg_value <= 100 && findOutputByName(output_arg_name, output_id))
+	{
+		setOutputVolume(output_id, output_arg_value);
+	}
+	if (output_delay.isNotEmpty() && parseNameAndValue(output_delay, output_arg_name, output_arg_value) &&
+		output_arg_value <= 500 && findOutputByName(output_arg_name, output_id))
+	{
+		setOutputDelay(output_id, output_arg_value);
 	}
 
 	// ------------------------------------------------------------------------------------------
@@ -656,7 +716,37 @@ void FxController::printStatus()
 			output_devices.add(String(device.deviceFriendlyName.c_str()));
 	}
 	settings->setProperty("output_devices", output_devices);
-	settings->setProperty("selected_output", getOutputName());
+
+	// BetterFxSound outputs rework: every output with its own state. selected_output is kept for
+	// compatibility: the first enabled output (the carrier, getOutputName(), may be a silent one).
+	Array<var> outputs;
+	String first_enabled_output;
+	for (auto& output : getOutputs())
+	{
+		auto* output_obj = new DynamicObject();
+		output_obj->setProperty("id", output.id);
+		output_obj->setProperty("name", output.name);
+		output_obj->setProperty("enabled", output.enabled);
+		output_obj->setProperty("present", output.present);
+		output_obj->setProperty("volume", output.volume_percent);
+		output_obj->setProperty("delay_ms", output.delay_ms);
+
+		const char* channel_mode = "both";
+		switch (output.channel_mode)
+		{
+		case OutputChannelMode::Left: channel_mode = "left"; break;
+		case OutputChannelMode::Right: channel_mode = "right"; break;
+		case OutputChannelMode::Mono: channel_mode = "mono"; break;
+		default: break;
+		}
+		output_obj->setProperty("channel_mode", String(channel_mode));
+
+		outputs.add(var(output_obj));
+		if (output.enabled && first_enabled_output.isEmpty())
+			first_enabled_output = output.name;
+	}
+	settings->setProperty("outputs", outputs);
+	settings->setProperty("selected_output", first_enabled_output);
 
 	Array<var> bands;
 	for (int i = 0; i < getNumEqBands(); i++)

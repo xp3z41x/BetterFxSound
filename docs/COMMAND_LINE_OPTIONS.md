@@ -21,7 +21,11 @@ Values containing spaces (preset names, device names) must be wrapped in double 
 | `--undo_preset` | *(flag, no value)* | Reverts the currently selected preset's unsaved changes. No-op if power is off or the preset isn't modified. Exclusive with the other preset commands below. |
 | `--rename_preset=<name>` | New preset name | Renames the currently selected user preset. `name` is sanitized first - see [Preset commands](#preset-commands). No-op if power is off, the preset has unsaved changes, the selected preset is a built-in preset, or `name` is empty after sanitizing. Exclusive with the other preset commands below. |
 | `--delete_preset` | *(flag, no value)* | Deletes the currently selected user preset. No-op if power is off or the selected preset is a built-in preset. Exclusive with the other preset commands below. |
-| `--output=<device>` | Output device's friendly name | Selects the audio output device. Must match a device name returned by Windows exactly. |
+| `--output=<device>` | Output device's friendly name | Enables only this output and disables every other one. Must match a connected device's name returned by Windows exactly; ignored if no connected device has that name. |
+| `--enable-output=<device>` | Output device's friendly name | Enables this output, leaving the others as they are. Running instance only. The device must be connected. |
+| `--disable-output=<device>` | Output device's friendly name | Disables this output, leaving the others as they are. Running instance only. With every output disabled, FxSound plays silence. |
+| `--output-volume=<device>:<0-100>` | Friendly name, then `:`, then an integer `0`–`100` | Sets this output's volume trim in percent, on top of the Windows master volume (which applies to every output). Running instance only. |
+| `--output-delay=<device>:<0-500>` | Friendly name, then `:`, then an integer `0`–`500` | Sets this output's delay in milliseconds. Running instance only. |
 | `--view=<1\|2>` | `1` = Lite, `2` = Full | Switches the UI between Lite and Full view. |
 | `--language=<code>` | Language code, e.g. `en`, `fr`, `fi` | Sets the display language. Falls back to the saved language, then the system display language, if omitted. |
 | `--num_bands=<n>` | Integer, one of `5`, `10`, `15`, `20`, `31` | Sets the number of equalizer bands. Default: `10`. |
@@ -32,8 +36,14 @@ Values containing spaces (preset names, device names) must be wrapped in double 
 | `--set_band_freq=<band:freq[,band:freq...]>` | `band` = 0-based band index, `freq` = frequency in Hz | Sets one or more equalizer band center frequencies on a running instance. `band` must be less than the current number of bands; `freq` must fall within that band's allowed range or the pair is ignored. Running instance only. |
 | `--set_band_gain=<band:gain[,band:gain...]>` | `band` = 0-based band index, `gain` = decimal, `-12.0`–`+12.0` | Sets one or more equalizer band boost/cut values in dB on a running instance. `band` must be less than the current number of bands, or the pair is ignored. Running instance only. |
 | `--set_effect=<name:value[,name:value...]>` | `name` = one of `fidelity`/`clarity`, `ambience`, `surround`, `dynamicboost`/`dynamic_boost`, `bass`/`bassboost`/`bass_boost`; `value` = decimal, `0.0`–`10.0` | Sets one or more effect levels on a running instance. Out-of-range values are ignored (left unchanged) rather than reset to a default. Running instance only. |
-| `--status` | *(flag, no value)* | Writes the running instance's current state (power, presets, output devices, equalizer, effects) as JSON to `%APPDATA%\FxSound\status.json`; any other options passed alongside `--status` are ignored. |
+| `--status` | *(flag, no value)* | Writes the running instance's current state (power, presets, output devices, per-output state, equalizer, effects) as JSON to `%APPDATA%\FxSound\status.json`; any other options passed alongside `--status` are ignored. |
 | `--run_minimized` | *(flag, no value)* | Starts FxSound minimized to the system tray without showing the main window. On a running instance, only affects visibility for that launch (hides the main window instead of bringing it to the front). |
+
+## Output commands
+
+Outputs are a flat list: each one can be enabled or disabled, and with none enabled FxSound plays silence. There is no main output. The Windows master volume applies to every enabled output; `--output-volume` is a per-output trim on top of it.
+
+`--output`, `--enable-output`, `--disable-output`, `--output-volume` and `--output-delay` match outputs by friendly name, exactly. For `--output-volume` and `--output-delay` the name is split from the number at the **last** colon, so names that contain `:` work. Quote the whole value when it has spaces: `--output-volume="Speakers (Realtek):50"`. Values out of range, or a name that matches no output, are ignored. Each output's state (`enabled`, `present`, `volume`, `delay_ms`, `channel_mode`) is reported in the `outputs` array of `status.json`; `selected_output` there is the first enabled output.
 
 ## Preset commands
 
@@ -107,6 +117,13 @@ Set individual equalizer band frequencies and gains on a running instance:
 
 ```
 fxsound.exe --set_band_freq="0:60,1:150" --set_band_gain="0:3.0,1:-2.5"
+```
+
+Play on the headphones only, then also add the speakers at half volume with a 40 ms delay:
+
+```
+fxsound.exe --output="Headphones (USB Audio)"
+fxsound.exe --enable-output="Speakers (Realtek High Definition Audio)" --output-volume="Speakers (Realtek High Definition Audio):50" --output-delay="Speakers (Realtek High Definition Audio):40"
 ```
 
 Set effect levels on a running instance:

@@ -8,7 +8,7 @@ FxSound includes an MCP ([Model Context Protocol](https://modelcontextprotocol.i
 - "Tune the equalizer for a podcast -- more clarity, less bass."
 - "Save my current settings as a new preset called 'Racing Games'."
 
-It exposes FxSound's diagnostics (device/session state) and its full command-line control interface (power, presets, equalizer, effects, output device) as MCP resources, tools, and prompts. Everything runs locally: it launches the already-installed `FxSound.exe`/`fxdiag.exe` and reads their local output -- no data is sent anywhere.
+It exposes FxSound's diagnostics (device/session state) and its full command-line control interface (power, presets, equalizer, effects, outputs: enable/disable, volume, delay) as MCP resources, tools, and prompts. Everything runs locally: it launches the already-installed `FxSound.exe`/`fxdiag.exe` and reads their local output -- no data is sent anywhere.
 
 ## Requirements
 
