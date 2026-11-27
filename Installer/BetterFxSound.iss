@@ -15,7 +15,7 @@
 ; the user's data: %APPDATA%\FxSound and HKCU\SOFTWARE\DFX are never touched.
 ;
 ; Build (paths are relative to this file unless absolute):
-;   iscc /DAppVersion=1.0.0 /DFxSoundExe=<FxSound.exe> /DFxDiagExe=<fxdiag.exe>
+;   iscc /DAppVersion=1.0.1 /DFxSoundExe=<FxSound.exe> /DFxDiagExe=<fxdiag.exe>
 ;        [/DFxMcpExe=<fxmcp.exe>] [/DOutputDir=<dir>] Installer\BetterFxSound.iss
 ;
 ; Setup command-line switches besides the standard Inno Setup ones:
@@ -23,7 +23,7 @@
 ;                driver. Used by the CI smoke test.
 
 #ifndef AppVersion
-  #define AppVersion "1.0.0"
+  #define AppVersion "1.0.1"
 #endif
 #ifndef FxSoundExe
   #define FxSoundExe "..\fxsound\Project\x64\Release\App\FxSound.exe"
