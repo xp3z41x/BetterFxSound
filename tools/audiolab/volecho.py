@@ -29,8 +29,8 @@ class Cb(AudioEndpointVolumeCallback):
         super().__init__()
         self.t0 = t0
 
-    def on_notify(self, new_volume, new_volume_db, new_mute, event_context, channels, channel_volumes):
-        ctx = str(event_context)
+    def on_notify(self, new_volume, new_mute, event_context, channels, channel_volumes):
+        ctx = str(event_context.contents) if event_context else "{00000000-0000-0000-0000-000000000000}"
         who = "TAGGED (ours)" if ctx.lower() == str(TAG).lower() else ("NULL" if ctx == "{00000000-0000-0000-0000-000000000000}" else ctx)
         print(f"  {time.time() - self.t0:7.3f}s  notify level={new_volume * 100:6.2f}% mute={new_mute}  context={who}", flush=True)
 

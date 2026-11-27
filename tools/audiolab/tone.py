@@ -45,7 +45,10 @@ def main(seconds, level):
             except Exception as e:  # stream invalidated by a device change: open it again
                 reopen += 1
                 print(f"reopen after {type(e).__name__}: {e}", flush=True)
-                time.sleep(0.2)
+                # PortAudio caches the device list (format, sample rate): start it again to see the new format.
+                p.terminate()
+                time.sleep(0.3)
+                p = pa.PyAudio()
     finally:
         p.terminate()
     print(f"done, {reopen} reopen(s)")
