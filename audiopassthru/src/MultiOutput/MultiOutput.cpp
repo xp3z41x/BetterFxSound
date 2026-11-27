@@ -262,6 +262,7 @@ public:
 	static constexpr DWORD kRetryMs = 1000;                   // Retry interval when the device is missing
 	static constexpr DWORD kIdleStopMs = 2000;                // Stop the stream after this much silence
 	static constexpr int kRealignMs = 3;                      // Delay changes from this size on are applied at once
+	static constexpr double kRealignErrorSecs = 0.020;        // A lasting offset from the target this big is too
 
 	// Creates the output and starts its render thread. The thread holds its own reference to the output, so the
 	// output is freed only once the thread no longer uses it (see requestStop()).
@@ -642,6 +643,7 @@ private:
 		frac_ = 3.0; // Pull three frames before the first output frame.
 		ratio_ = 1.0;
 		error_avg_ = 0.0;
+		hold_frames_ = 0;
 	}
 
 	bool pullFrame()
@@ -668,14 +670,15 @@ private:
 		const double rate = static_cast<double>(sample_rate_);
 		const UINT32 target = static_cast<UINT32>((kBaseLatencyMs + delay_ms_.load(std::memory_order_relaxed)) * rate / 1000.0);
 		const UINT32 slack = static_cast<UINT32>(rate * 0.15); // 150 ms
-		UINT32 fill = write_pos_.load(std::memory_order_acquire) - read_pos_.load(std::memory_order_relaxed);
+		// Silence still to be played before the queued audio (a raised delay) counts as queued.
+		UINT32 fill = write_pos_.load(std::memory_order_acquire) - read_pos_.load(std::memory_order_relaxed) + hold_frames_;
 
 		if (primed_)
 		{
-			// The delay was changed: from a few ms on, the queue is lined up with the new target at once, as the
-			// carrier does, instead of leaving it to the drift correction below, which moves at most 0.5% and
-			// would take up to a minute to get there. The output fades out first (realign_pending_), then the
-			// queued audio is cut or padded with silence, then it fades back in.
+			// The delay was changed: from a few ms on, the output moves by the change at once, as the carrier
+			// does, instead of leaving it to the drift correction below, which moves at most 0.5% and would take
+			// up to a minute to get there. The output fades out first (realign_pending_), then the queued audio
+			// is cut by the change or that much silence is played first, then it fades back in.
 			const UINT32 moved = target > aligned_target_ ? target - aligned_target_ : aligned_target_ - target;
 			if (!realign_pending_ && moved >= static_cast<UINT32>(rate * kRealignMs / 1000.0))
 				realign_pending_ = true;
@@ -739,6 +742,12 @@ private:
 		// 10% of the (smoothed) error per second keeps the pitch change far below audibility.
 		const double error_secs = (static_cast<double>(fill) - static_cast<double>(target)) / rate;
 		error_avg_ += (error_secs - error_avg_) * 0.02;
+		// A lasting offset is lined up at once too: typically a Bluetooth stream that was idle and took ~0.1 s
+		// to start consuming after Start() while the queue kept filling. Left to the drift correction, the
+		// output stayed that much late, out of sync with the others, for about a minute after every pause in
+		// the audio. Clock drift alone keeps the smoothed error near 1 ms.
+		if (!realign_pending_ && (error_avg_ > kRealignErrorSecs || error_avg_ < -kRealignErrorSecs))
+			realign_pending_ = true;
 		double adjust = error_avg_ * 0.1;
 		if (adjust > 0.005) adjust = 0.005;
 		if (adjust < -0.005) adjust = -0.005;
@@ -758,6 +767,14 @@ private:
 
 		for (; produced < space; produced++)
 		{
+			if (hold_frames_ > 0)
+			{
+				// Silence first, for a raised delay (see below). Nothing is pulled meanwhile.
+				std::memset(out + static_cast<size_t>(produced) * channels_, 0, channels_ * sizeof(float));
+				hold_frames_--;
+				continue;
+			}
+
 			while (frac_ >= 1.0)
 			{
 				if (!pullFrame())
@@ -797,22 +814,34 @@ private:
 			primed_ = false;
 			idle_since_ = now;
 		}
-		else if (realign_pending_ && current_gain_ < 0.01f)
+		else if (realign_pending_ && (current_gain_ < 0.01f || hold_frames_ > 0))
 		{
-			// Faded out: line the queue up with the new target. Too much queued (delay lowered): skip the
-			// difference. Too little (delay raised): play silence until the queue is built up again. Either way
-			// the output fades back in from silence.
-			const UINT32 queued = write_pos_.load(std::memory_order_acquire) - read_pos_.load(std::memory_order_relaxed);
-			if (queued > target)
+			// Faded out: move the output. For a delay change, by exactly the change, so the queue keeps its
+			// level relative to the target (the writes are bursty, the instantaneous level is not the mean). For
+			// a lasting offset, by the offset. Later: skip that much queued audio. Earlier: play that much silence
+			// first. Either way the output fades back in from silence.
+			const UINT32 r = read_pos_.load(std::memory_order_relaxed);
+			const UINT32 queued = write_pos_.load(std::memory_order_acquire) - r;
+			const INT64 shift = (target != aligned_target_)
+				? static_cast<INT64>(aligned_target_) - static_cast<INT64>(target)
+				: static_cast<INT64>(queued) + static_cast<INT64>(hold_frames_) - static_cast<INT64>(target);
+			if (shift > 0)
 			{
-				read_pos_.store(read_pos_.load(std::memory_order_relaxed) + (queued - target), std::memory_order_release);
-				resetResampler();
+				// Silence not played yet goes first, then queued audio.
+				const UINT32 from_hold = static_cast<UINT64>(shift) < hold_frames_ ? static_cast<UINT32>(shift) : hold_frames_;
+				hold_frames_ -= from_hold;
+				const UINT64 rest = static_cast<UINT64>(shift) - from_hold;
+				if (rest > 0)
+				{
+					read_pos_.store(r + (rest < queued ? static_cast<UINT32>(rest) : queued), std::memory_order_release);
+					resetResampler();
+				}
 			}
-			else if (queued < target)
+			else if (shift < 0)
 			{
-				primed_ = false;
-				idle_since_ = now;
+				hold_frames_ += static_cast<UINT32>(-shift);
 			}
+			error_avg_ = 0.0;
 			current_gain_ = 0.0f;
 			aligned_target_ = target;
 			realign_pending_ = false;
@@ -876,6 +905,7 @@ private:
 	double error_avg_ = 0.0;
 	float current_gain_ = 0.0f;
 	UINT32 aligned_target_ = 0;		// Queue target (frames) the output was last lined up with
+	UINT32 hold_frames_ = 0;		// Silence to play before pulling from the queue again (a raised delay)
 	bool realign_pending_ = false;	// The delay changed: fading out before lining up with the new target
 };
 
