@@ -26,6 +26,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "file.h"
 #include "qnt.h"
 #include <string>
+#include <string.h>
 
 #include "BinauralSyn.h"
 #include "ptutil\dfxp\u_dfxp.h"
@@ -168,6 +169,15 @@ int DfxDspPrivate::processAudio(short int *si_input_samples, short int *si_outpu
 	// copy a stale registry gain back over one the UI had just set (or communicate stale
 	// effect values over newer ones). The EQ sync now runs on the thread that changes the
 	// EQ (eqSyncFromRegistry()), so nothing here touches the registry or takes a lock.
+	// BetterFxSound: a format change setSignalFormat() could not apply yet (lock busy) leaves
+	// the DSP set up for the old format, so pass this block through untouched until it is.
+	if (format_pending_)
+	{
+		if ((si_output_samples != si_input_samples) && (i_num_sample_sets > 0) && (pending_frame_bytes_ > 0))
+			memmove(si_output_samples, si_input_samples, (size_t)i_num_sample_sets * (size_t)pending_frame_bytes_);
+		return OKAY;
+	}
+
 	// Apply DFX processing here using data and format vars above. Format will always be 32 bit floating point.
 	if (dfxpUniversalModifySamples(dfxp_handle_, si_input_samples, si_output_samples, i_num_sample_sets, i_check_for_duplicate_buffers) != OKAY)
 		return(NOT_OKAY);
@@ -182,11 +192,23 @@ int DfxDspPrivate::setSignalFormat(int i_bps, int i_nch, int i_srate, int i_vali
 	// the registry and writes it to the DSP, so it must not interleave with a setter on another
 	// thread or it could communicate a value older than the one that setter just applied. Take
 	// the parameter lock only for a real format change, so the steady state stays lock-free.
+	// This runs on the time-critical processing thread and the UI can hold the lock for a long
+	// time (a preset load reads a file and writes/reads dozens of registry values under it), so
+	// only try it: if it is busy, keep the old last_signal_* so the next buffer retries, and let
+	// processAudio() pass the blocks through unprocessed meanwhile.
 	if ((i_bps == last_signal_bps_) && (i_nch == last_signal_nch_) &&
 		(i_srate == last_signal_srate_) && (i_valid_bits == last_signal_valid_bits_))
 		return OKAY;
 
-	DfxDspParamLock lock(&param_lock_);
+	if (!TryEnterCriticalSection(&param_lock_))
+	{
+		format_pending_ = true;
+		pending_frame_bytes_ = (i_bps / 8) * i_nch;
+		return(NOT_OKAY);
+	}
+	DfxDspParamLock lock(&param_lock_, true);
+
+	format_pending_ = false;
 
 	last_signal_bps_ = i_bps;
 	last_signal_nch_ = i_nch;

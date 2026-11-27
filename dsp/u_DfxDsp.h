@@ -80,6 +80,8 @@ class DfxDspParamLock
 {
 public:
 	explicit DfxDspParamLock(CRITICAL_SECTION *cs) : cs_(cs) { EnterCriticalSection(cs_); }
+	// Adopts a lock the caller already holds (e.g. from TryEnterCriticalSection).
+	DfxDspParamLock(CRITICAL_SECTION *cs, bool /*already_held*/) : cs_(cs) {}
 	~DfxDspParamLock() { LeaveCriticalSection(cs_); }
 	DfxDspParamLock(const DfxDspParamLock&) = delete;
 	DfxDspParamLock& operator=(const DfxDspParamLock&) = delete;
@@ -165,7 +167,9 @@ private:
 	// the registry before another thread stored the newer one and then communicate the stale
 	// value last. processAudio() never takes it; the processing thread only takes it in
 	// setSignalFormat() when the format really changes, a rare reinit that already re-reads
-	// every setting. Recursive, so a locked method may call another locked method.
+	// every setting. Recursive, so a locked method may call another locked method. The
+	// processing thread only ever try-locks it (see setSignalFormat()), so a setter or a
+	// preset load holding it never stalls the audio.
 	CRITICAL_SECTION param_lock_;
 
 	// BetterFxSound: last format handed to setSignalFormat() (processing thread only), so the
@@ -174,6 +178,13 @@ private:
 	int last_signal_nch_ = -1;
 	int last_signal_srate_ = -1;
 	int last_signal_valid_bits_ = -1;
+
+	// BetterFxSound: set (processing thread only) while a new format could not be applied
+	// because param_lock_ was busy. processAudio() then passes the block through unprocessed,
+	// since the DSP is still set up for the old format, and setSignalFormat() retries on the
+	// next buffer. pending_frame_bytes_ is the size of one sample set in the new format.
+	bool format_pending_ = false;
+	int pending_frame_bytes_ = 0;
 	int headphone_on_;
 	int music_mode_;     /* DFXP_MUSIC_MODE_MUSIC1, DFXP_MUSIC_MODE_MUSIC2, DFXP_MUSIC_MODE_SPEECH */
 
