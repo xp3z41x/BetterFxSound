@@ -548,6 +548,12 @@ begin
   DevCon := DrvDir + '\fxdevcon64.exe';
   if FileExists(DevCon) then
     RunCapture(DevCon, 'remove', DrvDir, Output);
+  { The values InstallDriver recorded describe the device that is now gone. }
+  RegDeleteValue(HKLM64, DfxDevicesKey, 'dfx_guid');
+  RegDeleteValue(HKLM64, DfxDevicesKey, 'default_buffer_size');
+  RegDeleteKeyIfEmpty(HKLM64, DfxDevicesKey);
+  RegDeleteKeyIfEmpty(HKLM64, 'Software\DFX\23');
+  RegDeleteKeyIfEmpty(HKLM64, 'Software\DFX');
 end;
 
 { The app's "Launch on system startup" toggle writes HKCU\...\Run\FxSound with the

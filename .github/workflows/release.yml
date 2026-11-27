@@ -278,6 +278,8 @@ jobs:
           Assert (-not (Test-Path "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\BetterFxSound.lnk")) "Start menu shortcut removed"
           Assert (-not (Test-Path 'HKLM:\SOFTWARE\BetterFxSound')) "HKLM\SOFTWARE\BetterFxSound removed"
           Assert ($log -match 'fxdevcon64.exe" remove -> started=1 exit=0') "driver removed by the uninstall"
+          $dfxDevices = Get-ItemProperty 'HKLM:\SOFTWARE\DFX\23\devices' -ErrorAction SilentlyContinue
+          Assert ($null -eq $dfxDevices -or ($null -eq $dfxDevices.dfx_guid -and $null -eq $dfxDevices.default_buffer_size)) "driver values setup recorded in HKLM\SOFTWARE\DFX removed"
           Write-Host "Left behind on purpose: $env:APPDATA\FxSound (settings, presets), HKCU\SOFTWARE\DFX. Other leftovers:"
           foreach ($path in "$env:ProgramData\FxSound", 'HKLM:\SOFTWARE\DFX') {
             if (Test-Path $path) { Write-Host "  $path"; Get-ChildItem $path -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "    $($_.Name)" } }
