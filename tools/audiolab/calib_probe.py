@@ -235,6 +235,80 @@ def analyze(run_dir, targets):
         print(line)
 
 
+def _load_mono(run_dir, stream):
+    data = np.load(os.path.join(run_dir, stream["file"])).astype(np.float64)
+    ch = stream["channels"]
+    data = data[: len(data) // ch * ch].reshape(-1, ch).mean(axis=1)
+    return data, sample_times(stream)[: len(data)]
+
+
+def _find_arrival(rec, chirp, start, max_lag, rate, look_back_ms):
+    """DelayCalibration's findArrival. look_back_ms=None is the 1.0.0 rule (earliest peak >= 50%
+    anywhere before the strongest one). Returns (lag ms, confidence of the strongest peak,
+    confidence of the chosen peak) or None."""
+    seg = rec[start:start + max_lag + len(chirp)]
+    if len(seg) < max_lag + len(chirp):
+        return None
+    nfft = 1 << (len(seg) + len(chirp)).bit_length()
+    corr = np.abs(np.fft.irfft(np.fft.rfft(seg, nfft) * np.conj(np.fft.rfft(chirp, nfft)), nfft)[:max_lag])
+    peak = corr.max()
+    rms = np.sqrt(np.mean(corr ** 2))
+    if peak <= 0 or rms <= 0:
+        return None
+    top = int(np.argmax(corr))
+    lb = 0 if look_back_ms is None else max(0, top - int(look_back_ms * rate / 1000))
+    lag = lb + int(np.argmax(corr[lb:top + 1] >= 0.5 * peak))
+    end = min(max_lag, lag + rate // 500)
+    best = lag + int(np.argmax(corr[lag:end]))
+    return best * 1000.0 / rate, peak / rms, corr[best] / rms
+
+
+def _combine_old(vals):
+    ok = [v for v in vals if v and v[1] >= 6.0]
+    return float(np.median([v[0] for v in ok])) if len(ok) >= 2 else None
+
+
+def _combine_new(vals, min_conf=8.0, agree_ms=40.0):
+    ok = [v for v in vals if v and v[2] >= min_conf]
+    best = None
+    for v in ok:
+        group = [w for w in ok if abs(w[0] - v[0]) <= agree_ms]
+        key = (len(group), sum(w[2] for w in group))
+        if best is None or key > best[0]:
+            best = (key, group)
+    if not best or len(best[1]) < 2:
+        return None
+    return float(np.median([w[0] for w in best[1]]))
+
+
+def replay(run_dir, targets, delays):
+    """Runs DelayCalibration's analysis, as in 1.0.0 and as fixed, on a recording of a real sync.
+    The sweeps are located in the FxSound virtual device's loopback (emission) and in the mic."""
+    with open(os.path.join(run_dir, "meta.json"), encoding="utf-8") as f:
+        meta = json.load(f)
+    mic = next(s for s in meta["streams"] if s["kind"] == "mic")
+    virt = next(s for s in meta["streams"] if "FxSound" in s["name"])
+    vx, vt = _load_mono(run_dir, virt)
+    emissions = [vt[i] for i, _, _ in detect(vx, virt["rate"])]
+    mx, mt = _load_mono(run_dir, mic)
+    rate = mic["rate"]
+    chirp = make_chirp(rate)
+    names = [x.strip() for x in targets.split(",")]
+    dl = [int(x) for x in delays.split(",")] if delays else [0] * len(names)
+    per = {n: ([], []) for n in names}
+    for k, e in enumerate(emissions):
+        t = k % len(names)
+        i0 = int(np.searchsorted(mt, e))
+        per[names[t]][0].append(_find_arrival(mx, chirp, i0, rate, rate, None))
+        per[names[t]][1].append(_find_arrival(mx, chirp, i0, int(rate * (1.0 + min(max(dl[t], 0), 500) / 1000)), rate, 30))
+    fmt = lambda vals: " ".join(f"{v[0]:5.0f}/{v[2]:4.1f}" if v else "    none " for v in vals)
+    show = lambda x: "not measured" if x is None else f"{x:.0f} ms"
+    print(f"{len(emissions)} sweeps, {len(names)} targets; each repetition is lag ms / confidence of the chosen peak")
+    for n in names:
+        old, new = per[n]
+        print(f"  {n:24s} 1.0.0: {fmt(old)} -> {show(_combine_old(old)):12s}  fixed: {fmt(new)} -> {show(_combine_new(new))}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -246,11 +320,17 @@ def main():
     a = sub.add_parser("analyze")
     a.add_argument("dir")
     a.add_argument("--targets", default="", help="comma separated, in measurement order")
+    p = sub.add_parser("replay", help="DelayCalibration's analysis, 1.0.0 vs fixed, on a recording")
+    p.add_argument("dir")
+    p.add_argument("--targets", required=True, help="comma separated, in measurement order (carrier first)")
+    p.add_argument("--delays", default="", help="each target's delay in ms when the sync ran, same order")
     args = ap.parse_args()
     if args.cmd == "list":
         list_devices()
     elif args.cmd == "record":
         record(args.seconds, args.out, args.mic)
+    elif args.cmd == "replay":
+        replay(args.dir, args.targets, args.delays)
     else:
         analyze(args.dir, args.targets)
 
