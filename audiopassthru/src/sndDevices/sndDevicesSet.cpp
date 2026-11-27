@@ -86,7 +86,7 @@ int PT_DECLSPEC sndDevicesRequestTargetedPlaybackDevice(PT_HANDLE *hp_sndDevices
 		return(NOT_OKAY);
 
 	cast_handle->playbackDeviceIsUnavailable = FALSE;
-	cast_handle->stopAudioCaptureAndPlaybackLoop = 1;
+	InterlockedExchange(&(cast_handle->stopAudioCaptureAndPlaybackLoop), 1);
 
 	return(OKAY);
 }

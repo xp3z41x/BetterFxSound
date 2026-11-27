@@ -104,6 +104,8 @@ int PT_DECLSPEC sndDevicesInit(PT_HANDLE *hp_sndDevices, CSlout *hp_slout, int i
 	cast_handle->pEndptVolPlayback  = NULL;
 	cast_handle->ignoreVolumeCallbacks = FALSE;
 	cast_handle->ignoreDeviceCallbacks = FALSE;
+	cast_handle->enumeratedDefaultDeviceNum = SND_DEVICES_DEVICE_NOT_PRESENT;
+	wcscpy(cast_handle->dfxDeviceID, L"");
 
 	// No playback device has been used yet, so there is no mute setting of one to hold onto.
 	// Note these must survive a re-init, they are only reset here in the one time init call.
@@ -248,7 +250,7 @@ int PT_DECLSPEC sndDevicesFree(PT_HANDLE *hp_sndDevices)
 	} */
 
 	// Force the recording thread to exit.
-	cast_handle->stopAudioCaptureAndPlaybackLoop = 1;
+	InterlockedExchange(&(cast_handle->stopAudioCaptureAndPlaybackLoop), 1);
 
 	if( (cast_handle->initializationMode == SND_DEVICES_INIT_FOR_PROCESSING))
 	{

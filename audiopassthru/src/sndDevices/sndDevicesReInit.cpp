@@ -80,7 +80,10 @@ int PT_DECLSPEC sndDevicesReInit(PT_HANDLE *hp_sndDevices, int i_initType, int *
 	cast_handle->playbackIsActive = SND_DEVICES_PLAYBACK_IS_STOPPED;
 	cast_handle->playbackStreamIsTemporarilyPaused = 0;
 
-	cast_handle->stopAudioCaptureAndPlaybackLoop = 0;
+	// BetterFxSound: the only place the stop flag is cleared, before the devices are enumerated below. A stop requested
+	// from now on (by a device notification or a carrier switch) is kept, and the processing thread started after this
+	// reinit exits at once so another reinit sees it.
+	InterlockedExchange(&(cast_handle->stopAudioCaptureAndPlaybackLoop), 0);
 
 	wcscpy(cast_handle->lastDeviceAddCallbackGuid, L"");
 	cast_handle->lastDeviceAddCallbackGuidtype = 0;
@@ -337,7 +340,7 @@ int PT_DECLSPEC sndCheckDeviceChanges(PT_HANDLE* hp_sndDevices, BOOL* bp_deviceC
 	if (deviceCount != (UINT)cast_handle->totalNumDevices)
 	{
         *bp_deviceChanged = TRUE;
-		cast_handle->stopAudioCaptureAndPlaybackLoop = 1;
+		InterlockedExchange(&(cast_handle->stopAudioCaptureAndPlaybackLoop), 1);
 		return(OKAY);
 	}
 
@@ -372,7 +375,7 @@ int PT_DECLSPEC sndCheckDeviceChanges(PT_HANDLE* hp_sndDevices, BOOL* bp_deviceC
 					CoTaskMemFree(pID);
 					pDevice->Release();
 					*bp_deviceChanged = TRUE;
-					cast_handle->stopAudioCaptureAndPlaybackLoop = 1;
+					InterlockedExchange(&(cast_handle->stopAudioCaptureAndPlaybackLoop), 1);
 					return(OKAY);
 				}
 
@@ -386,7 +389,7 @@ int PT_DECLSPEC sndCheckDeviceChanges(PT_HANDLE* hp_sndDevices, BOOL* bp_deviceC
 		if (!deviceFound)
 		{
             *bp_deviceChanged = TRUE;
-			cast_handle->stopAudioCaptureAndPlaybackLoop = 1;
+			InterlockedExchange(&(cast_handle->stopAudioCaptureAndPlaybackLoop), 1);
 			return OKAY;
 		}
 	}

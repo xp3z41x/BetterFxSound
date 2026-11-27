@@ -109,8 +109,10 @@ int PT_DECLSPEC sndDevicesGetID(PT_HANDLE *hp_sndDevices, int i_deviceType, wcha
 		break;*/
 
 	case SND_DEVICES_DEFAULT :
-		if( cast_handle->defaultDeviceNum != SND_DEVICES_DEVICE_NOT_PRESENT )
-			wcscpy(wcp_ID, cast_handle->pwszID[ cast_handle->defaultDeviceNum ] );
+		// BetterFxSound: the device notification callbacks write defaultDeviceNum on another thread, read it once.
+		device_num = *(volatile int *)&(cast_handle->defaultDeviceNum);
+		if( (device_num >= 0) && (device_num < SND_DEVICES_MAX_NUM_DEVICES) )
+			wcscpy(wcp_ID, cast_handle->pwszID[ device_num ] );
 		else
 			*ip_resultFlag = SND_DEVICES_DEVICE_NOT_PRESENT;
 		break;
@@ -822,4 +824,51 @@ int PT_DECLSPEC sndDevicesGetPlaybackDeviceAvialblility(PT_HANDLE* hp_sndDevices
     }
 
     return(OKAY);
+}
+
+/*
+ * FUNCTION: sndDevicesGetVirtualDeviceIsDefault()
+ * DESCRIPTION: BetterFxSound. Asks Windows whether the FxSound virtual device is the default playback device (eRender,
+ * eMultimedia) right now. defaultDeviceNum is only updated when the device notification arrives, which happens some
+ * time after the change. *bp_isDefault is FALSE if the virtual device is not known or the query fails.
+ * Uses COM, so it must not be called on the processing thread.
+ */
+int PT_DECLSPEC sndDevicesGetVirtualDeviceIsDefault(PT_HANDLE* hp_sndDevices, BOOL* bp_isDefault)
+{
+	struct sndDevicesHdlType *cast_handle;
+	IMMDeviceEnumeratorPtr pEnumerator = NULL;
+	IMMDevicePtr pDefaultDevice = NULL;
+	LPWSTR pID = NULL;
+	HRESULT hr;
+	int dfx_num;
+
+	*bp_isDefault = FALSE;
+
+	cast_handle = (struct sndDevicesHdlType *)hp_sndDevices;
+
+	if (cast_handle == NULL)
+		return(NOT_OKAY);
+
+	dfx_num = cast_handle->dfxDeviceNum;
+	if ((dfx_num < 0) || (dfx_num >= SND_DEVICES_MAX_NUM_DEVICES) || (cast_handle->pwszID[dfx_num][0] == L'\0'))
+		return(OKAY);
+
+	hr = CoCreateInstance(cast_handle->CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL, cast_handle->IID_IMMDeviceEnumerator, (void**)&pEnumerator);
+	if (FAILED(hr) || pEnumerator == NULL)
+		return(OKAY);
+
+	hr = pEnumerator->GetDefaultAudioEndpoint(eRender, eMultimedia, &pDefaultDevice);
+	if (FAILED(hr) || pDefaultDevice == NULL)
+		return(OKAY);
+
+	hr = pDefaultDevice->GetId(&pID);
+	if (FAILED(hr) || pID == NULL)
+		return(OKAY);
+
+	if (wcscmp(pID, cast_handle->pwszID[dfx_num]) == 0)
+		*bp_isDefault = TRUE;
+
+	CoTaskMemFree(pID);
+
+	return(OKAY);
 }

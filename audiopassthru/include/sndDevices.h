@@ -403,10 +403,23 @@ struct sndDevicesHdlType {
 	float sigPower;
 	int bufferSizeMilliSecs;		// This is the average delay, actual internal buffers are twice this length.
 	//int playback_has_started;
-	int stopAudioCaptureAndPlaybackLoop;
+	// BetterFxSound: written from the device notification threads, the timer thread and the processing thread, so it
+	// is set with InterlockedExchange() and read as a volatile. Only sndDevicesReInit() clears it, before it enumerates
+	// the devices, so a request made at any later point (a device change, a carrier switch) makes the processing
+	// thread started after that reinit exit at once and run another reinit, instead of being lost.
+	volatile LONG stopAudioCaptureAndPlaybackLoop;
 	int dfxDeviceNum;	// The combo 44.1k and 48k hz. DFX device
 	//int dfx48DeviceNum;	// The 48k hz. DFX device
 	int defaultDeviceNum;
+	// BetterFxSound: the Windows default (eRender, eMultimedia) device as read by the last sndDevices_GetAll(). Unlike
+	// defaultDeviceNum, the device notification callbacks never write it, so the device rules can rely on it.
+	int enumeratedDefaultDeviceNum;
+	// BetterFxSound: the ID of the FxSound virtual device, kept across reinits (dfxDeviceNum is reset during one), so
+	// the device notification callbacks can recognize it at any time.
+	wchar_t dfxDeviceID[PT_MAX_GENERIC_STRLEN];
+	// BetterFxSound: odd while sndDevices_GetAll() rewrites the device list. The device notification callbacks read
+	// the list without a lock, and only trust what they read when this was even and unchanged around the read.
+	volatile LONG enumerationSequence;
 	int playbackDeviceNum;
 	int captureDeviceNum;
 	int priorDefaultDeviceNum;
@@ -492,6 +505,7 @@ int PT_DECLSPEC sndDevicesGetRecommendedBufferSizeMilliSecs(PT_HANDLE *, int *);
 int PT_DECLSPEC sndDevicesGetPlayBackStatus(PT_HANDLE *, int *);
 int PT_DECLSPEC sndDevicesGetNumMonoDevices(PT_HANDLE *, int *);
 int PT_DECLSPEC sndDevicesGetPlaybackDeviceAvialblility(PT_HANDLE*, BOOL*);
+int PT_DECLSPEC sndDevicesGetVirtualDeviceIsDefault(PT_HANDLE*, BOOL*);
 
 /* sndDevicesSet.cpp */
 int PT_DECLSPEC sndDevicesSetDeviceType(PT_HANDLE *, int, wchar_t *, int *);

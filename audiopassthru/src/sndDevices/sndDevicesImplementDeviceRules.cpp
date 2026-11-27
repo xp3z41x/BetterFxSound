@@ -100,7 +100,12 @@ int PT_DECLSPEC sndDevicesImplementDeviceRules(PT_HANDLE *hp_sndDevices, int *ip
 		return(OKAY);
 	}
 
-	current_defaultNum = cast_handle->defaultDeviceNum; // The device the system is currently using as the Default device.
+	// The device the system is currently using as the Default device.
+	// BetterFxSound: as read by the enumeration that just ran. defaultDeviceNum can be written meanwhile by the device
+	// notification callbacks (a default change during the reinit also makes it run again).
+	current_defaultNum = cast_handle->enumeratedDefaultDeviceNum;
+	if( (current_defaultNum < 0) || (current_defaultNum >= cast_handle->totalNumDevices) )
+		current_defaultNum = SND_DEVICES_DEVICE_NOT_PRESENT;
 	dfxNum = cast_handle->dfxDeviceNum;
 
 	// Get the default device selection mode (in currently implementation always on).
@@ -151,7 +156,8 @@ int PT_DECLSPEC sndDevicesImplementDeviceRules(PT_HANDLE *hp_sndDevices, int *ip
 		//	return(NOT_OKAY);
 
 		// This is the first run after installation, store the current default device as both the original default and the most recent default.
-		if( current_defaultNum != dfxNum )
+		// BetterFxSound: only when there is a default device.
+		if( (current_defaultNum != dfxNum) && (current_defaultNum != SND_DEVICES_DEVICE_NOT_PRESENT) )
 		{
 			if( sndDevicesWriteToRegistry(hp_sndDevices, REG_CURRENT_USER, SND_DEVICES_REGISTRY_ORIGINAL_DEFAULT_WIDE, cast_handle->pwszID[current_defaultNum]) != OKAY)
 				return(NOT_OKAY);
@@ -234,7 +240,8 @@ int PT_DECLSPEC sndDevicesImplementDeviceRules(PT_HANDLE *hp_sndDevices, int *ip
 	// If we got here we have more than one real playback device and either the user hasn't manually selected one or
 	// the selected device is not present. Use rules to select the playback device based on the default device setting and history.
 	// First check to see if the current default device is not one of the DFX devices.
-	if( current_defaultNum != dfxNum )
+	// BetterFxSound: with no default playback device known, the history below picks the device.
+	if( (current_defaultNum != dfxNum) && (current_defaultNum != SND_DEVICES_DEVICE_NOT_PRESENT) )
 	{
 		// A non-DFX device is currently the default device.
 		// Check to see if the user has manually turned off automatice default device selection mode.
@@ -288,7 +295,11 @@ int PT_DECLSPEC sndDevicesImplementDeviceRules(PT_HANDLE *hp_sndDevices, int *ip
 	}
 
 PlaybackDeviceIsSelected:  // Label to jump to when the playback device num has been determined.
-	if (SND_DEVICES_MONO_BUG_SKIP_MONO_DEVICES)
+	// BetterFxSound: the mono check below reads the selected device's ID, so it needs a valid selection.
+	if( (cast_handle->playbackDeviceNum < 0) || (cast_handle->playbackDeviceNum >= cast_handle->totalNumDevices) )
+		cast_handle->playbackDeviceNum = SND_DEVICES_DEVICE_NOT_PRESENT;
+
+	if (SND_DEVICES_MONO_BUG_SKIP_MONO_DEVICES && (cast_handle->playbackDeviceNum != SND_DEVICES_DEVICE_NOT_PRESENT))
 	{
 		// Check if selected playback device is a mono device. If so, try to revert back to the most recent
 		// playback device but also check to make sure it is not a mono device. If it is still a mono device,

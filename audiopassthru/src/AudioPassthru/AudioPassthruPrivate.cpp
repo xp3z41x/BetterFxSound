@@ -155,11 +155,12 @@ std::vector<SoundDevice> AudioPassthruPrivate::getSoundDevices(bool active_devic
 int AudioPassthruPrivate::sndDeviceHandleToSoundDevices(bool active_devices)
 {
 	int i_resultFlag;
-	wchar_t wcp_user_seleted_playback_device_guid[PT_MAX_GENERIC_STRLEN];
-	wchar_t wcp_targeted_real_playback_device_guid[PT_MAX_GENERIC_STRLEN];
-	wchar_t wcp_capture_device_guid[PT_MAX_GENERIC_STRLEN];
-	wchar_t wcp_dfx_device_guid[PT_MAX_GENERIC_STRLEN];
-	wchar_t wcp_default_device_guid[PT_MAX_GENERIC_STRLEN];
+	// BetterFxSound: start empty. The user selected device is never read, and was compared uninitialized.
+	wchar_t wcp_user_seleted_playback_device_guid[PT_MAX_GENERIC_STRLEN] = { 0 };
+	wchar_t wcp_targeted_real_playback_device_guid[PT_MAX_GENERIC_STRLEN] = { 0 };
+	wchar_t wcp_capture_device_guid[PT_MAX_GENERIC_STRLEN] = { 0 };
+	wchar_t wcp_dfx_device_guid[PT_MAX_GENERIC_STRLEN] = { 0 };
+	wchar_t wcp_default_device_guid[PT_MAX_GENERIC_STRLEN] = { 0 };
 
 	// Cast the handle so we can access its data.
 	struct sndDevicesHdlType *cast_handle;
@@ -767,15 +768,41 @@ int AudioPassthruPrivate::setTargetedRealPlaybackDevice(const std::wstring sound
 		std::lock_guard<std::mutex> lock(config_mutex_);
 		handed_back = handed_back_;
 	}
-	const bool virtual_is_default = s_sndDevices_.dfxDeviceNum != SND_DEVICES_DEVICE_NOT_PRESENT &&
-		s_sndDevices_.defaultDeviceNum == s_sndDevices_.dfxDeviceNum;
+	/*
+	* BetterFxSound: Windows is asked which device is the default now. The cached defaultDeviceNum only follows the
+	* device notifications, which arrive some time after a change.
+	*/
+	BOOL virtual_is_default = FALSE;
+	if (sndDevicesGetVirtualDeviceIsDefault(hp_sndDevices_, &virtual_is_default) != OKAY)
+		virtual_is_default = FALSE;
 	if (isProcessing() && !handed_back && virtual_is_default)
 	{
 		if (sndDevicesRequestTargetedPlaybackDevice(hp_sndDevices_, wcp_new_targeted_real_playback_guid, &i_resultFlag) != OKAY)
 			return(NOT_OKAY);
 	}
-	else if (sndDevicesSetDeviceType(hp_sndDevices_, SND_DEVICES_DEFAULT, wcp_new_targeted_real_playback_guid, &i_resultFlag) != OKAY)
-		return(NOT_OKAY);
+	else
+	{
+		if (sndDevicesSetDeviceType(hp_sndDevices_, SND_DEVICES_DEFAULT, wcp_new_targeted_real_playback_guid, &i_resultFlag) != OKAY)
+			return(NOT_OKAY);
+
+		/*
+		* BetterFxSound: while processing, the switch only takes effect at a reinit. It used to rely on the notification
+		* of the new Windows default to stop the processing thread, and nothing happened when that notification did
+		* not come (the default did not change, or setting it failed), leaving the new carrier pending and silent.
+		*/
+		if (i_resultFlag != SND_DEVICES_DEVICE_NOT_PRESENT && isProcessing() && !handed_back)
+		{
+			if (sndDevicesRequestTargetedPlaybackDevice(hp_sndDevices_, wcp_new_targeted_real_playback_guid, &i_resultFlag) != OKAY)
+				return(NOT_OKAY);
+		}
+	}
+
+	/*
+	* BetterFxSound: the device is not in the device list, so no switch was requested and no reinit will follow to
+	* clear a pending carrier. Marking it pending would keep it out of the additional outputs for good.
+	*/
+	if (i_resultFlag == SND_DEVICES_DEVICE_NOT_PRESENT)
+		return(OKAY);
 
 	/*
 	* BetterFxSound: the switch takes effect at the next reinit. Until then the new carrier is kept out of the

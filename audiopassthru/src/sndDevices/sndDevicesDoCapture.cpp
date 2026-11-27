@@ -415,7 +415,9 @@ int PT_DECLSPEC sndDevicesStartStopCapture(PT_HANDLE *hp_sndDevices, int i_start
 
 	if( i_startStopFlag == SND_DEVICES_START_CAPTURE )
 	{
-		cast_handle->stopAudioCaptureAndPlaybackLoop = 0;
+		// BetterFxSound: the stop flag is not cleared here. sndDevicesReInit() cleared it before it enumerated the
+		// devices, and a stop requested since then (a device change, a carrier switch) must make this new
+		// processing thread exit at once so another reinit picks it up. Clearing it here lost those requests.
 		hr = cast_handle->pAudioClientCapture->Start(); // Start capturing, this starts filling of the internal capture buffers.
 		hr = cast_handle->pAudioClientPlayback->Start(); // Start playback, this starts filling of the internal playback buffers.
 	}
@@ -423,7 +425,7 @@ int PT_DECLSPEC sndDevicesStartStopCapture(PT_HANDLE *hp_sndDevices, int i_start
 	{
 		hr = cast_handle->pAudioClientCapture->Stop();  // Stop capturing.
 		hr = cast_handle->pAudioClientPlayback->Stop(); // Stop playback.
-		cast_handle->stopAudioCaptureAndPlaybackLoop = 1;
+		InterlockedExchange(&(cast_handle->stopAudioCaptureAndPlaybackLoop), 1);
 	}
 
 	return(OKAY);

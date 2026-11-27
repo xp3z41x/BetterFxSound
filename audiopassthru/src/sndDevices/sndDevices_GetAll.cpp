@@ -38,9 +38,30 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 //extern CsndDevicesMMNotificationClient g_DeviceEvents;	// This is for registering the device callbacks.
 
+static int sndDevices_GetAllDevices(PT_HANDLE* hp_sndDevices, int* ip_num_devices);
+
 // Gets an array of objects for all audio devices and stores indexes to the default device and DFX device if installed.
+// BetterFxSound: enumerationSequence is odd while the list is rewritten, see sndDevicesHdlType.
 int PT_DECLSPEC sndDevices_GetAll(PT_HANDLE* hp_sndDevices, int* ip_num_devices)
 {
+	struct sndDevicesHdlType* cast_handle;
+	int i_return;
+
+	cast_handle = (struct sndDevicesHdlType*)hp_sndDevices;
+
+	if (cast_handle == NULL)
+		return(NOT_OKAY);
+
+	InterlockedIncrement(&(cast_handle->enumerationSequence));
+	i_return = sndDevices_GetAllDevices(hp_sndDevices, ip_num_devices);
+	InterlockedIncrement(&(cast_handle->enumerationSequence));
+
+	return(i_return);
+}
+
+static int sndDevices_GetAllDevices(PT_HANDLE* hp_sndDevices, int* ip_num_devices)
+{
+	int default_device_num = SND_DEVICES_DEVICE_NOT_PRESENT;	// BetterFxSound: published once the enumeration is done
 	HRESULT hr;
 	IMMDevicePtr pDefaultDevice = NULL;
 	IMMDeviceEnumeratorPtr pEnumerator = NULL;
@@ -83,6 +104,7 @@ int PT_DECLSPEC sndDevices_GetAll(PT_HANDLE* hp_sndDevices, int* ip_num_devices)
 	}
 	cast_handle->pCaptureDevice = NULL;
 	cast_handle->pPlaybackDevice = NULL;
+	cast_handle->enumeratedDefaultDeviceNum = SND_DEVICES_DEVICE_NOT_PRESENT;
 
 	// Copy current devices to previous devices to allow new device detection
 	if ((cast_handle->numRealDevices > 0) && (cast_handle->numRealDevices != cast_handle->numPreviousRealDevices))
@@ -119,6 +141,7 @@ int PT_DECLSPEC sndDevices_GetAll(PT_HANDLE* hp_sndDevices, int* ip_num_devices)
 		cast_handle->numRealDevices = 0;
 		cast_handle->dfxDeviceNum = SND_DEVICES_DEVICE_NOT_PRESENT;
 		cast_handle->defaultDeviceNum = SND_DEVICES_DEVICE_NOT_PRESENT;
+		cast_handle->enumeratedDefaultDeviceNum = SND_DEVICES_DEVICE_NOT_PRESENT;
 		return(OKAY);
 	}
 
@@ -230,7 +253,7 @@ int PT_DECLSPEC sndDevices_GetAll(PT_HANDLE* hp_sndDevices, int* ip_num_devices)
 
 			// Check ID strings to see if this is the default device.
 			if (pwszIDdefault != NULL && wcscmp(cast_handle->pwszID[i], pwszIDdefault) == 0)
-				cast_handle->defaultDeviceNum = i;
+				default_device_num = (int)i;
 
 			// Check friendly name to see if this is the DFX device.
 			// NOTE: We check if the DFX name is a substring rather than an exact match because
@@ -282,6 +305,16 @@ int PT_DECLSPEC sndDevices_GetAll(PT_HANDLE* hp_sndDevices, int* ip_num_devices)
 	}
 
 	CoTaskMemFree(pwszIDdefault);
+
+	// BetterFxSound: publish the default read by this enumeration. The device rules use enumeratedDefaultDeviceNum,
+	// which the device notification callbacks never write.
+	cast_handle->enumeratedDefaultDeviceNum = default_device_num;
+	cast_handle->defaultDeviceNum = default_device_num;
+
+	// BetterFxSound: remember the virtual device's ID for the device notification callbacks.
+	if ((cast_handle->dfxDeviceNum != SND_DEVICES_DEVICE_NOT_PRESENT) &&
+		(wcscmp(cast_handle->dfxDeviceID, cast_handle->pwszID[cast_handle->dfxDeviceNum]) != 0))
+		wcscpy_s(cast_handle->dfxDeviceID, PT_MAX_GENERIC_STRLEN, cast_handle->pwszID[cast_handle->dfxDeviceNum]);
 
 	return(OKAY);
 }
