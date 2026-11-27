@@ -279,6 +279,7 @@
     <ClInclude Include="include\MultiOutput.h" />
     <ClInclude Include="include\DelayCalibration.h" />
     <ClInclude Include="include\MasterVolume.h" />
+    <ClInclude Include="include\OwedVolume.h" />
     <ClInclude Include="include\codedefs.h" />
     <ClInclude Include="include\File.h" />
     <ClInclude Include="include\mry.h" />

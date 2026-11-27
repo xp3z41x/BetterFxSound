@@ -37,6 +37,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "u_sndDevices.h"
 #include "sndDevices.h"
 #include "MasterVolume.h"
+#include "OwedVolume.h"
 
 // BetterFxSound: master volume of the FxSound virtual device as a linear gain, mute included.
 // Starts at unity until the first read in sndDevicesReInit().
@@ -223,6 +224,16 @@ HRESULT STDMETHODCALLTYPE CsndDevicesAudioEndpointVolumeCallbackPlayback::OnNoti
 		return E_INVALIDARG;
 	}
 
+	// BetterFxSound: a driver reporting back, without this app's event context, the level and mute this app has
+	// just set (Bluetooth devices with absolute volume do): not a change the user made.
+	{
+		const float levelDiff = pNotify->fMasterVolume - cast_handle->engineSetPlaybackLevel;
+		if( (GetTickCount() - cast_handle->engineSetPlaybackTick) < 3000 &&
+			 (levelDiff < 0.01f) && (levelDiff > -0.01f) &&
+			 ((pNotify->bMuted != FALSE) == (cast_handle->engineSetPlaybackMute != FALSE)) )
+			return S_OK;
+	}
+
 	// Ignore any callbacks caused by our own volume setting calls in this app.
 	if( pNotify->guidEventContext != cast_handle->guidThisApplication )
 	{
@@ -233,6 +244,8 @@ HRESULT STDMETHODCALLTYPE CsndDevicesAudioEndpointVolumeCallbackPlayback::OnNoti
 			cast_handle->savedPlaybackMute = pNotify->bMuted;
 			cast_handle->savedPlaybackLevel = pNotify->fMasterVolume;
 			cast_handle->savedPlaybackLevelIsSaved = TRUE;
+			// While the device is at our 100%, its owed own setting follows the user's change too (OwedVolume.h).
+			owedVolumeUpdate(cast_handle->savedPlaybackDeviceID, pNotify->fMasterVolume, pNotify->bMuted);
 		}
 	}
 	return S_OK;

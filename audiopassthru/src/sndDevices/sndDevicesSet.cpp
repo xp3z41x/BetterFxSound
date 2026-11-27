@@ -50,6 +50,47 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
  * to be made in run mode in general a sndDevicesResetSystem() call should be made after this call is made.
  * However, the default playback device (SND_DEVICES_DEFAULT) can be changed in run mode without requiring a reset call.
  */
+/*
+ * FUNCTION: sndDevicesRequestTargetedPlaybackDevice()
+ * DESCRIPTION: BetterFxSound. While FxSound processes (its virtual device is the Windows default), makes the next
+ * re-init target this real playback device without changing the Windows default device: with the DFX device as the
+ * default, the device rules (sndDevicesImplementDeviceRules()) take the most recent playback device stored in the
+ * registry. The capture/playback loop is stopped so the processing thread exits and the re-init runs at once, the
+ * same way a device change notification does it.
+ * Selecting a device by making it the Windows default (sndDevicesSetDeviceType(SND_DEVICES_DEFAULT)) instead lets
+ * every app that follows the default play straight to that device, unprocessed, until the re-init puts the DFX
+ * device back as the default (about a third of a second).
+ */
+int PT_DECLSPEC sndDevicesRequestTargetedPlaybackDevice(PT_HANDLE *hp_sndDevices, wchar_t *wcp_ID, int *ip_resultFlag)
+{
+	struct sndDevicesHdlType *cast_handle;
+	int device_index_num;
+
+	cast_handle = (struct sndDevicesHdlType *)hp_sndDevices;
+
+	if (cast_handle == NULL)
+		return(NOT_OKAY);
+
+	*ip_resultFlag = SND_DEVICES_DEVICE_OPERATION_COMPLETED;
+
+	if( sndDevices_UtilsGetIndexFromID(hp_sndDevices, wcp_ID, &device_index_num) != OKAY )
+		return(NOT_OKAY);
+
+	if( device_index_num == SND_DEVICES_DEVICE_NOT_PRESENT )
+	{
+		*ip_resultFlag = SND_DEVICES_DEVICE_NOT_PRESENT;
+		return(OKAY);
+	}
+
+	if( sndDevicesWriteToRegistry(hp_sndDevices, REG_CURRENT_USER, SND_DEVICES_REGISTRY_MOST_RECENT_PLAYBACK_WIDE, cast_handle->pwszID[device_index_num]) != OKAY )
+		return(NOT_OKAY);
+
+	cast_handle->playbackDeviceIsUnavailable = FALSE;
+	cast_handle->stopAudioCaptureAndPlaybackLoop = 1;
+
+	return(OKAY);
+}
+
 int PT_DECLSPEC sndDevicesSetDeviceType(PT_HANDLE *hp_sndDevices, int i_deviceType, wchar_t *wcp_ID, int *ip_resultFlag)
 {
 	struct sndDevicesHdlType *cast_handle;

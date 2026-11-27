@@ -40,6 +40,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "operatingSystem.h"
 #include "u_sndDevices.h"
 #include "sndDevices.h"
+#include "OwedVolume.h"
 
 /*
  * FUNCTION: sndDevicesInitialSetupCaptureDevice()
@@ -228,40 +229,69 @@ int PT_DECLSPEC sndDevicesFinalSetupCaptureDevice(PT_HANDLE *hp_sndDevices, int 
  * BetterFxSound: while the device is an enabled output the engine keeps it at 100% and unmuted (the Windows
  * volume is applied inside the app as a software gain), so this is what gives the user their own level back.
  * The device is looked up by its ID in the current device list rather than held as an object pointer,
- * since all device objects are released and re-created on every re-init. If the device is no longer
- * present there is nothing to restore, its setting went away with it.
+ * since all device objects are released and re-created on every re-init.
+ * BetterFxSound: if the device is no longer present, its setting stays owed (OwedVolume.h, with the latest own
+ * setting known here) and goes back on the device when it is next seen while the engine does not use it, or is
+ * saved from there if the device becomes the carrier again. Once it is put back, nothing is owed any more.
  */
 static void sndDevices_RestoreSavedPlaybackDeviceSettings(struct sndDevicesHdlType *cast_handle)
 {
-	IMMDevice *pDevice;
+	IMMDevice *pDevice = NULL;
 	IAudioEndpointVolume *pEndptVol = NULL;
-	int deviceIndex;
+	int deviceIndex = SND_DEVICES_DEVICE_NOT_PRESENT;
 	HRESULT hr;
+	BOOL restored = FALSE;
 
 	if( !cast_handle->playbackSettingsAreSaved )
 		return;
 
-	if( sndDevices_UtilsGetIndexFromID((PT_HANDLE *)cast_handle, cast_handle->savedPlaybackDeviceID, &deviceIndex) != OKAY )
-		return;
+	if( (sndDevices_UtilsGetIndexFromID((PT_HANDLE *)cast_handle, cast_handle->savedPlaybackDeviceID, &deviceIndex) == OKAY) &&
+		(deviceIndex >= 0) && (deviceIndex < SND_DEVICES_MAX_NUM_DEVICES) )
+	{
+		pDevice = cast_handle->pAllDevices[deviceIndex];
+	}
 
-	if( (deviceIndex < 0) || (deviceIndex >= SND_DEVICES_MAX_NUM_DEVICES) )
-		return;
+	if( pDevice != NULL )
+	{
+		hr = pDevice->Activate(cast_handle->IID_IAudioEndpointVolume, CLSCTX_ALL, NULL, (void**)&pEndptVol);
+		if( SUCCEEDED(hr) && (pEndptVol != NULL) )
+		{
+			HRESULT hrLevel = S_OK;
 
-	pDevice = cast_handle->pAllDevices[deviceIndex];
-	if( pDevice == NULL )
-		return;
+			// BetterFxSound: noted, so that the driver reporting this change back is not taken for the user's.
+			if( cast_handle->savedPlaybackLevelIsSaved )
+				cast_handle->engineSetPlaybackLevel = cast_handle->savedPlaybackLevel;
+			cast_handle->engineSetPlaybackMute = cast_handle->savedPlaybackMute;
+			cast_handle->engineSetPlaybackTick = GetTickCount();
 
-	hr = pDevice->Activate(cast_handle->IID_IAudioEndpointVolume, CLSCTX_ALL, NULL, (void**)&pEndptVol);
-	if( FAILED(hr) || (pEndptVol == NULL) )
-		return;
+			// BetterFxSound: the level first, then mute: some drivers clear the mute flag as a side effect of a level change.
+			if( cast_handle->savedPlaybackLevelIsSaved )
+				hrLevel = pEndptVol->SetMasterVolumeLevelScalar(cast_handle->savedPlaybackLevel, &(cast_handle->guidThisApplication));
 
-	// BetterFxSound: the level first, then mute: some drivers clear the mute flag as a side effect of a level change.
-	if( cast_handle->savedPlaybackLevelIsSaved )
-		pEndptVol->SetMasterVolumeLevelScalar(cast_handle->savedPlaybackLevel, &(cast_handle->guidThisApplication));
+			hr = pEndptVol->SetMute(cast_handle->savedPlaybackMute, &(cast_handle->guidThisApplication));
 
-	pEndptVol->SetMute(cast_handle->savedPlaybackMute, &(cast_handle->guidThisApplication));
+			restored = SUCCEEDED(hrLevel) && SUCCEEDED(hr);
 
-	pEndptVol->Release();
+			pEndptVol->Release();
+		}
+	}
+
+	// BetterFxSound: the owed volume record follows.
+	if( restored )
+	{
+		owedVolumeErase(cast_handle->savedPlaybackDeviceID);
+	}
+	else
+	{
+		float owedLevel;
+		BOOL owedMute;
+		if( owedVolumeGet(cast_handle->savedPlaybackDeviceID, &owedLevel, &owedMute) )
+		{
+			if( cast_handle->savedPlaybackLevelIsSaved )
+				owedLevel = cast_handle->savedPlaybackLevel;
+			owedVolumeUpdate(cast_handle->savedPlaybackDeviceID, owedLevel, cast_handle->savedPlaybackMute);
+		}
+	}
 }
 
 /*
@@ -341,7 +371,20 @@ int PT_DECLSPEC sndDevicesInitialSetupPlaybackDevice(PT_HANDLE *hp_sndDevices, i
 
 			if( !cast_handle->playbackSettingsAreSaved )
 			{
-				if( SUCCEEDED(cast_handle->pEndptVolPlayback->GetMute(&playbackMuteSetting)) )
+				float owedLevel;
+				BOOL owedMute;
+
+				if( owedVolumeGet(playbackDeviceID, &owedLevel, &owedMute) )
+				{
+					// BetterFxSound: the engine set this device to 100% earlier and could not hand it back yet (it was
+					// unplugged, or the app crashed): it is still at our 100%, its own setting is the one owed.
+					wcscpy(cast_handle->savedPlaybackDeviceID, playbackDeviceID);
+					cast_handle->savedPlaybackMute = owedMute;
+					cast_handle->savedPlaybackLevel = owedLevel;
+					cast_handle->savedPlaybackLevelIsSaved = TRUE;
+					cast_handle->playbackSettingsAreSaved = TRUE;
+				}
+				else if( SUCCEEDED(cast_handle->pEndptVolPlayback->GetMute(&playbackMuteSetting)) )
 				{
 					wcscpy(cast_handle->savedPlaybackDeviceID, playbackDeviceID);
 					cast_handle->savedPlaybackMute = playbackMuteSetting;

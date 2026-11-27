@@ -1795,7 +1795,13 @@ void FxController::syncOutputsWhileOff(std::vector<SoundDevice>& sound_devices, 
 	if (changed)
 	{
 		failed_carrier_ids_.clear();
-		pushOutputsToEngine();
+		// This runs on the device notification thread (IMMNotificationClient), which must not block or release
+		// device objects: the engine's update (stopping removed outputs' threads, putting devices' own volume
+		// back) goes to the message thread.
+		MessageManager::callAsync([this]() {
+			ScopedLock auto_lock(lock_);
+			pushOutputsToEngine();
+		});
 		notifyOutputsChanged();
 	}
 

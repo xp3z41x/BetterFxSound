@@ -40,6 +40,11 @@ class SecondaryOutput;
 // own setting first, and makes sure it is never used on the FxSound virtual device.
 bool setDeviceFullVolumeById(const std::wstring& device_id, const GUID* event_context);
 
+// BetterFxSound: puts the device's own level and mute back if the engine owes them (see OwedVolume.h), then forgets
+// them. Returns false if something is owed and the device or its volume control is not available (it stays owed).
+// For devices the engine does not use (any more). Never from an audio processing or render loop.
+bool handBackOwedVolumeById(const std::wstring& device_id);
+
 // Rewrites an interleaved block in place for the given channel mode (no-op for Both).
 // Channel 0 is front left and channel 1 is front right in every standard layout.
 void applyOutputChannelMode(float* buffer, UINT32 frames, UINT32 channels, OutputChannelMode mode);
@@ -56,6 +61,10 @@ void applyOutputChannelMode(float* buffer, UINT32 frames, UINT32 channels, Outpu
  *  - configure() and stopAll() are called from the UI/timer thread.
  *  - write() is called from the audio processing thread. It never blocks, never
  *    allocates and never calls into COM.
+ *  - Each output's render thread holds a reference to its output, so an output that is removed while its
+ *    thread is stuck in a driver call (a Bluetooth device going away can block WASAPI calls for seconds) is
+ *    never freed under it: removal waits for the threads for a bounded time, and a thread that is still busy
+ *    finishes and frees its output on its own.
  */
 class MultiOutputRouter
 {
@@ -89,7 +98,8 @@ private:
 	MultiOutputRouter& operator=(const MultiOutputRouter&) = delete;
 
 	SRWLOCK lock_;
-	std::atomic<bool> driven_{ false };	// Read by the outputs' render threads
+	// Read by the outputs' render threads, which may outlive the router (see above), hence shared.
+	std::shared_ptr<std::atomic<bool>> driven_;
 	// shared_ptr so that setDriven() can keep the outputs alive while it works on them without the lock.
 	// Only the UI thread holds extra references, so an output is never destroyed on the audio thread.
 	std::vector<std::shared_ptr<SecondaryOutput>> outputs_;
