@@ -735,8 +735,27 @@ int AudioPassthruPrivate::setTargetedRealPlaybackDevice(const std::wstring sound
 	/* Set the guid of the newly selected playback device */
 	swprintf(wcp_new_targeted_real_playback_guid, PT_MAX_GENERIC_STRLEN, L"%s", sound_device_guid.c_str());
 
-	/* Set the newly targeted playback device as the default.  It will then automatically become the targeted device */
-	if (sndDevicesSetDeviceType(hp_sndDevices_, SND_DEVICES_DEFAULT, wcp_new_targeted_real_playback_guid, &i_resultFlag) != OKAY)
+	/*
+	* BetterFxSound: while processing, with the FxSound virtual device as the Windows default, the switch goes through
+	* the device rules (sndDevicesRequestTargetedPlaybackDevice()) and the Windows default is left alone. Making the
+	* real device the default for the switch let every app play straight to it, unprocessed and at its own level,
+	* until the reinit made the virtual device the default again (a third of a second per carrier switch).
+	* Otherwise (FxSound off, or starting): set the newly targeted playback device as the default. It will then
+	* automatically become the targeted device.
+	*/
+	bool handed_back;
+	{
+		std::lock_guard<std::mutex> lock(config_mutex_);
+		handed_back = handed_back_;
+	}
+	const bool virtual_is_default = s_sndDevices_.dfxDeviceNum != SND_DEVICES_DEVICE_NOT_PRESENT &&
+		s_sndDevices_.defaultDeviceNum == s_sndDevices_.dfxDeviceNum;
+	if (isProcessing() && !handed_back && virtual_is_default)
+	{
+		if (sndDevicesRequestTargetedPlaybackDevice(hp_sndDevices_, wcp_new_targeted_real_playback_guid, &i_resultFlag) != OKAY)
+			return(NOT_OKAY);
+	}
+	else if (sndDevicesSetDeviceType(hp_sndDevices_, SND_DEVICES_DEFAULT, wcp_new_targeted_real_playback_guid, &i_resultFlag) != OKAY)
 		return(NOT_OKAY);
 
 	/*

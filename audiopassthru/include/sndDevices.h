@@ -486,6 +486,7 @@ int PT_DECLSPEC sndDevicesGetPlaybackDeviceAvialblility(PT_HANDLE*, BOOL*);
 
 /* sndDevicesSet.cpp */
 int PT_DECLSPEC sndDevicesSetDeviceType(PT_HANDLE *, int, wchar_t *, int *);
+int PT_DECLSPEC sndDevicesRequestTargetedPlaybackDevice(PT_HANDLE *, wchar_t *, int *);
 int PT_DECLSPEC sndDevicesSetIconFileName(PT_HANDLE *, int, wchar_t *, int *);
 int PT_DECLSPEC sndDevicesSetDeviceName(PT_HANDLE *, int, wchar_t *, int *);
 int PT_DECLSPEC sndDevicesSetDefaultDeviceSelectionMode(PT_HANDLE *, int);
