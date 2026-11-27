@@ -48,7 +48,8 @@ func (a *App) registerWriteTools(s *mcp.Server) {
 			"friendly name (see the outputs list in fxsound://status, or fxsound://diagnostics's device list, " +
 			"for valid names). The device must be connected. To change one output without touching the " +
 			"others use fxsound_enable_output / fxsound_disable_output. Works whether or not FxSound is " +
-			"currently running.",
+			"currently running (when it is not, it is started with this output; an unknown name is then " +
+			"ignored instead of reported).",
 		Annotations: &mcp.ToolAnnotations{DestructiveHint: boolPtr(false)},
 	}, a.toolSetOutputDevice)
 
@@ -154,6 +155,9 @@ type setOutputDeviceInput struct {
 
 func (a *App) toolSetOutputDevice(ctx context.Context, _ *mcp.CallToolRequest, in setOutputDeviceInput) (*mcp.CallToolResult, applyResult, error) {
 	if err := fxsound.ValidateOutputName(in.DeviceName); err != nil {
+		return nil, applyResult{}, err
+	}
+	if err := a.checkOutputIfRunning(ctx, in.DeviceName); err != nil {
 		return nil, applyResult{}, err
 	}
 	if err := fxsound.Apply(ctx, a.Paths, map[string]string{"output": in.DeviceName}, false); err != nil {
@@ -332,6 +336,20 @@ func readyStatus(ctx context.Context, paths *fxsound.Paths) (*fxsound.Status, er
 		return nil, fmt.Errorf("read current state: %w", err)
 	}
 	return status, nil
+}
+
+// checkOutputIfRunning reports an unknown or disconnected output when FxSound
+// is running (it would silently ignore --output for it). On a cold start the
+// name is passed through unchecked: the outputs are only known once it runs.
+func (a *App) checkOutputIfRunning(ctx context.Context, name string) error {
+	running, err := fxsound.IsFxSoundRunning()
+	if err != nil {
+		return fmt.Errorf("check running state: %w", err)
+	}
+	if !running {
+		return nil
+	}
+	return a.checkOutput(ctx, name, true)
 }
 
 // checkOutput makes sure FxSound is running and knows an output with this

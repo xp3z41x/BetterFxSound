@@ -80,17 +80,27 @@ func BuildCommandLine(flags map[string]string) ([]string, error) {
 // invocation uses -- sending them to a cold start would silently no-op.
 // Flags that both initConfig and applyConfig understand (power, preset,
 // output, view, language, num_bands, balance, filter_q, master_gain,
-// volume_leveling, run_minimized) don't need this: a single
-// invocation works whether or not FxSound is already running.
+// volume_leveling, run_minimized) don't need this: when FxSound is not
+// running, they become the startup command line of a new instance, which
+// is launched without being waited on (see launch) and then given time to
+// become responsive.
 func Apply(ctx context.Context, paths *Paths, flags map[string]string, requireRunning bool) error {
+	args, err := BuildCommandLine(flags)
+	if err != nil {
+		return err
+	}
 	if requireRunning {
 		if err := EnsureRunning(ctx, paths); err != nil {
 			return err
 		}
-	}
-	args, err := BuildCommandLine(flags)
-	if err != nil {
-		return err
+	} else {
+		running, err := fxSoundRunning()
+		if err != nil {
+			return fmt.Errorf("check running state: %w", err)
+		}
+		if !running {
+			return startAndWait(ctx, paths, args)
+		}
 	}
 	if _, err := Run(ctx, applyConfigTimeout, paths.FxSoundExe, args...); err != nil {
 		return err
@@ -110,20 +120,25 @@ func Apply(ctx context.Context, paths *Paths, flags map[string]string, requireRu
 // cmd.Run/Wait): it becomes the persistent instance and runs until the
 // user quits it, not until this call returns.
 func EnsureRunning(ctx context.Context, paths *Paths) error {
-	running, err := IsFxSoundRunning()
+	running, err := fxSoundRunning()
 	if err != nil {
 		return fmt.Errorf("check running state: %w", err)
 	}
 	if running {
 		return nil
 	}
+	return startAndWait(ctx, paths, nil)
+}
 
-	if err := launch(paths.FxSoundExe); err != nil {
+// startAndWait launches a new FxSound instance with args as its startup
+// command line and waits (bounded) until it runs and answers --status.
+func startAndWait(ctx context.Context, paths *Paths, args []string) error {
+	if err := launch(paths.FxSoundExe, args...); err != nil {
 		return newError(ErrKindRequiresRunningInstance, err, "launch FxSound.exe")
 	}
 
 	if err := pollUntil(ctx, launchPollTotal, launchPollTick, func() (bool, error) {
-		return IsFxSoundRunning()
+		return fxSoundRunning()
 	}); err != nil {
 		return newError(ErrKindRequiresRunningInstance, err, "FxSound.exe did not start within %s", launchPollTotal)
 	}

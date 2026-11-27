@@ -47,5 +47,11 @@ func IsProcessRunning(exeName string) (bool, error) {
 // cold-start invocation is parsed by the narrower initConfig instead, which
 // silently ignores those flags.
 func IsFxSoundRunning() (bool, error) {
+	return fxSoundRunning()
+}
+
+// fxSoundRunning is what IsFxSoundRunning and this package's own checks call;
+// a package variable so tests can simulate a running or stopped app.
+var fxSoundRunning = func() (bool, error) {
 	return IsProcessRunning("FxSound.exe")
 }
