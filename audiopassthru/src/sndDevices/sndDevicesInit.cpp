@@ -109,6 +109,8 @@ int PT_DECLSPEC sndDevicesInit(PT_HANDLE *hp_sndDevices, CSlout *hp_slout, int i
 	// Note these must survive a re-init, they are only reset here in the one time init call.
 	wcscpy(cast_handle->savedPlaybackDeviceID, L"");
 	cast_handle->savedPlaybackMute = FALSE;
+	cast_handle->savedPlaybackLevel = 1.0f;
+	cast_handle->savedPlaybackLevelIsSaved = FALSE;
 	cast_handle->playbackSettingsAreSaved = FALSE;
 
 	for(i=0; i<SND_DEVICES_MAX_NUM_DEVICES; i++)
@@ -281,34 +283,33 @@ int PT_DECLSPEC sndDevices_ReleaseAllAudioObjects(PT_HANDLE *hp_sndDevices)
 	if (cast_handle == NULL)
 		return(NOT_OKAY);
 
-	// Turn off capture device volume control callback
-	if(cast_handle->EPVolEventsCapture.IsRegistered())
-	{
-		if (cast_handle->pEndptVolCapture != NULL)
-		{
-			cast_handle->pEndptVolCapture->UnregisterControlChangeNotify((IAudioEndpointVolumeCallback*)&(cast_handle->EPVolEventsCapture));
-		}
-	}
+	// BetterFxSound: each endpoint volume pointer is taken out of the handle before its object is unregistered
+	// and released, so the handle never holds a pointer to an object being released. The volume callbacks,
+	// which can still be running on a COM thread at this point, do not use these pointers at all: they only
+	// use the values their notification carries and plain fields of this static handle.
+	IAudioEndpointVolume *pEndptVolCapture = cast_handle->pEndptVolCapture;
+	IAudioEndpointVolume *pEndptVolPlayback = cast_handle->pEndptVolPlayback;
+	cast_handle->pEndptVolCapture = NULL;
+	cast_handle->pEndptVolPlayback = NULL;
 
-	if (cast_handle->pEndptVolCapture != NULL)
+	// Turn off capture device volume control callback
+	if (pEndptVolCapture != NULL)
 	{
-		cast_handle->pEndptVolCapture->Release();
-		cast_handle->pEndptVolCapture = NULL;
+		if (cast_handle->EPVolEventsCapture.IsRegistered())
+		{
+			pEndptVolCapture->UnregisterControlChangeNotify((IAudioEndpointVolumeCallback*)&(cast_handle->EPVolEventsCapture));
+		}
+		pEndptVolCapture->Release();
 	}
 
 	// Turn off playback device volume control callback
-	if (cast_handle->EPVolEventsPlayback.IsRegistered())
+	if (pEndptVolPlayback != NULL)
 	{
-		if (cast_handle->pEndptVolPlayback != NULL)
+		if (cast_handle->EPVolEventsPlayback.IsRegistered())
 		{
-			cast_handle->pEndptVolPlayback->UnregisterControlChangeNotify((IAudioEndpointVolumeCallback*)&(cast_handle->EPVolEventsPlayback));
+			pEndptVolPlayback->UnregisterControlChangeNotify((IAudioEndpointVolumeCallback*)&(cast_handle->EPVolEventsPlayback));
 		}
-	}
-
-	if (cast_handle->pEndptVolPlayback != NULL)
-	{
-		cast_handle->pEndptVolPlayback->Release();
-		cast_handle->pEndptVolPlayback = NULL;
+		pEndptVolPlayback->Release();
 	}
 
 	/*if (cast_handle->pAudioClientCapture != NULL)

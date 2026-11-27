@@ -72,6 +72,7 @@ private:
 	// current carrier. Called after every change and after every reinit (the carrier may have changed).
 	void applyAdditionalOutputs();
 	bool isDevicePresent(const std::wstring& device_id) const;
+	bool isProcessing() const;
 
 	int sndDeviceHandleToSoundDevices(bool active_devices = true);
 	static void onDeviceChange();
@@ -97,6 +98,8 @@ private:
 	std::vector<OutputConfig> outputs_;			// As passed to setOutputs(), carrier included
 	std::wstring pending_carrier_id_;			// Asked for by setAsPlaybackDevice(), until the next reinit
 	bool apply_pending_ = false;				// A change arrived during a measurement, apply it afterwards
+	std::wstring carrier_full_volume_id_;		// Carrier whose device was set to 100% and unmuted since the last reinit
+	bool handed_back_ = false;					// restoreDefaultPlaybackDevice() called, until processing starts again
 
 	MultiOutputRouter multi_output_;
 

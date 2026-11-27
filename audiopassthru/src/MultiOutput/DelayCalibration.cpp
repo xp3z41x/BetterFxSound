@@ -55,6 +55,8 @@ namespace
 
 	constexpr REFERENCE_TIME kStreamBufferHns = 1000000; // 100 ms
 
+	const wchar_t* const kNoOutputsError = L"No output is turned on. Turn on at least one output, then synchronize again.";
+
 	template <class T> void safeRelease(T*& p)
 	{
 		if (p != nullptr)
@@ -406,7 +408,8 @@ DelayCalibration::~DelayCalibration()
 	}
 }
 
-bool DelayCalibration::start(const std::wstring& virtual_device_id, const std::vector<Target>& targets, SoloFunction solo)
+bool DelayCalibration::start(const std::wstring& virtual_device_id, const std::vector<Target>& targets, SoloFunction solo,
+	const std::wstring& no_targets_error)
 {
 	if (state_.load() == static_cast<int>(State::Running))
 		return false;
@@ -427,6 +430,13 @@ bool DelayCalibration::start(const std::wstring& virtual_device_id, const std::v
 		std::lock_guard<std::mutex> lock(mutex_);
 		results_.clear();
 		error_.clear();
+	}
+
+	// Nothing to measure: fail at once with the reason the caller gave, without a measurement thread.
+	if (targets_.empty())
+	{
+		fail(no_targets_error.empty() ? std::wstring(kNoOutputsError) : no_targets_error);
+		return true;
 	}
 
 	state_.store(static_cast<int>(State::Running));
@@ -485,7 +495,7 @@ void DelayCalibration::run()
 {
 	if (targets_.empty())
 	{
-		fail(L"No output is turned on. Turn on at least one output, then synchronize again.");
+		fail(kNoOutputsError);
 		return;
 	}
 

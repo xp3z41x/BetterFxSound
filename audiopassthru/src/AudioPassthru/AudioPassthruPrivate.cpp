@@ -417,10 +417,15 @@ int AudioPassthruPrivate::processTimer()
 		if (sndDevicesReInit(hp_sndDevices_, SND_DEVICES_INIT_FOR_PROCESSING, &numRealDevices, &DfxDeviceEnabledFlag, &statusFlag) != OKAY)
 			return(NOT_OKAY);
 
-		/* BetterFxSound: the reinit settled which device is the carrier, a requested switch is no longer pending */
+		/*
+		* BetterFxSound: the reinit settled which device is the carrier, a requested switch is no longer pending.
+		* The carrier's stream was opened again, so the engine starts using its device again: its volume is set
+		* to 100% and unmuted once more by applyAdditionalOutputs() below.
+		*/
 		{
 			std::lock_guard<std::mutex> lock(config_mutex_);
 			pending_carrier_id_.clear();
+			carrier_full_volume_id_.clear();
 		}
 
 		if (statusFlag != SND_DEVICES_DEVICE_OPERATION_COMPLETED)
@@ -463,6 +468,13 @@ int AudioPassthruPrivate::processTimer()
 		if ((numRealDevices > 0) && (DfxDeviceEnabledFlag == IS_TRUE))
 		{
 			hProcessingThread_ = CreateThread(NULL, 0, processingThread, (LPVOID)this, 0L, &ProcessingThreadID_);
+
+			/* BetterFxSound: processing runs again, the real devices are FxSound's again */
+			{
+				std::lock_guard<std::mutex> lock(config_mutex_);
+				handed_back_ = false;
+			}
+			multi_output_.setDriven(true);
 
 			/* BetterFxSound: the carrier may have changed, recompute the carrier settings and the additional outputs */
 			applyAdditionalOutputs();
@@ -692,6 +704,17 @@ bool AudioPassthruPrivate::checkDeviceChanges()
 void AudioPassthruPrivate::restoreDefaultPlaybackDevice()
 {
 	int i_resultFlag;
+
+	/*
+	* BetterFxSound: the real device becomes the Windows default again and plays the apps' sound directly at
+	* its own level. Until processing starts again, the engine must not set any device to 100%.
+	*/
+	{
+		std::lock_guard<std::mutex> lock(config_mutex_);
+		handed_back_ = true;
+	}
+	multi_output_.setDriven(false);
+
 	/* Change the default soundcard to not be the DFX virtual one but instead the proper real one */
 	if (sndDevicesRestoreDefaultDevice(hp_sndDevices_, &i_resultFlag) != OKAY)
 		return;
@@ -791,75 +814,126 @@ void AudioPassthruPrivate::applyAdditionalOutputs()
 
 	const std::wstring carrier_id(wcp_targeted_guid);
 	const std::wstring dfx_id(wcp_dfx_guid);
+	const bool processing = isProcessing();
+	std::wstring set_full_volume_id;	// Carrier device to set to 100% and unmute, after the lock is released
 
-	std::lock_guard<std::mutex> lock(config_mutex_);
-
-	std::vector<AdditionalOutputConfig> effective;
-
-	// Whether a requested output stays out of the router. Duplicates are dropped here as well, so the
-	// indexes in effective_outputs_ match the router's own list (the delay measurement relies on it).
-	auto excluded = [&](const std::wstring& id) -> bool
 	{
-		if (id.empty() || id == carrier_id || id == dfx_id || id == pending_carrier_id_)
-			return true;
-		for (const auto& added : effective)
+		std::lock_guard<std::mutex> lock(config_mutex_);
+
+		std::vector<AdditionalOutputConfig> effective;
+
+		// Whether a requested output stays out of the router. Duplicates are dropped here as well, so the
+		// indexes in effective_outputs_ match the router's own list (the delay measurement relies on it).
+		auto excluded = [&](const std::wstring& id) -> bool
 		{
-			if (added.device_id == id)
+			if (id.empty() || id == carrier_id || id == dfx_id || id == pending_carrier_id_)
 				return true;
-		}
-		return !isDevicePresent(id);
-	};
+			for (const auto& added : effective)
+			{
+				if (added.device_id == id)
+					return true;
+			}
+			return !isDevicePresent(id);
+		};
 
-	// The carrier's own entry decides whether it plays. Missing or disabled: it plays silence.
-	bool carrier_enabled = false;
-	int carrier_delay_ms = 0;
-	OutputChannelMode carrier_channel_mode = OutputChannelMode::Both;
-	int carrier_volume_percent = 100;
+		// The carrier's own entry decides whether it plays. Missing or disabled: it plays silence.
+		bool carrier_enabled = false;
+		int carrier_delay_ms = 0;
+		OutputChannelMode carrier_channel_mode = OutputChannelMode::Both;
+		int carrier_volume_percent = 100;
 
-	for (const auto& output : outputs_)
-	{
-		if (!carrier_id.empty() && output.device_id == carrier_id && carrier_id != dfx_id)
+		for (const auto& output : outputs_)
 		{
-			carrier_enabled = output.enabled;
-			carrier_delay_ms = output.delay_ms;
-			carrier_channel_mode = output.channel_mode;
-			carrier_volume_percent = output.volume_percent;
-			break;
+			if (!carrier_id.empty() && output.device_id == carrier_id && carrier_id != dfx_id)
+			{
+				carrier_enabled = output.enabled;
+				carrier_delay_ms = output.delay_ms;
+				carrier_channel_mode = output.channel_mode;
+				carrier_volume_percent = output.volume_percent;
+				break;
+			}
+		}
+
+		for (const auto& output : outputs_)
+		{
+			if (!output.enabled || excluded(output.device_id))
+				continue;
+
+			AdditionalOutputConfig config;
+			config.device_id = output.device_id;
+			config.delay_ms = output.delay_ms;
+			config.channel_mode = output.channel_mode;
+			config.volume_percent = output.volume_percent;
+			effective.push_back(config);
+		}
+
+		if (carrier_delay_ms < 0) carrier_delay_ms = 0;
+		if (carrier_delay_ms > 500) carrier_delay_ms = 500;
+
+		const bool carrier_plays = carrier_enabled && !carrier_id.empty();
+
+		// The device's own level and mute are saved by the reinit (sndDevicesInitialSetupPlaybackDevice()) and
+		// put back on power off, exit or a switch to another carrier. Without them the device is left alone.
+		const bool carrier_setting_saved = s_sndDevices_.playbackSettingsAreSaved && s_sndDevices_.savedPlaybackLevelIsSaved &&
+			carrier_id == s_sndDevices_.savedPlaybackDeviceID;
+
+		main_delay_ms_.store(carrier_delay_ms, std::memory_order_relaxed);
+		main_channel_mode_.store(static_cast<int>(carrier_channel_mode), std::memory_order_relaxed);
+		carrier_trim_.store(outputTrimGain(carrier_volume_percent), std::memory_order_relaxed);
+		carrier_enabled_.store(carrier_plays, std::memory_order_relaxed);
+
+		/*
+		* The real device of an enabled carrier is set to 100% and unmuted when the engine starts using it: after
+		* every reinit (start, power on, carrier switch) and when the carrier output gets enabled. Once only, no
+		* callback keeps forcing it. Only while processing: when FxSound is off, the real device is the Windows
+		* default and plays the apps' sound directly at its own level. Only once its own setting is saved, so it
+		* can be handed back. carrier_plays already excludes the FxSound virtual device.
+		*/
+		if (!carrier_plays)
+		{
+			carrier_full_volume_id_.clear();
+		}
+		else if (processing && !handed_back_ && carrier_setting_saved && carrier_full_volume_id_ != carrier_id)
+		{
+			carrier_full_volume_id_ = carrier_id;
+			set_full_volume_id = carrier_id;
+		}
+
+		/* The measurement relies on the output order, keep it stable while it runs. processTimer() applies the
+		   change once the measurement is over. */
+		if (calibration_.getState(NULL) == DelayCalibration::State::Running)
+		{
+			apply_pending_ = true;
+		}
+		else
+		{
+			apply_pending_ = false;
+			effective_outputs_ = effective;
+			multi_output_.configure(effective);
 		}
 	}
 
-	for (const auto& output : outputs_)
-	{
-		if (!output.enabled || excluded(output.device_id))
-			continue;
+	/*
+	* COM calls, outside the lock. The change is tagged with this app's GUID, so the playback volume callback
+	* does not take it for the user's own mute setting (the one handed back when FxSound stops driving the device).
+	*/
+	if (!set_full_volume_id.empty())
+		setDeviceFullVolumeById(set_full_volume_id, &s_sndDevices_.guidThisApplication);
+}
 
-		AdditionalOutputConfig config;
-		config.device_id = output.device_id;
-		config.delay_ms = output.delay_ms;
-		config.channel_mode = output.channel_mode;
-		config.volume_percent = output.volume_percent;
-		effective.push_back(config);
-	}
+/*
+* FUNCTION: isProcessing()
+* DESCRIPTION: BetterFxSound. True while the processing thread runs, that is while FxSound drives the devices and
+* the FxSound virtual device is the Windows default.
+*/
+bool AudioPassthruPrivate::isProcessing() const
+{
+	HANDLE thread = hProcessingThread_;
+	if (thread == NULL || thread == INVALID_HANDLE_VALUE || i_kill_processing_thread_)
+		return false;
 
-	if (carrier_delay_ms < 0) carrier_delay_ms = 0;
-	if (carrier_delay_ms > 500) carrier_delay_ms = 500;
-
-	main_delay_ms_.store(carrier_delay_ms, std::memory_order_relaxed);
-	main_channel_mode_.store(static_cast<int>(carrier_channel_mode), std::memory_order_relaxed);
-	carrier_trim_.store(outputTrimGain(carrier_volume_percent), std::memory_order_relaxed);
-	carrier_enabled_.store(carrier_enabled && !carrier_id.empty(), std::memory_order_relaxed);
-
-	/* The measurement relies on the output order, keep it stable while it runs. processTimer() applies the
-	   change once the measurement is over. */
-	if (calibration_.getState(NULL) == DelayCalibration::State::Running)
-	{
-		apply_pending_ = true;
-		return;
-	}
-	apply_pending_ = false;
-
-	effective_outputs_ = effective;
-	multi_output_.configure(effective);
+	DWORD exit_code = 0;
+	return GetExitCodeThread(thread, &exit_code) && exit_code == STILL_ACTIVE;
 }
 
 /*
@@ -949,7 +1023,8 @@ void AudioPassthruPrivate::applyMainDelay(float* buffer, UINT32 frames, UINT32 c
 * FUNCTION: startDelayCalibration()
 * DESCRIPTION: BetterFxSound. Starts measuring the delay of every enabled output that is present with the
 * microphone: the carrier if it is enabled, and every output currently playing through the router (those are
-* already limited to enabled, present devices). With no output at all the measurement fails with an error.
+* already limited to enabled, present devices). With nothing to measure it fails at once, with an error that
+* says whether no output is turned on or none of those turned on is connected.
 */
 bool AudioPassthruPrivate::startDelayCalibration()
 {
@@ -975,6 +1050,7 @@ bool AudioPassthruPrivate::startDelayCalibration()
 	}
 
 	std::vector<DelayCalibration::Target> targets;
+	std::wstring no_targets_error;
 	{
 		std::lock_guard<std::mutex> lock(config_mutex_);
 
@@ -989,15 +1065,39 @@ bool AudioPassthruPrivate::startDelayCalibration()
 			DelayCalibration::Target target = { effective_outputs_[i].device_id, (int)i };
 			targets.push_back(target);
 		}
+
+		// Nothing to measure: say why. No output turned on, or none of those turned on is connected, or
+		// (rarely) the outputs are still being set up, for example during a switch of the carrier.
+		if (targets.empty())
+		{
+			bool any_enabled = false;
+			bool any_connected = false;
+			for (const auto& output : outputs_)
+			{
+				if (!output.enabled || output.device_id.empty() || output.device_id == wcp_dfx_guid)
+					continue;
+				any_enabled = true;
+				if (isDevicePresent(output.device_id))
+					any_connected = true;
+			}
+
+			if (!any_enabled)
+				no_targets_error = L"No output is turned on. Turn on at least one output, then synchronize again.";
+			else if (!any_connected)
+				no_targets_error = L"None of the outputs that are turned on is connected. Connect one of them, then synchronize again.";
+			else
+				no_targets_error = L"The outputs are not ready yet. Wait a moment, then synchronize again.";
+		}
 	}
 
-	// With no target the measurement thread fails at once with a clear error. The virtual device is only
-	// needed to play the test sound, so it is required only when there is something to measure.
+	// With no target the measurement fails at once with the error above. The virtual device is only needed
+	// to play the test sound, so it is required only when there is something to measure.
 	if (!targets.empty() && wcp_dfx_guid[0] == L'\0')
 		return false;
 
 	std::atomic<int>* solo = &solo_;
-	return calibration_.start(std::wstring(wcp_dfx_guid), targets, [solo](int index) { solo->store(index, std::memory_order_relaxed); });
+	return calibration_.start(std::wstring(wcp_dfx_guid), targets, [solo](int index) { solo->store(index, std::memory_order_relaxed); },
+		no_targets_error);
 }
 
 void AudioPassthruPrivate::cancelDelayCalibration()
