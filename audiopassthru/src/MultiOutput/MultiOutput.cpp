@@ -379,35 +379,17 @@ public:
 		const UINT32 free_frames = kRingFrames - (w - r);
 		const UINT32 n = frames < free_frames ? frames : free_frames;
 
-		const OutputChannelMode mode = static_cast<OutputChannelMode>(channel_mode_.load(std::memory_order_relaxed));
-
+		// Every channel is queued as is. The channel mode is applied by render(), on what is played now, so a
+		// change is heard within one device period rather than after the queued audio (latency + delay).
 		for (UINT32 i = 0; i < n; i++)
 		{
 			float* dst = &ring_[static_cast<size_t>((w + i) & kRingMask) * kMaxChannels];
 			const float* src = data + static_cast<size_t>(i) * channels;
 
 			if (silent)
-			{
 				std::memset(dst, 0, channels * sizeof(float));
-			}
-			else if (mode == OutputChannelMode::Both || channels < 2)
-			{
-				std::memcpy(dst, src, channels * sizeof(float));
-			}
 			else
-			{
-				// Channel 0 is front left and channel 1 is front right in every WAVEFORMATEXTENSIBLE layout.
-				float value;
-				if (mode == OutputChannelMode::Left)
-					value = src[0];
-				else if (mode == OutputChannelMode::Right)
-					value = src[1];
-				else
-					value = 0.5f * (src[0] + src[1]);
-
-				for (UINT32 c = 0; c < channels; c++)
-					dst[c] = value;
-			}
+				std::memcpy(dst, src, channels * sizeof(float));
 		}
 		write_pos_.store(w + n, std::memory_order_release);
 	}
@@ -763,6 +745,9 @@ private:
 		// realignment, a fast fade out (~2 ms) instead.
 		const float gain_target = realign_pending_ ? 0.0f : target_gain_.load(std::memory_order_relaxed) * masterVolumeGain();
 		const float gain_step = static_cast<float>(1.0 / ((realign_pending_ ? 0.002 : 0.01) * rate)); // One-pole ramp
+		// The channel mode, for this whole period. The stream has the processing format's channels
+		// (WAVEFORMATEXTENSIBLE order: front left, front right, ...); Windows converts it to the device.
+		const OutputChannelMode mode = static_cast<OutputChannelMode>(channel_mode_.load(std::memory_order_relaxed));
 		bool underflow = false;
 
 		for (; produced < space; produced++)
@@ -792,6 +777,7 @@ private:
 			const float gain = current_gain_;
 
 			const float t = static_cast<float>(frac_);
+			float* frame = out + static_cast<size_t>(produced) * channels_;
 			for (UINT32 c = 0; c < channels_; c++)
 			{
 				const float xm1 = history_[0][c];
@@ -801,8 +787,9 @@ private:
 				const float c1 = 0.5f * (x1 - xm1);
 				const float c2 = xm1 - 2.5f * x0 + 2.0f * x1 - 0.5f * x2;
 				const float c3 = 0.5f * (x2 - xm1) + 1.5f * (x0 - x1);
-				out[produced * channels_ + c] = (((c3 * t + c2) * t + c1) * t + x0) * gain;
+				frame[c] = (((c3 * t + c2) * t + c1) * t + x0) * gain;
 			}
+			applyOutputChannelMode(frame, 1, channels_, mode);
 			frac_ += ratio_;
 		}
 

@@ -66,7 +66,7 @@ public:
 
 private:
 	void applyMainDelay(float* buffer, UINT32 frames, UINT32 channels, UINT32 sample_rate);
-	void applyCarrierGain(float* buffer, UINT32 frames, UINT32 channels, UINT32 sample_rate);
+	void applyCarrierGain(float* buffer, UINT32 frames, UINT32 channels, UINT32 sample_rate, bool enabled);
 
 	// Recomputes the carrier settings and the additional outputs from the requested outputs and the
 	// current carrier. Called after every change and after every reinit (the carrier may have changed).

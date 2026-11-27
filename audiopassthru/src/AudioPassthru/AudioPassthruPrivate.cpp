@@ -471,6 +471,17 @@ int AudioPassthruPrivate::processTimer()
 		/* PTNOTE - added check on DfxDeviceEnabledFlag status, may need to take additional steps if no DFX device is preset. */
 		if ((numRealDevices > 0) && (DfxDeviceEnabledFlag == IS_TRUE))
 		{
+			/*
+			* BetterFxSound: the reinit may have changed the carrier, and its own settings are only published by
+			* applyAdditionalOutputs() below. Until then the new thread plays the carrier silent (then fades it in),
+			* instead of with the previous carrier's channel mode, delay and trim. Its delay line starts empty, so
+			* it does not replay audio from before the reinit either. The previous thread has exited, so these
+			* processing thread variables are not in use.
+			*/
+			carrier_enabled_.store(false, std::memory_order_relaxed);
+			carrier_gain_ = 0.0f;
+			main_delay_format_ = 0;
+
 			hProcessingThread_ = CreateThread(NULL, 0, processingThread, (LPVOID)this, 0L, &ProcessingThreadID_);
 
 			/* BetterFxSound: processing runs again, the real devices are FxSound's again */
@@ -602,15 +613,23 @@ DWORD AudioPassthruPrivate::threadWorker(void)
 				multi_output_.write(fp_buffer, (UINT32)numSampleSets, pwfx->nChannels, pwfx->nSamplesPerSec, solo_.load(std::memory_order_relaxed));
 			}
 
-			/* BetterFxSound: optional channel mode for the carrier (left only, right only or mono) */
-			applyOutputChannelMode(fp_buffer, (UINT32)numSampleSets, pwfx->nChannels,
-				static_cast<OutputChannelMode>(main_channel_mode_.load(std::memory_order_relaxed)));
+			/*
+			* BetterFxSound: the carrier output's settings, read once for the whole block. carrier_enabled_ is
+			* read first (acquire) and published last (release) by applyAdditionalOutputs(), and every new
+			* processing thread starts with it off. So an enabled carrier is always played with its own
+			* channel mode, never with the one of the previous carrier.
+			*/
+			const bool carrier_enabled = carrier_enabled_.load(std::memory_order_acquire);
+			const OutputChannelMode carrier_channel_mode = static_cast<OutputChannelMode>(main_channel_mode_.load(std::memory_order_relaxed));
 
-			/* BetterFxSound: optional delay for the carrier */
+			/* BetterFxSound: optional delay for the carrier. It keeps every channel, so a new channel mode is heard at once. */
 			applyMainDelay(fp_buffer, (UINT32)numSampleSets, pwfx->nChannels, pwfx->nSamplesPerSec);
 
+			/* BetterFxSound: optional channel mode for the carrier (left only, right only or mono), on what is played now */
+			applyOutputChannelMode(fp_buffer, (UINT32)numSampleSets, pwfx->nChannels, carrier_channel_mode);
+
 			/* BetterFxSound: Windows master volume x this output's trim, or silence if the carrier output is disabled */
-			applyCarrierGain(fp_buffer, (UINT32)numSampleSets, pwfx->nChannels, pwfx->nSamplesPerSec);
+			applyCarrierGain(fp_buffer, (UINT32)numSampleSets, pwfx->nChannels, pwfx->nSamplesPerSec, carrier_enabled);
 
 			/* BetterFxSound: while an additional output is being measured, the carrier is silent */
 			{
@@ -906,10 +925,12 @@ void AudioPassthruPrivate::applyAdditionalOutputs()
 		const bool carrier_setting_saved = s_sndDevices_.playbackSettingsAreSaved && s_sndDevices_.savedPlaybackLevelIsSaved &&
 			carrier_id == s_sndDevices_.savedPlaybackDeviceID;
 
+		// carrier_enabled_ last, with release: the processing thread reads it first (acquire), so once it
+		// sees this carrier enabled it also sees this carrier's delay, channel mode and trim.
 		main_delay_ms_.store(carrier_delay_ms, std::memory_order_relaxed);
 		main_channel_mode_.store(static_cast<int>(carrier_channel_mode), std::memory_order_relaxed);
 		carrier_trim_.store(outputTrimGain(carrier_volume_percent), std::memory_order_relaxed);
-		carrier_enabled_.store(carrier_plays, std::memory_order_relaxed);
+		carrier_enabled_.store(carrier_plays, std::memory_order_release);
 
 		/*
 		* The real device of an enabled carrier is set to 100% and unmuted when the engine starts using it: after
@@ -1013,12 +1034,12 @@ bool AudioPassthruPrivate::isProcessing() const
 * Loopback capture is taken before the virtual device's endpoint volume, so the buffer is full scale and
 * this is the only place the master volume is applied to the carrier: there is no double attenuation.
 */
-void AudioPassthruPrivate::applyCarrierGain(float* buffer, UINT32 frames, UINT32 channels, UINT32 sample_rate)
+void AudioPassthruPrivate::applyCarrierGain(float* buffer, UINT32 frames, UINT32 channels, UINT32 sample_rate, bool enabled)
 {
 	if (buffer == NULL || frames == 0 || channels == 0)
 		return;
 
-	const float target = carrier_enabled_.load(std::memory_order_relaxed)
+	const float target = enabled
 		? carrier_trim_.load(std::memory_order_relaxed) * masterVolumeGain()
 		: 0.0f;
 
