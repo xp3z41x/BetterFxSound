@@ -378,7 +378,7 @@ namespace
 		size_t lag = 0;
 		while (lag < max_lag && correlation[lag] < 0.5 * peak)
 			lag++;
-		const size_t refine_end = std::min(max_lag, lag + kRate / 500); // within 2 ms
+		const size_t refine_end = (std::min)(max_lag, lag + kRate / 500); // within 2 ms
 		size_t best = lag;
 		for (size_t i = lag; i < refine_end; i++)
 		{
@@ -558,7 +558,7 @@ void DelayCalibration::run()
 
 		double level = 0.0;
 		for (float sample : recording)
-			level = std::max(level, static_cast<double>(std::fabs(sample)));
+			level = (std::max)(level, static_cast<double>(std::fabs(sample)));
 		if (level < 1e-4)
 		{
 			fail(L"The microphone recorded only silence. Check that it is on, not muted and set as the default recording device.");
