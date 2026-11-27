@@ -42,29 +42,18 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 // Starts at unity until the first read in sndDevicesReInit().
 static std::atomic<float> s_masterVolumeGain(1.0f);
 
-void masterVolumePublish(float level_scalar, float level_db, bool level_db_valid, bool muted)
+void masterVolumePublish(float level_scalar, bool muted)
 {
-	float gain;
+	float gain = 0.0f;
 
-	// "!(x > 0)" also catches NaN.
-	if (muted || !(level_scalar > 0.0f))
+	// "x > 0" is also false for NaN.
+	if (!muted && level_scalar > 0.0f)
 	{
-		gain = 0.0f;
+		// Never boost: the processed audio is already close to full scale.
+		const float level = (level_scalar < 1.0f) ? level_scalar : 1.0f;
+		// Same squared curve as the output trim (outputTrimGain()): 50% is about -12 dB.
+		gain = level * level;
 	}
-	else if (level_db_valid && level_db == level_db)
-	{
-		// The level in dB follows the device's own volume curve, like Windows would apply it.
-		gain = powf(10.0f, level_db / 20.0f);
-	}
-	else
-	{
-		// Fallback, close to the usual audio taper.
-		gain = level_scalar * level_scalar;
-	}
-
-	// Never boost: the processed audio is already close to full scale.
-	if (!(gain > 0.0f)) gain = 0.0f;
-	if (gain > 1.0f) gain = 1.0f;
 
 	s_masterVolumeGain.store(gain, std::memory_order_relaxed);
 }
@@ -138,24 +127,23 @@ HRESULT STDMETHODCALLTYPE CsndDevicesAudioEndpointVolumeCallbackCapture::QueryIn
 HRESULT STDMETHODCALLTYPE CsndDevicesAudioEndpointVolumeCallbackCapture::OnNotify(PAUDIO_VOLUME_NOTIFICATION_DATA pNotify)
 {
 	struct sndDevicesHdlType *cast_handle;
-	float levelDb = 0.0f;
-	bool levelDbValid = false;
+
+	cast_handle = (struct sndDevicesHdlType *)g_sndDevicesVolumeCallbackCapture_hdl;
+
+	if (cast_handle == NULL)
+		return(S_FALSE);
+
+	if (cast_handle->ignoreVolumeCallbacks)
+		return(S_OK);
 
 	if (pNotify == NULL)
 	{
 		return E_INVALIDARG;
 	}
 
-	cast_handle = (struct sndDevicesHdlType *)g_sndDevicesVolumeCallbackCapture_hdl;
-
-	// Publishing is harmless, so it is done even while ignoreVolumeCallbacks is set: the gain must always
-	// follow the slider. The level in dB is not part of the notification, so it is read from the endpoint.
-	if (cast_handle != NULL && cast_handle->pEndptVolCapture != NULL)
-	{
-		levelDbValid = SUCCEEDED(cast_handle->pEndptVolCapture->GetMasterVolumeLevel(&levelDb));
-	}
-
-	masterVolumePublish(pNotify->fMasterVolume, levelDb, levelDbValid, pNotify->bMuted != FALSE);
+	// Only the values the notification carries are used: no COM call, and nothing is read from the handle's
+	// audio objects, which a reinit on another thread may be releasing while this callback runs.
+	masterVolumePublish(pNotify->fMasterVolume, pNotify->bMuted != FALSE);
 
 	return S_OK;
 }
@@ -214,9 +202,10 @@ HRESULT STDMETHODCALLTYPE CsndDevicesAudioEndpointVolumeCallbackPlayback::QueryI
 }
 
 // PTNOTE - this is the callback hit when the playback volume control is moved.
-// BetterFxSound: the real playback device's volume and mute are the user's own and are no longer copied
-// to the FxSound virtual device. Only the saved mute setting is kept up to date, so that what gets put
-// back on the device when FxSound stops driving it is what the user set last.
+// BetterFxSound: the real playback device's volume and mute are no longer copied to the FxSound virtual
+// device. Only the saved mute setting is kept up to date, so that what gets put back on the device when
+// FxSound stops driving it is what the user set last. The engine's own change (100% and unmuted when it
+// starts using the device) carries guidThisApplication and is ignored here.
 HRESULT STDMETHODCALLTYPE CsndDevicesAudioEndpointVolumeCallbackPlayback::OnNotify(PAUDIO_VOLUME_NOTIFICATION_DATA pNotify)
 {
 	struct sndDevicesHdlType *cast_handle;

@@ -224,8 +224,9 @@ int PT_DECLSPEC sndDevicesFinalSetupCaptureDevice(PT_HANDLE *hp_sndDevices, int 
  * Puts the saved mute setting back on the real playback device it was saved from.
  * Called whenever FxSound stops driving that device, either because it is switching to a different
  * playback device, or because it is handing control back to the real device on exit or power off.
- * Only mute is restored. The device's volume is never put back: a change made to it, through the device
- * or through the FxSound volume control, is the user's own and must be kept.
+ * Only mute is restored. The device's volume is not put back. BetterFxSound: if the device was an enabled
+ * output, the engine set it to 100% when it started using it (the Windows volume is applied inside the app
+ * as a software gain), so it is handed back at 100%.
  * The device is looked up by its ID in the current device list rather than held as an object pointer,
  * since all device objects are released and re-created on every re-init. If the device is no longer
  * present there is nothing to restore, its setting went away with it.
@@ -319,9 +320,9 @@ int PT_DECLSPEC sndDevicesInitialSetupPlaybackDevice(PT_HANDLE *hp_sndDevices, i
 		}
 
 		// If we are moving onto a different playback device, hand the device we are leaving its own
-		// mute setting back, then take a copy of the new device's mute setting before this app applies
-		// the FxSound mute setting to it.
-		// Note this must happen before the mute syncing done at the end of sndDevicesReInit().
+		// mute setting back, then take a copy of the new device's mute setting before this app changes it.
+		// Note this must happen before AudioPassthruPrivate::applyAdditionalOutputs() runs after the reinit:
+		// for an enabled carrier output it sets the device to 100% and unmutes it.
 		if( (cast_handle->playbackDeviceNum >= 0) && (cast_handle->playbackDeviceNum < SND_DEVICES_MAX_NUM_DEVICES) )
 		{
 			wchar_t *playbackDeviceID = cast_handle->pwszID[cast_handle->playbackDeviceNum];
@@ -547,8 +548,9 @@ int PT_DECLSPEC sndDevicesRestoreDefaultDevice(PT_HANDLE *hp_sndDevices, int *ip
 	// treats picking a different output device, so that device's own mute setting applies from here
 	// on - not FxSound's. Done before the default device is changed below, so the device already
 	// carries its own mute setting by the time the user is listening through it.
-	// The device's volume needs no restoring: FxSound never overwrites it, the FxSound volume control
-	// just follows it, so the device already holds the level the user last set, through either one.
+	// BetterFxSound: the device's volume is not restored. If it was an enabled output, the engine set it to
+	// 100% when it started using it (the Windows volume is applied inside the app as a software gain), and it
+	// is handed back at that level.
 	// Note the FxSound mute setting is not lost by this: it stays on the DFX device, which Windows
 	// remembers, so muting FxSound and restarting it comes back muted.
 	// Note also that playbackSettingsAreSaved is deliberately left set. On a power off the process

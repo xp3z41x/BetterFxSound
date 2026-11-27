@@ -23,6 +23,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #pragma once
 
 #include <windows.h>
+#include <atomic>
 #include <memory>
 #include <string>
 #include <vector>
@@ -30,6 +31,15 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "AudioPassthru.h"
 
 class SecondaryOutput;
+
+// BetterFxSound: sets an output device's own endpoint volume to 100% and unmutes it, so that the
+// only attenuation is the app's software gain (Windows master volume x the output's trim). Called
+// when the engine starts using the device, never from an audio processing or render loop.
+// event_context tags the change in the device's volume notifications (NULL is allowed).
+// Returns false if the device or its volume control is not available. The caller makes sure it is
+// never used on the FxSound virtual device.
+bool setDeviceFullVolume(IMMDevice* device, const GUID* event_context);
+bool setDeviceFullVolumeById(const std::wstring& device_id, const GUID* event_context);
 
 // Rewrites an interleaved block in place for the given channel mode (no-op for Both).
 // Channel 0 is front left and channel 1 is front right in every standard layout.
@@ -61,6 +71,13 @@ public:
 	// Closes every secondary output.
 	void stopAll();
 
+	// Whether the engine drives the outputs: FxSound is on and processing, with the FxSound virtual
+	// device as the Windows default. While it is not, an output whose stream opens leaves its device's
+	// volume alone (the device may be the Windows default, playing the apps' sound directly); its
+	// device is set to 100% and unmuted here, on the calling thread, once driving starts again.
+	// UI/timer thread.
+	void setDriven(bool driven);
+
 	// Audio thread: queues one block of processed, interleaved 32 bit float audio.
 	// solo_index >= 0: only that output gets the audio, the others get silence.
 	// solo_index == -1: every output here gets silence (the carrier output is being measured).
@@ -72,5 +89,6 @@ private:
 	MultiOutputRouter& operator=(const MultiOutputRouter&) = delete;
 
 	SRWLOCK lock_;
+	std::atomic<bool> driven_{ false };	// Read by the outputs' render threads
 	std::vector<std::unique_ptr<SecondaryOutput>> outputs_;
 };

@@ -27,18 +27,20 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
  * Windows' volume slider, volume keys and mute act on the FxSound virtual device, which is the
  * default playback device. The app captures that device with loopback, and loopback is taken
  * before the endpoint volume, so the captured audio is always full scale. The level and mute of
- * the virtual device are therefore read here and applied by the app itself to each output. The
- * volume of the real devices is never changed.
+ * the virtual device are therefore read here and applied by the app itself to each output. So that
+ * a real device's own level does not stack on this gain, the engine sets the real device of every
+ * enabled output to 100% and unmutes it when it starts using it. The virtual device's own volume is
+ * never changed.
  *
  * Threading: masterVolumePublish() is called from the COM thread that delivers the endpoint
- * volume callback and from the thread doing the device reinit. masterVolumeGain() is a single
- * atomic load and is safe on the audio threads.
+ * volume callback and from the thread doing the device reinit. It only uses the values passed in.
+ * masterVolumeGain() is a single atomic load and is safe on the audio threads.
  */
 
-// Publishes the master volume of the virtual device. level_scalar is the 0..1 slider value,
-// level_db the matching level in dB (used when level_db_valid is true, because it follows the
-// device's own volume curve).
-void masterVolumePublish(float level_scalar, float level_db, bool level_db_valid, bool muted);
+// Publishes the master volume of the virtual device: level_scalar is the 0..1 slider value, as
+// IAudioEndpointVolume and its change notification report it, muted its mute state. The gain
+// follows the slider with the same squared curve as the output trim: 50% is about -12 dB.
+void masterVolumePublish(float level_scalar, bool muted);
 
 // Linear gain for the master volume, mute included, 0..1. Lock-free, real-time safe.
 float masterVolumeGain();

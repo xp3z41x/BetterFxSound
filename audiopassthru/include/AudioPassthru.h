@@ -117,13 +117,17 @@ public:
 	// the carrier path plays silence; no reinit is needed. Every other enabled entry whose device
 	// is present plays through the additional outputs. The FxSound virtual device is always
 	// ignored. Zero enabled outputs means silence; processing keeps running.
+	// When the engine starts using an enabled output's device (stream opened, reinit, power on,
+	// output enabled), it sets that device's own volume to 100% and unmutes it, once, so it does
+	// not stack on the app's gain. The FxSound virtual device's volume is never changed.
 	void setOutputs(const std::vector<OutputConfig>& outputs);
 
 	// BetterFxSound: measures the delay of every enabled output that is present (the carrier
 	// only if it is enabled) with the default microphone. Runs in the background; poll
 	// getDelayCalibrationState(). State: 0 idle, 1 running, 2 done, 3 failed.
 	// Results have one entry per measured output, keyed by device_id, in no particular order.
-	// With no enabled output the measurement fails and getDelayCalibrationError() says why.
+	// With nothing to measure (no output turned on, or none of them connected) the measurement
+	// fails at once and getDelayCalibrationError() says which.
 	bool startDelayCalibration();
 	void cancelDelayCalibration();
 	int getDelayCalibrationState(int* progress_percent);

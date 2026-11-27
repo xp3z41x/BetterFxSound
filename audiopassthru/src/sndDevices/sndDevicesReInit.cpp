@@ -44,8 +44,6 @@ int PT_DECLSPEC sndDevicesReInit(PT_HANDLE *hp_sndDevices, int i_initType, int *
 {
 	struct sndDevicesHdlType *cast_handle;
 	float captureVolScalar = 1.0f;
-	float captureVolDb = 0.0f;
-	bool captureVolDbValid = false;
 	wchar_t name[PT_MAX_GENERIC_STRLEN];
 	wchar_t regVal[PT_MAX_GENERIC_STRLEN];
 	HRESULT hr;
@@ -174,7 +172,8 @@ int PT_DECLSPEC sndDevicesReInit(PT_HANDLE *hp_sndDevices, int i_initType, int *
 
 			// BetterFxSound: read the Windows master volume (the FxSound virtual device's level and mute) and
 			// publish it as the software gain applied to every output. It is no longer copied to the real
-			// playback device, and the real device's own volume and mute are left alone.
+			// playback device. If the carrier is an enabled output, its real device is set to 100% and unmuted
+			// after the reinit, by AudioPassthruPrivate::applyAdditionalOutputs().
 			hr = cast_handle->pEndptVolCapture->GetMute(&captureMuteState);
 			if (hr != S_OK)
 			{
@@ -191,9 +190,7 @@ int PT_DECLSPEC sndDevicesReInit(PT_HANDLE *hp_sndDevices, int i_initType, int *
 				SND_DEVICES_SET_STATUS_AND_RETURN_OK(SND_DEVICES_GET_MASTER_VOLUME_FAILED);
 			}
 
-			captureVolDbValid = SUCCEEDED(cast_handle->pEndptVolCapture->GetMasterVolumeLevel(&captureVolDb));
-
-			masterVolumePublish(captureVolScalar, captureVolDb, captureVolDbValid, captureMuteState != FALSE);
+			masterVolumePublish(captureVolScalar, captureMuteState != FALSE);
 
 			// Setup capture and playback buffers
 			cast_handle->bufferSizeMilliSecs = SND_DEVICES_CAPTURE_BUFFER_DEFAULT_SIZE_MILLI_SECS;

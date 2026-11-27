@@ -63,7 +63,10 @@ public:
 	~DelayCalibration();
 
 	// Starts a measurement on its own thread. Returns false if one is already running.
-	bool start(const std::wstring& virtual_device_id, const std::vector<Target>& targets, SoloFunction solo);
+	// With no target it fails at once (state Failed, no thread) with no_targets_error as the error,
+	// or a generic one if that is empty.
+	bool start(const std::wstring& virtual_device_id, const std::vector<Target>& targets, SoloFunction solo,
+		const std::wstring& no_targets_error = std::wstring());
 	void cancel();
 
 	State getState(int* progress_percent) const;

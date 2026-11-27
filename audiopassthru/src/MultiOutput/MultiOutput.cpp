@@ -24,6 +24,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include <mmreg.h>
 #include <Mmdeviceapi.h>
 #include <Audioclient.h>
+#include <endpointvolume.h>
 #include <atomic>
 #include <cstring>
 #include <memory>
@@ -89,8 +90,8 @@ public:
 	static constexpr DWORD kRetryMs = 1000;                   // Retry interval when the device is missing
 	static constexpr DWORD kIdleStopMs = 2000;                // Stop the stream after this much silence
 
-	explicit SecondaryOutput(const AdditionalOutputConfig& config)
-		: device_id_(config.device_id), ring_(static_cast<size_t>(kRingFrames) * kMaxChannels, 0.0f)
+	SecondaryOutput(const AdditionalOutputConfig& config, const std::atomic<bool>* driven)
+		: device_id_(config.device_id), driven_(driven), ring_(static_cast<size_t>(kRingFrames) * kMaxChannels, 0.0f)
 	{
 		applyConfig(config);
 		// Fade in from silence: the master volume is applied on top of the trim.
@@ -124,6 +125,10 @@ public:
 	}
 
 	const std::wstring& deviceId() const { return device_id_; }
+
+	// Router, UI thread: true once if the stream opened while the engine was not driving the outputs, so
+	// the device still has to be set to 100% and unmuted.
+	bool takeFullVolumePending() { return full_volume_pending_.exchange(false); }
 
 	void setDelayMs(int delay_ms)
 	{
@@ -335,6 +340,21 @@ private:
 		channels_ = channels;
 		sample_rate_ = sample_rate;
 		running_ = false;
+
+		// The engine starts using this device: its own volume goes to 100% and it is unmuted, so it does
+		// not stack on the app's gain. Done once per stream open, never while rendering. While the engine
+		// is not driving the outputs (FxSound off), the device is left alone and the router does it when
+		// driving starts. The second check covers driving starting in between: exactly one of the two
+		// sides takes the pending flag.
+		if (driven_ == nullptr || !driven_->load())
+		{
+			full_volume_pending_.store(true);
+			if (driven_ == nullptr || !driven_->load())
+				return true;
+			if (!full_volume_pending_.exchange(false))
+				return true;
+		}
+		setDeviceFullVolume(device_, NULL);
 		return true;
 	}
 
@@ -513,6 +533,8 @@ private:
 	SecondaryOutput& operator=(const SecondaryOutput&) = delete;
 
 	const std::wstring device_id_;
+	const std::atomic<bool>* const driven_;					// The router's flag, outlives this output
+	std::atomic<bool> full_volume_pending_{ false };	// Opened while not driven, the router sets 100%
 	std::atomic<int> delay_ms_{ 0 };
 	std::atomic<int> channel_mode_{ 0 };
 	std::atomic<float> target_gain_{ 1.0f };
@@ -545,6 +567,47 @@ private:
 	double error_avg_ = 0.0;
 	float current_gain_ = 0.0f;
 };
+
+bool setDeviceFullVolume(IMMDevice* device, const GUID* event_context)
+{
+	if (device == nullptr)
+		return false;
+
+	IAudioEndpointVolume* volume = nullptr;
+	HRESULT hr = device->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, NULL, reinterpret_cast<void**>(&volume));
+	if (FAILED(hr) || volume == nullptr)
+		return false;
+
+	// S_FALSE (the value was already set) counts as success.
+	const bool level_ok = SUCCEEDED(volume->SetMasterVolumeLevelScalar(1.0f, event_context));
+	const bool mute_ok = SUCCEEDED(volume->SetMute(FALSE, event_context));
+	volume->Release();
+	return level_ok && mute_ok;
+}
+
+bool setDeviceFullVolumeById(const std::wstring& device_id, const GUID* event_context)
+{
+	if (device_id.empty())
+		return false;
+
+	IMMDeviceEnumerator* enumerator = nullptr;
+	HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), NULL, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), reinterpret_cast<void**>(&enumerator));
+	if (FAILED(hr) || enumerator == nullptr)
+		return false;
+
+	IMMDevice* device = nullptr;
+	hr = enumerator->GetDevice(device_id.c_str(), &device);
+	enumerator->Release();
+	if (FAILED(hr) || device == nullptr)
+		return false;
+
+	bool ok = false;
+	DWORD state = 0;
+	if (SUCCEEDED(device->GetState(&state)) && state == DEVICE_STATE_ACTIVE)
+		ok = setDeviceFullVolume(device, event_context);
+	device->Release();
+	return ok;
+}
 
 void applyOutputChannelMode(float* buffer, UINT32 frames, UINT32 channels, OutputChannelMode mode)
 {
@@ -633,7 +696,7 @@ void MultiOutputRouter::configure(const std::vector<AdditionalOutputConfig>& out
 		if (output != nullptr)
 			output->applyConfig(config);
 		else
-			output.reset(new SecondaryOutput(config));
+			output.reset(new SecondaryOutput(config, &driven_));
 
 		next.push_back(std::move(output));
 	}
@@ -656,6 +719,27 @@ void MultiOutputRouter::configure(const std::vector<AdditionalOutputConfig>& out
 void MultiOutputRouter::stopAll()
 {
 	configure(std::vector<AdditionalOutputConfig>());
+}
+
+void MultiOutputRouter::setDriven(bool driven)
+{
+	driven_.store(driven);
+	if (!driven)
+		return;
+
+	// Outputs whose stream opened while the engine was not driving them: their device is set to 100% and
+	// unmuted now, on this thread, never on their render threads.
+	std::vector<std::wstring> device_ids;
+	AcquireSRWLockShared(&lock_);
+	for (const auto& output : outputs_)
+	{
+		if (output != nullptr && output->takeFullVolumePending())
+			device_ids.push_back(output->deviceId());
+	}
+	ReleaseSRWLockShared(&lock_);
+
+	for (const auto& device_id : device_ids)
+		setDeviceFullVolumeById(device_id, NULL);
 }
 
 void MultiOutputRouter::write(const float* data, UINT32 frames, UINT32 channels, UINT32 sample_rate, int solo_index)
