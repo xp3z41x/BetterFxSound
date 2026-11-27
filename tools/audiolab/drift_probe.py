@@ -278,6 +278,35 @@ def find_markers(env, rate, period_s, first_guess=None):
     return peaks
 
 
+def loud_windows(x, rate, markers, start, end):
+    """10 ms windows more than 10 dB above the median level: unprocessed audio reaching the output at full
+    scale (for example while the real device is briefly the Windows default during a carrier switch)."""
+    win = int(0.01 * rate)
+    n = (end - start) // win
+    if n <= 0:
+        return []
+    r = np.sqrt(np.mean(np.asarray(x[start:start + n * win], dtype=np.float64).reshape(n, win) ** 2, axis=1))
+    free = np.ones(n, dtype=bool)          # windows clear of the markers (they are 15 dB over the tone)
+    for m, _ in markers:
+        if np.isnan(m):
+            continue
+        a = max(0, int((m - MASK_BEFORE_S * rate - start) // win))
+        b = min(n, int((m + MASK_AFTER_S * rate - start) // win) + 1)
+        if b > 0:
+            free[a:b] = False
+    if not free.any():
+        return []
+    med = float(np.median(r[free])) + 1e-12
+    hits = np.where(free & (r > med * 3.16))[0]
+    out = []
+    last = -10
+    for h in hits:
+        if h - last > 5:
+            out.append(((start + int(h) * win) / rate, float(20 * np.log10(r[h] / med))))
+        last = h
+    return out
+
+
 def clicks_and_dropouts(x, rate, markers, start, end):
     """Second-difference spikes and level drops outside the marker regions."""
     mask = np.zeros(len(x), dtype=bool)
@@ -356,12 +385,14 @@ def analyze(out_dir):
         start = int(2.0 * rate)
         end = len(x) - int(1.0 * rate)
         clicks, drops = clicks_and_dropouts(np.asarray(x), rate, peaks, start, end)
+        loud = loud_windows(x, rate, peaks, start, end)
         to_wall = lambda s: a + b * (s * rate) - t_start
         result["devices"][c["label"]] = {
             "name": c["name"], "rate": rate, "clock_ppm_vs_qpc": round(ppm, 2), "timebase_jitter_ms_p99": round(jit, 3),
             "markers": len(peaks), "clicks": len(clicks), "click_times_s": [round(to_wall(s), 3) for s in clicks[:50]],
             "dropouts": len(drops), "dropout_times_s": [round(to_wall(s), 3) for s in drops[:50]],
             "overflow_flags": int(sum(1 for _, _, s in c["log"] if s)),
+            "loud": len(loud), "loud_times_s_db": [(round(to_wall(t), 3), round(db_, 1)) for t, db_ in loud[:50]],
         }
     ref = walls.get("ref")
     labels = [c["label"] for c in meta["captures"] if c["label"] != "ref"]
@@ -414,6 +445,8 @@ def print_result(result, series, meta):
             print(f"    click times: {d['click_times_s'][:12]}")
         if d["dropouts"]:
             print(f"    dropout times: {d['dropout_times_s'][:12]}")
+        if d.get("loud"):
+            print(f"    LOUD (>10 dB over median, 10 ms windows): {d['loud_times_s_db'][:12]}")
     for tr in meta.get("triggers", []):
         if tr.get("perf") is None:
             continue
