@@ -125,18 +125,20 @@ private:
 	};
 
 	// BetterFxSound: choose additional outputs that play together with the main output.
-	class OutputsSettingsPane : public SettingsPane
+	class OutputsSettingsPane : public SettingsPane, private Timer
 	{
 	public:
 		OutputsSettingsPane();
-		~OutputsSettingsPane() = default;
+		~OutputsSettingsPane();
 
 		void resized() override;
 		void paint(Graphics& g) override;
 
 	private:
-		static constexpr int DESCRIPTION_Y = 40;
-		static constexpr int DESCRIPTION_HEIGHT = 100;
+		static constexpr int DESCRIPTION_Y = 36;
+		static constexpr int DESCRIPTION_HEIGHT = 72;
+		static constexpr int SYNC_BUTTON_HEIGHT = 26;
+		static constexpr int SYNC_STATUS_HEIGHT = 48;
 		static constexpr int ROW_SPACING = 4;
 
 		class OutputRow : public Component
@@ -169,10 +171,14 @@ private:
 		};
 
 		void visibilityChanged() override;
+		void timerCallback() override;
 		void rebuild();
 		void setText();
+		void onSyncClicked();
 
 		Label description_;
+		TextButton sync_button_;
+		Label sync_status_;
 		Label empty_label_;
 		Viewport viewport_;
 		Component rows_container_;

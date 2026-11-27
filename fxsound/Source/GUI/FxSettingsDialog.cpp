@@ -356,11 +356,30 @@ FxSettingsDialog::OutputsSettingsPane::OutputsSettingsPane() :
 	viewport_.setViewedComponent(&rows_container_, false);
 	viewport_.setScrollBarsShown(true, false);
 
+	sync_button_.setMouseCursor(MouseCursor::PointingHandCursor);
+	sync_button_.onClick = [this]() { onSyncClicked(); };
+
+	sync_status_.setColour(Label::ColourIds::textColourId, getLookAndFeel().findColour(TextButton::textColourOnId));
+	sync_status_.setJustificationType(Justification::topLeft);
+	sync_status_.setMinimumHorizontalScale(1.0f);
+
 	setText();
 
 	addAndMakeVisible(description_);
+	addAndMakeVisible(sync_button_);
+	addAndMakeVisible(sync_status_);
 	addChildComponent(empty_label_);
 	addAndMakeVisible(viewport_);
+}
+
+FxSettingsDialog::OutputsSettingsPane::~OutputsSettingsPane()
+{
+	// Closing the settings while measuring stops the measurement.
+	if (isTimerRunning())
+	{
+		stopTimer();
+		FxController::getInstance().cancelDelayCalibration();
+	}
 }
 
 void FxSettingsDialog::OutputsSettingsPane::resized()
@@ -370,8 +389,10 @@ void FxSettingsDialog::OutputsSettingsPane::resized()
 
 	auto width = getWidth() - ((X_MARGIN + 5) * 2);
 	description_.setBounds(X_MARGIN, DESCRIPTION_Y, width, DESCRIPTION_HEIGHT);
+	sync_button_.setBounds(X_MARGIN, description_.getBottom() + 4, jmin(width, 260), SYNC_BUTTON_HEIGHT);
+	sync_status_.setBounds(X_MARGIN, sync_button_.getBottom() + 2, width, SYNC_STATUS_HEIGHT);
 
-	auto list_y = description_.getBottom() + 10;
+	auto list_y = sync_status_.getBottom() + 4;
 	auto list_height = jmax(60, getHeight() - list_y - 20);
 	viewport_.setBounds(X_MARGIN, list_y, width, list_height);
 	empty_label_.setBounds(viewport_.getBounds());
@@ -407,11 +428,16 @@ void FxSettingsDialog::OutputsSettingsPane::setText()
 {
 	auto& theme = dynamic_cast<FxTheme&>(LookAndFeel::getDefaultLookAndFeel());
 
-	description_.setFont(theme.getNormalFont().withHeight(14.0f));
+	description_.setFont(theme.getNormalFont().withHeight(13.0f));
 	description_.setText(TRANS("Play the enhanced sound on these devices at the same time as the main output. "
 		"Each device can have its own volume and play both channels, only the left or right one, or mono. "
-		"Use the delay to line the devices up: if one device sounds late (for example Bluetooth headphones), "
-		"make that one the main output and add delay to the others."), NotificationType::dontSendNotification);
+		"Use the delay to line the devices up, or let the microphone do it."), NotificationType::dontSendNotification);
+
+	sync_status_.setFont(theme.getNormalFont().withHeight(13.0f));
+	if (isTimerRunning())
+		sync_button_.setButtonText(TRANS("Cancel sync"));
+	else
+		sync_button_.setButtonText(TRANS("Sync delays with microphone"));
 
 	empty_label_.setFont(theme.getNormalFont().withHeight(14.0f));
 	empty_label_.setText(TRANS("No other output devices were found."), NotificationType::dontSendNotification);
@@ -419,10 +445,61 @@ void FxSettingsDialog::OutputsSettingsPane::setText()
 
 void FxSettingsDialog::OutputsSettingsPane::visibilityChanged()
 {
-	if (isVisible())
+	if (isVisible() && !isTimerRunning())
 	{
 		rebuild();
 	}
+}
+
+void FxSettingsDialog::OutputsSettingsPane::onSyncClicked()
+{
+	auto& controller = FxController::getInstance();
+
+	if (isTimerRunning())
+	{
+		controller.cancelDelayCalibration();
+		return;
+	}
+
+	if (!controller.startDelayCalibration())
+	{
+		sync_status_.setText(TRANS("Sync could not start. Make sure FxSound is on and playing to a main output."), NotificationType::dontSendNotification);
+		return;
+	}
+
+	sync_status_.setText(TRANS("Measuring... Keep the room quiet, the beeps will play on each device in turn."), NotificationType::dontSendNotification);
+	rows_container_.setEnabled(false);
+	startTimer(200);
+	setText();
+}
+
+void FxSettingsDialog::OutputsSettingsPane::timerCallback()
+{
+	auto& controller = FxController::getInstance();
+	int progress = 0;
+	auto state = controller.getDelayCalibrationState(&progress);
+
+	if (state == 1)
+	{
+		sync_status_.setText(TRANS("Measuring... Keep the room quiet, the beeps will play on each device in turn.") + " " + String(progress) + "%", NotificationType::dontSendNotification);
+		return;
+	}
+
+	stopTimer();
+	rows_container_.setEnabled(true);
+
+	if (state == 2)
+	{
+		auto summary = controller.applyDelayCalibrationResults();
+		rebuild();
+		sync_status_.setText(summary, NotificationType::dontSendNotification);
+	}
+	else
+	{
+		sync_status_.setText(TRANS("Sync failed:") + " " + controller.getDelayCalibrationError(), NotificationType::dontSendNotification);
+	}
+
+	setText();
 }
 
 void FxSettingsDialog::OutputsSettingsPane::rebuild()
@@ -469,7 +546,7 @@ FxSettingsDialog::OutputsSettingsPane::OutputRow::OutputRow(const SoundDevice& d
 		name += " " + TRANS("(main output)");
 
 	bool enabled = (config != nullptr);
-	int delay_ms = enabled ? config->delay_ms : 0;
+	int delay_ms = is_main_output_ ? FxController::getInstance().getMainOutputDelay() : (enabled ? config->delay_ms : 0);
 	int volume = enabled ? config->volume_percent : 100;
 	auto channel_mode = is_main_output_ ? main_channel_mode : (enabled ? config->channel_mode : OutputChannelMode::Both);
 
@@ -539,9 +616,10 @@ void FxSettingsDialog::OutputsSettingsPane::OutputRow::setupSlider(Slider& slide
 
 int FxSettingsDialog::OutputsSettingsPane::OutputRow::getPreferredHeight() const
 {
-	// One line for the name, plus delay and volume when this additional output is on.
-	bool show_sliders = !is_main_output_ && toggle_.getToggleState();
-	return 8 + LINE_HEIGHT * (show_sliders ? 3 : 1);
+	// Name line, plus delay (main and active outputs) and volume (active additional outputs).
+	if (is_main_output_)
+		return 8 + LINE_HEIGHT * 2;
+	return 8 + LINE_HEIGHT * (toggle_.getToggleState() ? 3 : 1);
 }
 
 void FxSettingsDialog::OutputsSettingsPane::OutputRow::resized()
@@ -570,13 +648,13 @@ void FxSettingsDialog::OutputsSettingsPane::OutputRow::paint(Graphics& g)
 void FxSettingsDialog::OutputsSettingsPane::OutputRow::updateControlsState()
 {
 	bool active = is_main_output_ || toggle_.getToggleState();
-	bool show_sliders = !is_main_output_ && toggle_.getToggleState();
+	bool show_volume = !is_main_output_ && toggle_.getToggleState();
 
 	channel_list_.setVisible(active);
-	delay_label_.setVisible(show_sliders);
-	delay_slider_.setVisible(show_sliders);
-	volume_label_.setVisible(show_sliders);
-	volume_slider_.setVisible(show_sliders);
+	delay_label_.setVisible(active);
+	delay_slider_.setVisible(active);
+	volume_label_.setVisible(show_volume);
+	volume_slider_.setVisible(show_volume);
 }
 
 void FxSettingsDialog::OutputsSettingsPane::OutputRow::save()
@@ -587,6 +665,7 @@ void FxSettingsDialog::OutputsSettingsPane::OutputRow::save()
 	if (is_main_output_)
 	{
 		controller.setMainOutputChannelMode(channel_mode);
+		controller.setMainOutputDelay(static_cast<int>(delay_slider_.getValue()));
 		return;
 	}
 

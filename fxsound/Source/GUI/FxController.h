@@ -149,6 +149,16 @@ public:
 	void setAdditionalOutput(const String& device_id, bool enabled, int delay_ms, int volume_percent, OutputChannelMode channel_mode);
 	OutputChannelMode getMainOutputChannelMode();
 	void setMainOutputChannelMode(OutputChannelMode channel_mode);
+	int getMainOutputDelay();
+	void setMainOutputDelay(int delay_ms);
+
+	// BetterFxSound: automatic delay sync with the microphone.
+	bool startDelayCalibration();
+	void cancelDelayCalibration();
+	int getDelayCalibrationState(int* progress_percent); // 0 idle, 1 running, 2 done, 3 failed
+	String getDelayCalibrationError();
+	// Turns the measured latencies into delays, saves and applies them. Returns a summary for the user.
+	String applyDelayCalibrationResults();
 	void applyAdditionalOutputs();
 
 	FxThemeMode getThemeMode();
