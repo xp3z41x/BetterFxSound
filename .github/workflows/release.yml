@@ -126,8 +126,6 @@ jobs:
           # User data that must survive everything below.
           $presets = New-Item -ItemType Directory -Force "$env:APPDATA\FxSound\Presets"
           Copy-Item Installer\Resources\Factsoft\1.fac "$presets\SmokeTest.fac"
-          New-Item -Force 'HKCU:\SOFTWARE\DFX' | Out-Null
-          Set-ItemProperty 'HKCU:\SOFTWARE\DFX' -Name SmokeTest -Value 'keep'
 
           Write-Host "::group::Install official FxSound"
           $p = Start-Process release\fxsound_setup.exe -ArgumentList '/exenoui','/qn','/norestart','/l*v',"`"$logs\official-install.log`"" -PassThru
@@ -138,6 +136,13 @@ jobs:
           Write-Host "::endgroup::"
           $official = Find-Official
           Assert ($null -ne $official) "official FxSound is installed ($($official.DisplayVersion))"
+          # The official installer starts FxSound, and on its first start (a version change)
+          # the app itself clears HKCU\SOFTWARE\DFX. Seed that key only after that.
+          Start-Sleep 10
+          New-Item -Force 'HKCU:\SOFTWARE\DFX' | Out-Null
+          Set-ItemProperty 'HKCU:\SOFTWARE\DFX' -Name SmokeTest -Value 'keep'
+          Start-Sleep 5
+          Assert ((Get-ItemProperty 'HKCU:\SOFTWARE\DFX').SmokeTest -eq 'keep') "HKCU\SOFTWARE\DFX seeded while official FxSound runs"
 
           Write-Host "::group::Install BetterFxSound over it"
           $p = Start-Process $setup -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',"/LOG=`"$logs\install.log`"" -PassThru
