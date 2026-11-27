@@ -40,7 +40,7 @@ func TestWriteToolsLifecycle(t *testing.T) {
 	t.Logf("baseline: power=%v preset=%q output=%q num_bands=%d",
 		baseline.Power, baseline.SelectedPreset, baseline.SelectedOutput, baseline.Equalizer.NumBands)
 
-	session, ctx, cleanup := connectTestSession(t, 90*time.Second)
+	session, ctx, cleanup := connectTestSession(t, 180*time.Second)
 	defer cleanup()
 
 	defer restoreBaseline(t, paths, baseline)
@@ -48,6 +48,7 @@ func TestWriteToolsLifecycle(t *testing.T) {
 	t.Run("set_power", func(t *testing.T) { testSetPower(t, session, ctx, paths, baseline) })
 	t.Run("select_preset", func(t *testing.T) { testSelectPreset(t, session, ctx, paths, baseline) })
 	t.Run("set_output_device", func(t *testing.T) { testSetOutputDevice(t, session, ctx, paths, baseline) })
+	t.Run("output_tools", func(t *testing.T) { testOutputTools(t, session, ctx, paths, baseline) })
 	t.Run("preset_lifecycle", func(t *testing.T) { testPresetLifecycle(t, session, ctx, paths, baseline) })
 	t.Run("eq_bands_and_gains", func(t *testing.T) { testEqBandsAndGains(t, session, ctx, paths, baseline) })
 	t.Run("effects", func(t *testing.T) { testEffects(t, session, ctx, paths, baseline) })
@@ -149,6 +150,77 @@ func testSetOutputDevice(t *testing.T, session *mcp.ClientSession, ctx context.C
 	callToolOK(t, session, ctx, "fxsound_set_output_device", map[string]any{"device_name": only})
 	if got := freshStatus(t, ctx, paths).SelectedOutput; got != only {
 		t.Errorf("after set_output_device(%q): status.selected_output = %q", only, got)
+	}
+}
+
+// testOutputTools changes one enabled output's volume and delay and puts them back, enables
+// and disables a disabled output (it plays for a moment), and checks that bad names and
+// values are reported instead of being silently ignored by FxSound.
+func testOutputTools(t *testing.T, session *mcp.ClientSession, ctx context.Context, paths *fxsound.Paths, baseline *fxsound.Status) {
+	var target, spare *fxsound.OutputInfo
+	for i := range baseline.Outputs {
+		o := &baseline.Outputs[i]
+		if o.Present && o.Enabled && target == nil {
+			target = o
+		}
+		if o.Present && !o.Enabled && spare == nil {
+			spare = o
+		}
+	}
+	if target == nil {
+		t.Skip("needs an enabled, connected output")
+	}
+	output := func() *fxsound.OutputInfo {
+		t.Helper()
+		o := freshStatus(t, ctx, paths).FindOutput(target.Name)
+		if o == nil {
+			t.Fatalf("output %q is gone from status.json", target.Name)
+		}
+		return o
+	}
+
+	volume := 37
+	if target.Volume == volume {
+		volume = 38
+	}
+	callToolOK(t, session, ctx, "fxsound_set_output_volume", map[string]any{"device_name": target.Name, "volume": volume})
+	if got := output().Volume; got != volume {
+		t.Errorf("after set_output_volume(%d): volume = %d", volume, got)
+	}
+	delay := 123
+	if target.DelayMs == delay {
+		delay = 124
+	}
+	callToolOK(t, session, ctx, "fxsound_set_output_delay", map[string]any{"device_name": target.Name, "delay_ms": delay})
+	if got := output().DelayMs; got != delay {
+		t.Errorf("after set_output_delay(%d): delay_ms = %d", delay, got)
+	}
+	callToolOK(t, session, ctx, "fxsound_set_output_volume", map[string]any{"device_name": target.Name, "volume": target.Volume})
+	callToolOK(t, session, ctx, "fxsound_set_output_delay", map[string]any{"device_name": target.Name, "delay_ms": target.DelayMs})
+	if o := output(); o.Volume != target.Volume || o.DelayMs != target.DelayMs {
+		t.Errorf("restoring: volume = %d, delay_ms = %d, want %d, %d", o.Volume, o.DelayMs, target.Volume, target.DelayMs)
+	}
+
+	const unknown = "No Such Output (fxmcp test)"
+	callToolExpectError(t, session, ctx, "fxsound_set_output_volume", map[string]any{"device_name": unknown, "volume": 50})
+	callToolExpectError(t, session, ctx, "fxsound_set_output_delay", map[string]any{"device_name": unknown, "delay_ms": 50})
+	callToolExpectError(t, session, ctx, "fxsound_enable_output", map[string]any{"device_name": unknown})
+	callToolExpectError(t, session, ctx, "fxsound_disable_output", map[string]any{"device_name": unknown})
+	callToolExpectError(t, session, ctx, "fxsound_set_output_device", map[string]any{"device_name": unknown})
+	callToolExpectError(t, session, ctx, "fxsound_set_output_volume", map[string]any{"device_name": target.Name, "volume": 101})
+	callToolExpectError(t, session, ctx, "fxsound_set_output_delay", map[string]any{"device_name": target.Name, "delay_ms": 501})
+	callToolExpectError(t, session, ctx, "fxsound_enable_output", map[string]any{"device_name": " "})
+
+	if spare == nil {
+		return
+	}
+	callToolOK(t, session, ctx, "fxsound_enable_output", map[string]any{"device_name": spare.Name})
+	if o := freshStatus(t, ctx, paths).FindOutput(spare.Name); o == nil || !o.Enabled {
+		t.Errorf("after enable_output(%q): not enabled", spare.Name)
+	}
+	callToolOK(t, session, ctx, "fxsound_disable_output", map[string]any{"device_name": spare.Name})
+	if o := freshStatus(t, ctx, paths).FindOutput(spare.Name); o == nil || o.Enabled {
+		t.Errorf("after disable_output(%q): still enabled", spare.Name)
 	}
 }
 
