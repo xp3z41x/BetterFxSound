@@ -3601,9 +3601,10 @@ String FxController::applySoleOutputPreset(const String& previous_sole_id)
 }
 
 // BetterFxSound: only stores the outputs. The engine gets them from flushOutputsToEngine(), queued here,
-// with lock_ released: setOutputs() may wait for removed outputs' render threads to stop, which must not
-// stall every other user of lock_. Every change is made on the message thread and the flush always sends
-// the latest outputs, so the engine gets them in order.
+// with lock_ released, so lock_ is never held across the engine call. setOutputs() itself still runs on the
+// message thread and, until the engine stops removed outputs without waiting for their render threads,
+// can block it (UI and timer included) while a slow output closes. Every change is made on the message
+// thread and the flush always sends the latest outputs, so the engine gets them in order.
 void FxController::pushOutputsToEngine()
 {
 	ScopedLock auto_lock(lock_);

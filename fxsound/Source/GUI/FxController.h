@@ -364,7 +364,7 @@ private:
 	bool no_enabled_output_present_ = false;	// Logged once: every enabled output is disconnected, silence
 	StringArray failed_carrier_ids_;	// Asked for but not taken by the engine; skipped until the devices change
 	// pushOutputsToEngine() stores the outputs here and flushOutputsToEngine() hands them to the engine with
-	// lock_ released: setOutputs() may wait for removed outputs' render threads to stop.
+	// lock_ released (setOutputs() may wait for removed outputs' render threads to stop, on the message thread).
 	std::vector< ::OutputConfig> pending_engine_outputs_;
 	bool engine_outputs_pending_ = false;
 	bool no_output_;				// Powered off because no real output device was present
