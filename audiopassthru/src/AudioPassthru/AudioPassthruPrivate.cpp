@@ -748,22 +748,6 @@ void AudioPassthruPrivate::setOutputs(const std::vector<OutputConfig>& outputs)
 }
 
 /*
-* FUNCTION: setAdditionalOutputs()
-* DESCRIPTION: BetterFxSound, legacy. Stores the additional outputs requested by the UI and applies them.
-* The carrier stays on. Ignored once setOutputs() has been used.
-*/
-void AudioPassthruPrivate::setAdditionalOutputs(const std::vector<AdditionalOutputConfig>& outputs)
-{
-	{
-		std::lock_guard<std::mutex> lock(config_mutex_);
-		additional_outputs_ = outputs;
-		if (!legacy_mode_)
-			return;
-	}
-	applyAdditionalOutputs();
-}
-
-/*
 * FUNCTION: isDevicePresent()
 * DESCRIPTION: BetterFxSound. True if the device is an active playback device in the list read at the last
 * device enumeration. Every device arrival or removal causes a reinit, which re-reads that list and then
@@ -899,33 +883,6 @@ void AudioPassthruPrivate::applyAdditionalOutputs()
 
 	effective_outputs_ = effective;
 	multi_output_.configure(effective);
-}
-
-/*
-* FUNCTION: setMainOutputChannelMode()
-* DESCRIPTION: BetterFxSound, legacy. Selects which channels the carrier plays. Ignored once setOutputs() has been used.
-*/
-void AudioPassthruPrivate::setMainOutputChannelMode(OutputChannelMode mode)
-{
-	std::lock_guard<std::mutex> lock(config_mutex_);
-	legacy_main_channel_mode_ = mode;
-	if (legacy_mode_)
-		main_channel_mode_.store(static_cast<int>(mode), std::memory_order_relaxed);
-}
-
-/*
-* FUNCTION: setMainOutputDelay()
-* DESCRIPTION: BetterFxSound, legacy. Sets the extra delay of the carrier. Ignored once setOutputs() has been used.
-*/
-void AudioPassthruPrivate::setMainOutputDelay(int delay_ms)
-{
-	if (delay_ms < 0) delay_ms = 0;
-	if (delay_ms > 500) delay_ms = 500;
-
-	std::lock_guard<std::mutex> lock(config_mutex_);
-	legacy_main_delay_ms_ = delay_ms;
-	if (legacy_mode_)
-		main_delay_ms_.store(delay_ms, std::memory_order_relaxed);
 }
 
 /*

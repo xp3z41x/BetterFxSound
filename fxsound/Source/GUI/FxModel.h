@@ -28,7 +28,10 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 class FxModel final
 {
 public:
-	enum Event { Notification=1, Subscription, PresetSelected, PresetListUpdated, PresetModified, OutputSelected, OutputListUpdated, OutputError, Other };
+	// BetterFxSound outputs rework: OutputListUpdated is sent after any change to the device list,
+	// to which outputs are enabled, or to the output settings changed by delay calibration. The
+	// outputs themselves are read with FxController::getOutputs().
+	enum Event { Notification=1, Subscription, PresetSelected, PresetListUpdated, PresetModified, OutputListUpdated, OutputError, Other };
 	enum PresetType { AppPreset=1, UserPreset=2 };
 
 	struct Preset final
@@ -57,8 +60,6 @@ public:
 	FxModel(const FxModel&) = delete;
 	void operator=(const FxModel&) = delete;
 
-	void initOutputs(const std::vector<SoundDevice>& output_devices);
-
 	void initPresets(const Array<Preset>& presets);
 	int  addPreset(const Preset& preset);
 	void removePreset(int preset);
@@ -82,44 +83,9 @@ public:
 		notifyListeners();
 	}
 
-	const StringArray& getOutputNames() const
+	void notifyOutputListUpdated()
 	{
-		return output_names_;
-	}
-
-	std::vector<SoundDevice> getOutputDevices() const
-	{
-		return output_devices_;
-	}
-
-	SoundDevice getSelectedOutput()
-	{
-		return selected_output_device_;
-	}
-
-	int getSelectedOutputIndex()
-	{
-		int selected_output_id = 0;
-		for (auto& output_device : output_devices_)
-		{
-			if (output_device.pwszID == selected_output_device_.pwszID)
-			{
-				return selected_output_id;
-			}
-
-			selected_output_id++;
-		}
-
-		return -1;
-	}
-
-	void setSelectedOutput(const SoundDevice& sound_device, bool notify=true)
-	{
-		selected_output_device_ = sound_device;
-		if (notify)
-		{
-			notifyListeners(Event::OutputSelected);
-		}
+		notifyListeners(Event::OutputListUpdated);
 	}
 
     void notifyOutputError()
@@ -191,16 +157,12 @@ private:
 
 	bool power_state_;
 	Array<Preset> presets_;
-	StringArray output_names_;
 	int selected_preset_;
-    bool output_disconnected_;
 
 	bool hotkey_support_;
 	bool menu_clicked_;
 	int language_;
 	bool debug_logging_;
-	std::vector<SoundDevice> output_devices_;
-	SoundDevice selected_output_device_;
 
 	String message_;
 	std::pair<String, String> message_link_;

@@ -89,9 +89,7 @@ public:
 	void setPowerState(bool power_state);
     bool setPreset(const String& preset_name, bool notify = true);
 	bool setPreset(int preset_index, bool notify=true);
-	void setOutput(const String output_device_id, bool notify=true);
-	void setOutput(int output, bool notify=true);
-    
+
     bool isPlaybackDeviceAvailable();
 	void checkDeviceChanges();
 
@@ -138,19 +136,13 @@ public:
 	bool isOutputDevicePresent(const String& output_device_name);
 	SoundDevice getPreferredOutput();
 	int compareOutputDevicePriority(const String& output_device_name1, const String& output_device_name2, const juce::Array<DeviceConfig>& device_configs);
+	// Re-reads the device priority (Output preferences) and elects the carrier again.
 	void refreshOutputList();
+	// Name of the carrier, the enabled output on the low latency path (see docs/OUTPUTS_REWORK.md).
+	// Used to apply a device's preset; not shown to the user as a "main output".
 	const String& getOutputName();
-    void setOutputName(const String& output_device_name);
     bool isNewOutputPrioritized();
     void setNewOutputPrioritized(bool prioritize_new_devices);
-
-	// BetterFxSound: additional outputs that play the processed sound together with the main output.
-	std::vector<AdditionalOutputConfig> getAdditionalOutputs();
-	void setAdditionalOutput(const String& device_id, bool enabled, int delay_ms, int volume_percent, OutputChannelMode channel_mode);
-	OutputChannelMode getMainOutputChannelMode();
-	void setMainOutputChannelMode(OutputChannelMode channel_mode);
-	int getMainOutputDelay();
-	void setMainOutputDelay(int delay_ms);
 
 	// BetterFxSound outputs rework (docs/OUTPUTS_REWORK.md): one flat list of outputs, no "main"
 	// output from the UI's point of view. Every output can be enabled or disabled; zero enabled
@@ -170,6 +162,9 @@ public:
 	void setOutputDelay(const String& id, int delay_ms);
 	void setOutputChannelMode(const String& id, OutputChannelMode channel_mode);
 	int getEnabledOutputCount();
+	// Enables the given present output and disables every other one (CLI --output, "next output" hotkey).
+	// Returns false if no present output has this id.
+	bool enableOnlyOutput(const String& id);
 
 	// BetterFxSound: automatic delay sync with the microphone.
 	bool startDelayCalibration();
@@ -178,7 +173,6 @@ public:
 	String getDelayCalibrationError();
 	// Turns the measured latencies into delays, saves and applies them. Returns a summary for the user.
 	String applyDelayCalibrationResults();
-	void applyAdditionalOutputs();
 
 	FxThemeMode getThemeMode();
 	void setThemeMode(FxThemeMode mode);
@@ -283,13 +277,39 @@ private:
 	void onSystemResume();
 	
     void initOutputs(std::vector<SoundDevice>& sound_devices);
-	void updateOutputs(std::vector<SoundDevice>& sound_devices);
+	void updateOutputs(std::vector<SoundDevice>& sound_devices, const StringArray& new_device_names);
 	void clearOutputRestore();
-    void selectProcessingOutput(std::vector<SoundDevice>& sound_devices);
+    void selectProcessingOutput(std::vector<SoundDevice>& sound_devices, const StringArray& new_device_names);
 	void syncPlaybackAvailability();
-    void syncOutputWithSystemDefault(std::vector<SoundDevice>& sound_devices);
+	void syncOutputsWhileOff(std::vector<SoundDevice>& sound_devices, const StringArray& new_device_names);
+	StringArray findNewDeviceNames(const std::vector<SoundDevice>& sound_devices);
 
 	void sortByDeviceConfigPriority(std::vector<SoundDevice>& devices);
+
+	// BetterFxSound outputs rework: one entry per output that is enabled or has been configured.
+	// Persisted as the "outputs" settings key. Guarded by lock_.
+	struct OutputEntry {
+		String id;
+		String name;
+		bool enabled = false;
+		int delay_ms = 0;
+		int volume_percent = 100;
+		OutputChannelMode channel_mode = OutputChannelMode::Both;
+	};
+	void loadOutputSettings(const std::vector<SoundDevice>& sound_devices);
+	void saveOutputSettings();
+	OutputEntry* findOutputEntry(const String& id);
+	OutputEntry& getOutputEntry(const String& id);
+	const SoundDevice* findActiveOutput(const String& id) const;
+	bool refreshActiveOutputs(const std::vector<SoundDevice>& sound_devices);
+	bool enableNewOutputs(const StringArray& new_device_names);
+	SoundDevice electCarrier();
+	void applyCarrier();
+	void requestCarrier(const SoundDevice& device);
+	void pushOutputsToEngine();
+	void notifyOutputsChanged();
+	void enableNextOutput();
+	void handleNoOutput();
 
 	void powerOn(bool on);
 
@@ -325,7 +345,16 @@ private:
 	bool output_changed_;
     bool playback_device_available_;
 	bool system_sleeping_;
-	String output_device_name_;
+	String output_device_name_;		// Carrier name, see getOutputName()
+
+	// BetterFxSound outputs rework (guarded by lock_).
+	std::vector<OutputEntry> output_entries_;
+	String carrier_id_;				// Carrier the engine uses, or will use once a requested switch is done
+	String requested_carrier_id_;	// Asked for with setAsPlaybackDevice(), not confirmed by a reinit yet
+	String elected_carrier_id_;		// Last carrier chosen by the election; its device preset was applied
+	StringArray failed_carrier_ids_;	// Asked for but not taken by the engine; skipped until the devices change
+	bool no_output_;				// Powered off because no real output device was present
+	String startup_output_name_;	// --output given on the command line before init
 
 	// HDMI outputs disappear when the PC goes to sleep. The device removal notification arrives
 	// before the system suspend notification, so a removal can only be recognized as sleep-related
@@ -334,7 +363,7 @@ private:
 	// asleep) so HDMI also gets that time after wake. If HDMI is back in time it is reused, otherwise
 	// it is treated as a physical disconnect and the preferred output is selected.
 	static constexpr int HDMI_FAILOVER_INTERVAL = 30;	// 30 ticks * 100 ms = 3 s
-	String failover_output_name_;
+	String failover_output_id_;
 	int hdmi_failover_counter_;
 	bool hdmi_reconnect_pending_;	// HDMI output lost, waiting for it to reconnect
 	std::vector<SoundDevice> active_output_devices_;

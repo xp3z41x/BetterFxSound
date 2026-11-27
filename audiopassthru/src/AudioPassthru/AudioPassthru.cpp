@@ -118,21 +118,6 @@ void AudioPassthru::setOutputs(const std::vector<OutputConfig>& outputs)
 	data_->setOutputs(outputs);
 }
 
-void AudioPassthru::setAdditionalOutputs(const std::vector<AdditionalOutputConfig>& outputs)
-{
-	data_->setAdditionalOutputs(outputs);
-}
-
-void AudioPassthru::setMainOutputChannelMode(OutputChannelMode mode)
-{
-	data_->setMainOutputChannelMode(mode);
-}
-
-void AudioPassthru::setMainOutputDelay(int delay_ms)
-{
-	data_->setMainOutputDelay(delay_ms);
-}
-
 bool AudioPassthru::startDelayCalibration()
 {
 	return data_->startDelayCalibration();

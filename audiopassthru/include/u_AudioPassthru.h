@@ -58,9 +58,6 @@ public:
 	bool checkDeviceChanges();
 	void restoreDefaultPlaybackDevice();
 	void setOutputs(const std::vector<OutputConfig>& outputs);
-	void setAdditionalOutputs(const std::vector<AdditionalOutputConfig>& outputs);
-	void setMainOutputChannelMode(OutputChannelMode mode);
-	void setMainOutputDelay(int delay_ms);
 	bool startDelayCalibration();
 	void cancelDelayCalibration();
 	int getDelayCalibrationState(int* progress_percent);

@@ -117,15 +117,7 @@ public:
 	// the carrier path plays silence; no reinit is needed. Every other enabled entry whose device
 	// is present plays through the additional outputs. The FxSound virtual device is always
 	// ignored. Zero enabled outputs means silence; processing keeps running.
-	// Once this has been called, the three legacy calls below no longer have any effect.
 	void setOutputs(const std::vector<OutputConfig>& outputs);
-
-	// BetterFxSound, legacy (until FxController uses setOutputs()): the carrier ("main output")
-	// is always on, these set its delay and channel mode, and setAdditionalOutputs() sets the
-	// other outputs. The carrier and the FxSound virtual device are ignored if they are in the list.
-	void setAdditionalOutputs(const std::vector<AdditionalOutputConfig>& outputs);
-	void setMainOutputChannelMode(OutputChannelMode mode);
-	void setMainOutputDelay(int delay_ms);
 
 	// BetterFxSound: measures the delay of every enabled output that is present (the carrier
 	// only if it is enabled) with the default microphone. Runs in the background; poll
