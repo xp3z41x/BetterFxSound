@@ -151,8 +151,8 @@ public:
 		setVolumePercent(config.volume_percent);
 	}
 
-	// Audio thread. Never blocks.
-	void write(const float* data, UINT32 frames, UINT32 channels, UINT32 sample_rate)
+	// Audio thread. Never blocks. 'silent' queues silence of the same length instead.
+	void write(const float* data, UINT32 frames, UINT32 channels, UINT32 sample_rate, bool silent)
 	{
 		if (data == nullptr || frames == 0 || channels == 0 || channels > kMaxChannels || sample_rate == 0)
 			return;
@@ -182,7 +182,11 @@ public:
 			float* dst = &ring_[static_cast<size_t>((w + i) & kRingMask) * kMaxChannels];
 			const float* src = data + static_cast<size_t>(i) * channels;
 
-			if (mode == OutputChannelMode::Both || channels < 2)
+			if (silent)
+			{
+				std::memset(dst, 0, channels * sizeof(float));
+			}
+			else if (mode == OutputChannelMode::Both || channels < 2)
 			{
 				std::memcpy(dst, src, channels * sizeof(float));
 			}
@@ -655,14 +659,18 @@ void MultiOutputRouter::stopAll()
 	configure(std::vector<AdditionalOutputConfig>());
 }
 
-void MultiOutputRouter::write(const float* data, UINT32 frames, UINT32 channels, UINT32 sample_rate)
+void MultiOutputRouter::write(const float* data, UINT32 frames, UINT32 channels, UINT32 sample_rate, int solo_index)
 {
 	// Never wait on the audio thread: if the list is being changed right now, skip this block.
 	if (!TryAcquireSRWLockShared(&lock_))
 		return;
 
-	for (auto& output : outputs_)
-		output->write(data, frames, channels, sample_rate);
+	const bool solo_active = (solo_index >= -1);
+	for (size_t i = 0; i < outputs_.size(); i++)
+	{
+		const bool silent = solo_active && static_cast<int>(i) != solo_index;
+		outputs_[i]->write(data, frames, channels, sample_rate, silent);
+	}
 
 	ReleaseSRWLockShared(&lock_);
 }

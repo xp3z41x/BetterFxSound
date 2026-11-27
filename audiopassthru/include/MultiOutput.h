@@ -62,7 +62,10 @@ public:
 	void stopAll();
 
 	// Audio thread: queues one block of processed, interleaved 32 bit float audio.
-	void write(const float* data, UINT32 frames, UINT32 channels, UINT32 sample_rate);
+	// solo_index >= 0: only that output gets the audio, the others get silence.
+	// solo_index == -1: every output here gets silence (the main output is being measured).
+	// Any other negative value: normal operation.
+	void write(const float* data, UINT32 frames, UINT32 channels, UINT32 sample_rate, int solo_index);
 
 private:
 	MultiOutputRouter(const MultiOutputRouter&) = delete;

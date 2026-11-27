@@ -70,6 +70,14 @@ struct AdditionalOutputConfig {
 	int volume_percent = 100;	// Volume of this output, 0 to 100
 };
 
+// BetterFxSound: result of the microphone delay measurement for one output.
+struct DelayCalibrationResult {
+	std::wstring device_id;
+	bool measured = false;		// False if the test sound was not heard clearly from this output
+	double latency_ms = 0.0;	// Time from the test sound until it was heard, including the output's current delay
+	double confidence = 0.0;	// Correlation peak / RMS, higher is better
+};
+
 class AudioPassthruCallback
 {
 public:
@@ -98,6 +106,17 @@ public:
 	void setAdditionalOutputs(const std::vector<AdditionalOutputConfig>& outputs);
 	// BetterFxSound: channel mode of the main output (Both keeps the original behaviour).
 	void setMainOutputChannelMode(OutputChannelMode mode);
+	// BetterFxSound: extra delay of the main output, 0 to 500 ms.
+	void setMainOutputDelay(int delay_ms);
+
+	// BetterFxSound: measures the delay of the main and the additional outputs with the
+	// default microphone. Runs in the background; poll getDelayCalibrationState().
+	// State: 0 idle, 1 running, 2 done, 3 failed.
+	bool startDelayCalibration();
+	void cancelDelayCalibration();
+	int getDelayCalibrationState(int* progress_percent);
+	std::vector<DelayCalibrationResult> getDelayCalibrationResults();
+	std::wstring getDelayCalibrationError();
 
 private:
 	AudioPassthruPrivate *data_;

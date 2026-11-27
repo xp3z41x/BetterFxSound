@@ -122,3 +122,33 @@ void AudioPassthru::setMainOutputChannelMode(OutputChannelMode mode)
 {
 	data_->setMainOutputChannelMode(mode);
 }
+
+void AudioPassthru::setMainOutputDelay(int delay_ms)
+{
+	data_->setMainOutputDelay(delay_ms);
+}
+
+bool AudioPassthru::startDelayCalibration()
+{
+	return data_->startDelayCalibration();
+}
+
+void AudioPassthru::cancelDelayCalibration()
+{
+	data_->cancelDelayCalibration();
+}
+
+int AudioPassthru::getDelayCalibrationState(int* progress_percent)
+{
+	return data_->getDelayCalibrationState(progress_percent);
+}
+
+std::vector<DelayCalibrationResult> AudioPassthru::getDelayCalibrationResults()
+{
+	return data_->getDelayCalibrationResults();
+}
+
+std::wstring AudioPassthru::getDelayCalibrationError()
+{
+	return data_->getDelayCalibrationError();
+}
