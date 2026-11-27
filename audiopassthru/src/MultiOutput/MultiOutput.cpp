@@ -261,6 +261,7 @@ public:
 	static constexpr REFERENCE_TIME kDeviceBufferHns = 200000; // 20 ms WASAPI buffer
 	static constexpr DWORD kRetryMs = 1000;                   // Retry interval when the device is missing
 	static constexpr DWORD kIdleStopMs = 2000;                // Stop the stream after this much silence
+	static constexpr int kRealignMs = 3;                      // Delay changes from this size on are applied at once
 
 	// Creates the output and starts its render thread. The thread holds its own reference to the output, so the
 	// output is freed only once the thread no longer uses it (see requestStop()).
@@ -671,16 +672,28 @@ private:
 
 		if (primed_)
 		{
-			if (fill > target + slack)
+			// The delay was changed: from a few ms on, the queue is lined up with the new target at once, as the
+			// carrier does, instead of leaving it to the drift correction below, which moves at most 0.5% and
+			// would take up to a minute to get there. The output fades out first (realign_pending_), then the
+			// queued audio is cut or padded with silence, then it fades back in.
+			const UINT32 moved = target > aligned_target_ ? target - aligned_target_ : aligned_target_ - target;
+			if (!realign_pending_ && moved >= static_cast<UINT32>(rate * kRealignMs / 1000.0))
+				realign_pending_ = true;
+
+			if (realign_pending_)
 			{
-				// Far too much audio queued (delay was lowered, or the device stalled): jump ahead.
+				// Handled after this block's fade out.
+			}
+			else if (fill > target + slack)
+			{
+				// Far too much audio queued (the device stalled): jump ahead.
 				read_pos_.store(read_pos_.load(std::memory_order_relaxed) + (fill - target), std::memory_order_release);
 				resetResampler();
 				fill = target;
 			}
 			else if (fill + slack < target)
 			{
-				// Far too little (delay was raised): build the buffer up again before playing.
+				// Far too little: build the buffer up again before playing.
 				primed_ = false;
 				idle_since_ = now;
 			}
@@ -692,6 +705,8 @@ private:
 			{
 				primed_ = true;
 				resetResampler();
+				aligned_target_ = target;
+				realign_pending_ = false;
 				if (!running_)
 				{
 					if (FAILED(client_->Start()))
@@ -735,9 +750,10 @@ private:
 
 		float* out = reinterpret_cast<float*>(buffer);
 		UINT32 produced = 0;
-		// This output's own trim times the Windows master volume (level and mute), see MasterVolume.h.
-		const float gain_target = target_gain_.load(std::memory_order_relaxed) * masterVolumeGain();
-		const float gain_step = static_cast<float>(1.0 / (0.01 * rate)); // One-pole ramp, ~10 ms
+		// This output's own trim times the Windows master volume (level and mute), see MasterVolume.h. Before a
+		// realignment, a fast fade out (~2 ms) instead.
+		const float gain_target = realign_pending_ ? 0.0f : target_gain_.load(std::memory_order_relaxed) * masterVolumeGain();
+		const float gain_step = static_cast<float>(1.0 / ((realign_pending_ ? 0.002 : 0.01) * rate)); // One-pole ramp
 		bool underflow = false;
 
 		for (; produced < space; produced++)
@@ -780,6 +796,26 @@ private:
 			std::memset(out + static_cast<size_t>(produced) * channels_, 0, static_cast<size_t>(space - produced) * channels_ * sizeof(float));
 			primed_ = false;
 			idle_since_ = now;
+		}
+		else if (realign_pending_ && current_gain_ < 0.01f)
+		{
+			// Faded out: line the queue up with the new target. Too much queued (delay lowered): skip the
+			// difference. Too little (delay raised): play silence until the queue is built up again. Either way
+			// the output fades back in from silence.
+			const UINT32 queued = write_pos_.load(std::memory_order_acquire) - read_pos_.load(std::memory_order_relaxed);
+			if (queued > target)
+			{
+				read_pos_.store(read_pos_.load(std::memory_order_relaxed) + (queued - target), std::memory_order_release);
+				resetResampler();
+			}
+			else if (queued < target)
+			{
+				primed_ = false;
+				idle_since_ = now;
+			}
+			current_gain_ = 0.0f;
+			aligned_target_ = target;
+			realign_pending_ = false;
 		}
 
 		return SUCCEEDED(render_->ReleaseBuffer(space, 0));
@@ -839,6 +875,8 @@ private:
 	double ratio_ = 1.0;
 	double error_avg_ = 0.0;
 	float current_gain_ = 0.0f;
+	UINT32 aligned_target_ = 0;		// Queue target (frames) the output was last lined up with
+	bool realign_pending_ = false;	// The delay changed: fading out before lining up with the new target
 };
 
 bool setDeviceFullVolumeById(const std::wstring& device_id, const GUID* event_context)
