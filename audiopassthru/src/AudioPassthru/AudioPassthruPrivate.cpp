@@ -960,6 +960,9 @@ void AudioPassthruPrivate::applyAdditionalOutputs()
 	if (!set_full_volume_id.empty())
 	{
 		owedVolumeRecord(set_full_volume_id, carrier_own_level, carrier_own_mute);
+		s_sndDevices_.engineSetPlaybackLevel = 1.0f;
+		s_sndDevices_.engineSetPlaybackMute = FALSE;
+		s_sndDevices_.engineSetPlaybackTick = GetTickCount();
 		setDeviceFullVolumeById(set_full_volume_id, &s_sndDevices_.guidThisApplication);
 	}
 

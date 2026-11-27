@@ -258,6 +258,12 @@ static void sndDevices_RestoreSavedPlaybackDeviceSettings(struct sndDevicesHdlTy
 		{
 			HRESULT hrLevel = S_OK;
 
+			// BetterFxSound: noted, so that the driver reporting this change back is not taken for the user's.
+			if( cast_handle->savedPlaybackLevelIsSaved )
+				cast_handle->engineSetPlaybackLevel = cast_handle->savedPlaybackLevel;
+			cast_handle->engineSetPlaybackMute = cast_handle->savedPlaybackMute;
+			cast_handle->engineSetPlaybackTick = GetTickCount();
+
 			// BetterFxSound: the level first, then mute: some drivers clear the mute flag as a side effect of a level change.
 			if( cast_handle->savedPlaybackLevelIsSaved )
 				hrLevel = pEndptVol->SetMasterVolumeLevelScalar(cast_handle->savedPlaybackLevel, &(cast_handle->guidThisApplication));

@@ -437,6 +437,12 @@ struct sndDevicesHdlType {
 	float savedPlaybackLevel;		// Its volume level, 0..1 as IAudioEndpointVolume reports it.
 	BOOL savedPlaybackLevelIsSaved;	// FALSE if the level could not be read; then only mute is put back.
 	BOOL playbackSettingsAreSaved;	// TRUE when the values above hold a valid setting.
+	// BetterFxSound: the last level and mute this app set on the playback device, and when (GetTickCount()). Some
+	// drivers (Bluetooth with absolute volume) report such a change back a second time, without this app's event
+	// context; the playback volume callback must not take that for the user's own setting.
+	float engineSetPlaybackLevel;
+	BOOL engineSetPlaybackMute;
+	DWORD engineSetPlaybackTick;
 
 	int noBufferCount;			// This is a count of how many times no buffers were available in a DoRecording call.
 	int WindowsSilentBufferCount;				// This is a buffer specified by the Windows flag to be all zeros.
