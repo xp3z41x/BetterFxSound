@@ -485,7 +485,7 @@ void DelayCalibration::run()
 {
 	if (targets_.empty())
 	{
-		fail(L"There are no outputs to synchronize.");
+		fail(L"No output is turned on. Turn on at least one output, then synchronize again.");
 		return;
 	}
 

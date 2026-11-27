@@ -52,10 +52,11 @@ public:
 	struct Target
 	{
 		std::wstring device_id;
-		int solo_index;			// -1 = main output, otherwise index of the additional output
+		int solo_index;			// -1 = carrier output, otherwise index of the additional output
 	};
 
-	// solo(-1) = main only, solo(k) = additional output k only, solo(INT_MIN) = everything back on.
+	// solo(-1) = carrier only, solo(k) = additional output k only, solo(INT_MIN) = everything back on.
+	// Targets may be in any order and the carrier may be absent; results follow the order of the targets.
 	typedef std::function<void(int)> SoloFunction;
 
 	DelayCalibration();

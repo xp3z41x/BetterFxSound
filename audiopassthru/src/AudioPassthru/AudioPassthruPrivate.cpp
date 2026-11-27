@@ -19,6 +19,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 //#include "stdafx.h"
 #include "u_AudioPassthru.h"
 #include "sndDevices.h"
+#include "MasterVolume.h"
 #include <algorithm>
 #include <cstring>
 
@@ -395,6 +396,18 @@ int AudioPassthruPrivate::processTimer()
 		}
 	}
 
+	/* BetterFxSound: an output change that arrived during a delay measurement is applied once it is over */
+	if (!b_need_to_start_thread && calibration_.getState(NULL) != DelayCalibration::State::Running)
+	{
+		bool apply_pending;
+		{
+			std::lock_guard<std::mutex> lock(config_mutex_);
+			apply_pending = apply_pending_;
+		}
+		if (apply_pending)
+			applyAdditionalOutputs();
+	}
+
 	if (b_need_to_start_thread)
 	{
 		/* Initialize flag which can be set by the outside telling thread to end */
@@ -403,6 +416,12 @@ int AudioPassthruPrivate::processTimer()
 		/* Reinit the sndDevices module */
 		if (sndDevicesReInit(hp_sndDevices_, SND_DEVICES_INIT_FOR_PROCESSING, &numRealDevices, &DfxDeviceEnabledFlag, &statusFlag) != OKAY)
 			return(NOT_OKAY);
+
+		/* BetterFxSound: the reinit settled which device is the carrier, a requested switch is no longer pending */
+		{
+			std::lock_guard<std::mutex> lock(config_mutex_);
+			pending_carrier_id_.clear();
+		}
 
 		if (statusFlag != SND_DEVICES_DEVICE_OPERATION_COMPLETED)
 		{
@@ -445,7 +464,7 @@ int AudioPassthruPrivate::processTimer()
 		{
 			hProcessingThread_ = CreateThread(NULL, 0, processingThread, (LPVOID)this, 0L, &ProcessingThreadID_);
 
-			/* BetterFxSound: the main output may have changed, re-check the additional outputs against it */
+			/* BetterFxSound: the carrier may have changed, recompute the carrier settings and the additional outputs */
 			applyAdditionalOutputs();
 		}
 		else
@@ -567,14 +586,17 @@ DWORD AudioPassthruPrivate::threadWorker(void)
 				multi_output_.write(fp_buffer, (UINT32)numSampleSets, pwfx->nChannels, pwfx->nSamplesPerSec, solo_.load(std::memory_order_relaxed));
 			}
 
-			/* BetterFxSound: optional channel mode for the main output (left only, right only or mono) */
+			/* BetterFxSound: optional channel mode for the carrier (left only, right only or mono) */
 			applyOutputChannelMode(fp_buffer, (UINT32)numSampleSets, pwfx->nChannels,
 				static_cast<OutputChannelMode>(main_channel_mode_.load(std::memory_order_relaxed)));
 
-			/* BetterFxSound: optional delay for the main output */
+			/* BetterFxSound: optional delay for the carrier */
 			applyMainDelay(fp_buffer, (UINT32)numSampleSets, pwfx->nChannels, pwfx->nSamplesPerSec);
 
-			/* BetterFxSound: while an additional output is being measured, the main output is silent */
+			/* BetterFxSound: Windows master volume x this output's trim, or silence if the carrier output is disabled */
+			applyCarrierGain(fp_buffer, (UINT32)numSampleSets, pwfx->nChannels, pwfx->nSamplesPerSec);
+
+			/* BetterFxSound: while an additional output is being measured, the carrier is silent */
 			{
 				int solo = solo_.load(std::memory_order_relaxed);
 				if (solo >= 0)
@@ -687,23 +709,88 @@ int AudioPassthruPrivate::setTargetedRealPlaybackDevice(const std::wstring sound
 	if (sndDevicesSetDeviceType(hp_sndDevices_, SND_DEVICES_DEFAULT, wcp_new_targeted_real_playback_guid, &i_resultFlag) != OKAY)
 		return(NOT_OKAY);
 
+	/*
+	* BetterFxSound: the switch takes effect at the next reinit. Until then the new carrier is kept out of the
+	* additional outputs, so it is not opened twice (once there, once as the carrier) for a moment.
+	*/
+	{
+		wchar_t wcp_targeted_guid[PT_MAX_GENERIC_STRLEN];
+		if (sndDevicesGetID(hp_sndDevices_, SND_DEVICES_TARGETED_REAL_PLAYBACK, wcp_targeted_guid, &i_resultFlag) != OKAY)
+			wcp_targeted_guid[0] = L'\0';
+
+		bool changed = false;
+		{
+			std::lock_guard<std::mutex> lock(config_mutex_);
+			if (!sound_device_guid.empty() && sound_device_guid != wcp_targeted_guid && sound_device_guid != pending_carrier_id_)
+			{
+				pending_carrier_id_ = sound_device_guid;
+				changed = true;
+			}
+		}
+		if (changed)
+			applyAdditionalOutputs();
+	}
+
 	return(OKAY);
 }
 /*
-* FUNCTION: setAdditionalOutputs()
-* DESCRIPTION: BetterFxSound. Stores the additional outputs requested by the UI and applies them.
+* FUNCTION: setOutputs()
+* DESCRIPTION: BetterFxSound. Stores the whole requested set of outputs, carrier included, and applies it.
 */
-void AudioPassthruPrivate::setAdditionalOutputs(const std::vector<AdditionalOutputConfig>& outputs)
+void AudioPassthruPrivate::setOutputs(const std::vector<OutputConfig>& outputs)
 {
-	additional_outputs_ = outputs;
+	{
+		std::lock_guard<std::mutex> lock(config_mutex_);
+		legacy_mode_ = false;
+		outputs_ = outputs;
+	}
 	applyAdditionalOutputs();
 }
 
 /*
+* FUNCTION: setAdditionalOutputs()
+* DESCRIPTION: BetterFxSound, legacy. Stores the additional outputs requested by the UI and applies them.
+* The carrier stays on. Ignored once setOutputs() has been used.
+*/
+void AudioPassthruPrivate::setAdditionalOutputs(const std::vector<AdditionalOutputConfig>& outputs)
+{
+	{
+		std::lock_guard<std::mutex> lock(config_mutex_);
+		additional_outputs_ = outputs;
+		if (!legacy_mode_)
+			return;
+	}
+	applyAdditionalOutputs();
+}
+
+/*
+* FUNCTION: isDevicePresent()
+* DESCRIPTION: BetterFxSound. True if the device is an active playback device in the list read at the last
+* device enumeration. Every device arrival or removal causes a reinit, which re-reads that list and then
+* calls applyAdditionalOutputs(), so an output that is plugged in later is picked up then.
+*/
+bool AudioPassthruPrivate::isDevicePresent(const std::wstring& device_id) const
+{
+	if (device_id.empty())
+		return false;
+
+	for (int index = 0; index < s_sndDevices_.totalNumDevices && index < SND_DEVICES_MAX_NUM_DEVICES; index++)
+	{
+		if (s_sndDevices_.deviceState[index] == DEVICE_STATE_ACTIVE && device_id == s_sndDevices_.pwszID[index])
+			return true;
+	}
+	return false;
+}
+
+/*
 * FUNCTION: applyAdditionalOutputs()
-* DESCRIPTION: BetterFxSound. Opens the requested additional outputs, leaving out the device that is
-* currently the main output (it already plays the audio) and the FxSound virtual device (playing
-* into it would feed the output back into the capture).
+* DESCRIPTION: BetterFxSound. Works out, for the current carrier (the targeted real playback device):
+*  - whether the carrier plays, and with which delay, channel mode and trim (published as atomics that the
+*    processing thread reads);
+*  - which other outputs play through the MultiOutputRouter. The carrier (it already plays the audio), a
+*    carrier switch that is pending, the FxSound virtual device (playing into it would feed the output back
+*    into the capture), disabled outputs and devices that are not present are left out.
+* Called after every change of the requested outputs and after every reinit, since the carrier may change.
 */
 void AudioPassthruPrivate::applyAdditionalOutputs()
 {
@@ -719,19 +806,96 @@ void AudioPassthruPrivate::applyAdditionalOutputs()
 	if (sndDevicesGetID(hp_sndDevices_, SND_DEVICES_VIRTUAL_PLAYBACK_DFX, wcp_dfx_guid, &i_resultFlag) != OKAY)
 		wcp_dfx_guid[0] = L'\0';
 
+	const std::wstring carrier_id(wcp_targeted_guid);
+	const std::wstring dfx_id(wcp_dfx_guid);
+
+	std::lock_guard<std::mutex> lock(config_mutex_);
+
 	std::vector<AdditionalOutputConfig> effective;
-	for (const auto& output : additional_outputs_)
+
+	// Whether a requested output stays out of the router. Duplicates are dropped here as well, so the
+	// indexes in effective_outputs_ match the router's own list (the delay measurement relies on it).
+	auto excluded = [&](const std::wstring& id) -> bool
 	{
-		if (output.device_id.empty())
-			continue;
-		if (output.device_id == wcp_targeted_guid || output.device_id == wcp_dfx_guid)
-			continue;
-		effective.push_back(output);
+		if (id.empty() || id == carrier_id || id == dfx_id || id == pending_carrier_id_)
+			return true;
+		for (const auto& added : effective)
+		{
+			if (added.device_id == id)
+				return true;
+		}
+		return !isDevicePresent(id);
+	};
+
+	bool carrier_enabled;
+	int carrier_delay_ms;
+	OutputChannelMode carrier_channel_mode;
+	int carrier_volume_percent;
+
+	if (legacy_mode_)
+	{
+		carrier_enabled = true;
+		carrier_delay_ms = legacy_main_delay_ms_;
+		carrier_channel_mode = legacy_main_channel_mode_;
+		carrier_volume_percent = 100;
+
+		for (const auto& output : additional_outputs_)
+		{
+			if (excluded(output.device_id))
+				continue;
+			effective.push_back(output);
+		}
+	}
+	else
+	{
+		carrier_enabled = false;
+		carrier_delay_ms = 0;
+		carrier_channel_mode = OutputChannelMode::Both;
+		carrier_volume_percent = 100;
+
+		// The carrier's own entry decides whether it plays. Missing or disabled: it plays silence.
+		for (const auto& output : outputs_)
+		{
+			if (!carrier_id.empty() && output.device_id == carrier_id && carrier_id != dfx_id)
+			{
+				carrier_enabled = output.enabled;
+				carrier_delay_ms = output.delay_ms;
+				carrier_channel_mode = output.channel_mode;
+				carrier_volume_percent = output.volume_percent;
+				break;
+			}
+		}
+
+		for (const auto& output : outputs_)
+		{
+			if (!output.enabled || excluded(output.device_id))
+				continue;
+
+			AdditionalOutputConfig config;
+			config.device_id = output.device_id;
+			config.delay_ms = output.delay_ms;
+			config.channel_mode = output.channel_mode;
+			config.volume_percent = output.volume_percent;
+			effective.push_back(config);
+		}
 	}
 
-	/* The measurement relies on the output order, keep it stable while it runs */
+	if (carrier_delay_ms < 0) carrier_delay_ms = 0;
+	if (carrier_delay_ms > 500) carrier_delay_ms = 500;
+
+	main_delay_ms_.store(carrier_delay_ms, std::memory_order_relaxed);
+	main_channel_mode_.store(static_cast<int>(carrier_channel_mode), std::memory_order_relaxed);
+	carrier_trim_.store(outputTrimGain(carrier_volume_percent), std::memory_order_relaxed);
+	carrier_enabled_.store(carrier_enabled && !carrier_id.empty(), std::memory_order_relaxed);
+
+	/* The measurement relies on the output order, keep it stable while it runs. processTimer() applies the
+	   change once the measurement is over. */
 	if (calibration_.getState(NULL) == DelayCalibration::State::Running)
+	{
+		apply_pending_ = true;
 		return;
+	}
+	apply_pending_ = false;
 
 	effective_outputs_ = effective;
 	multi_output_.configure(effective);
@@ -739,22 +903,77 @@ void AudioPassthruPrivate::applyAdditionalOutputs()
 
 /*
 * FUNCTION: setMainOutputChannelMode()
-* DESCRIPTION: BetterFxSound. Selects which channels the main output plays.
+* DESCRIPTION: BetterFxSound, legacy. Selects which channels the carrier plays. Ignored once setOutputs() has been used.
 */
 void AudioPassthruPrivate::setMainOutputChannelMode(OutputChannelMode mode)
 {
-	main_channel_mode_.store(static_cast<int>(mode), std::memory_order_relaxed);
+	std::lock_guard<std::mutex> lock(config_mutex_);
+	legacy_main_channel_mode_ = mode;
+	if (legacy_mode_)
+		main_channel_mode_.store(static_cast<int>(mode), std::memory_order_relaxed);
 }
 
 /*
 * FUNCTION: setMainOutputDelay()
-* DESCRIPTION: BetterFxSound. Sets the extra delay of the main output.
+* DESCRIPTION: BetterFxSound, legacy. Sets the extra delay of the carrier. Ignored once setOutputs() has been used.
 */
 void AudioPassthruPrivate::setMainOutputDelay(int delay_ms)
 {
 	if (delay_ms < 0) delay_ms = 0;
 	if (delay_ms > 500) delay_ms = 500;
-	main_delay_ms_.store(delay_ms, std::memory_order_relaxed);
+
+	std::lock_guard<std::mutex> lock(config_mutex_);
+	legacy_main_delay_ms_ = delay_ms;
+	if (legacy_mode_)
+		main_delay_ms_.store(delay_ms, std::memory_order_relaxed);
+}
+
+/*
+* FUNCTION: applyCarrierGain()
+* DESCRIPTION: BetterFxSound. Applies the Windows master volume (level and mute) times the carrier's own trim
+* to the carrier in place, or fades it to silence when the carrier output is disabled. Changes are ramped
+* over about 10 ms so they do not click. Processing thread only: atomics and arithmetic, no allocation,
+* no lock, no COM call.
+*
+* Loopback capture is taken before the virtual device's endpoint volume, so the buffer is full scale and
+* this is the only place the master volume is applied to the carrier: there is no double attenuation.
+*/
+void AudioPassthruPrivate::applyCarrierGain(float* buffer, UINT32 frames, UINT32 channels, UINT32 sample_rate)
+{
+	if (buffer == NULL || frames == 0 || channels == 0)
+		return;
+
+	const float target = carrier_enabled_.load(std::memory_order_relaxed)
+		? carrier_trim_.load(std::memory_order_relaxed) * masterVolumeGain()
+		: 0.0f;
+
+	const size_t samples = (size_t)frames * channels;
+
+	if (carrier_gain_ == target)
+	{
+		// Steady state.
+		if (target == 1.0f)
+			return;
+		if (target == 0.0f)
+		{
+			memset(buffer, 0, sizeof(float) * samples);
+			return;
+		}
+		for (size_t i = 0; i < samples; i++)
+			buffer[i] *= target;
+		return;
+	}
+
+	const float step = (float)(1.0 / (0.01 * (double)(sample_rate > 0 ? sample_rate : 48000)));
+	float gain = carrier_gain_;
+	for (UINT32 i = 0; i < frames; i++)
+	{
+		gain = rampGain(gain, target, step);
+		float* frame = buffer + (size_t)i * channels;
+		for (UINT32 c = 0; c < channels; c++)
+			frame[c] *= gain;
+	}
+	carrier_gain_ = gain;
 }
 
 /*
@@ -794,7 +1013,9 @@ void AudioPassthruPrivate::applyMainDelay(float* buffer, UINT32 frames, UINT32 c
 
 /*
 * FUNCTION: startDelayCalibration()
-* DESCRIPTION: BetterFxSound. Starts measuring the delay of every active output with the microphone.
+* DESCRIPTION: BetterFxSound. Starts measuring the delay of every enabled output that is present with the
+* microphone: the carrier if it is enabled, and every output currently playing through the router (those are
+* already limited to enabled, present devices). With no output at all the measurement fails with an error.
 */
 bool AudioPassthruPrivate::startDelayCalibration()
 {
@@ -807,17 +1028,39 @@ bool AudioPassthruPrivate::startDelayCalibration()
 	if (sndDevicesGetID(hp_sndDevices_, SND_DEVICES_VIRTUAL_PLAYBACK_DFX, wcp_dfx_guid, &i_resultFlag) != OKAY)
 		wcp_dfx_guid[0] = L'\0';
 
-	if (wcp_dfx_guid[0] == L'\0' || wcp_targeted_guid[0] == L'\0')
-		return false;
+	// A change that is still waiting for the end of a previous measurement goes in first, so the targets
+	// below match what the router really plays.
+	{
+		bool apply_pending;
+		{
+			std::lock_guard<std::mutex> lock(config_mutex_);
+			apply_pending = apply_pending_;
+		}
+		if (apply_pending && calibration_.getState(NULL) != DelayCalibration::State::Running)
+			applyAdditionalOutputs();
+	}
 
 	std::vector<DelayCalibration::Target> targets;
-	DelayCalibration::Target main_target = { std::wstring(wcp_targeted_guid), -1 };
-	targets.push_back(main_target);
-	for (size_t i = 0; i < effective_outputs_.size(); i++)
 	{
-		DelayCalibration::Target target = { effective_outputs_[i].device_id, (int)i };
-		targets.push_back(target);
+		std::lock_guard<std::mutex> lock(config_mutex_);
+
+		// The carrier is measured only if it is enabled, and is not necessarily the first result.
+		if (wcp_targeted_guid[0] != L'\0' && carrier_enabled_.load(std::memory_order_relaxed))
+		{
+			DelayCalibration::Target carrier_target = { std::wstring(wcp_targeted_guid), -1 };
+			targets.push_back(carrier_target);
+		}
+		for (size_t i = 0; i < effective_outputs_.size(); i++)
+		{
+			DelayCalibration::Target target = { effective_outputs_[i].device_id, (int)i };
+			targets.push_back(target);
+		}
 	}
+
+	// With no target the measurement thread fails at once with a clear error. The virtual device is only
+	// needed to play the test sound, so it is required only when there is something to measure.
+	if (!targets.empty() && wcp_dfx_guid[0] == L'\0')
+		return false;
 
 	std::atomic<int>* solo = &solo_;
 	return calibration_.start(std::wstring(wcp_dfx_guid), targets, [solo](int index) { solo->store(index, std::memory_order_relaxed); });

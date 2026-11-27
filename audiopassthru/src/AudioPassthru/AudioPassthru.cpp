@@ -112,7 +112,12 @@ void AudioPassthru::restoreDefaultPlaybackDevice()
 {
     data_->restoreDefaultPlaybackDevice();
 }
-// BetterFxSound: additional simultaneous outputs.
+// BetterFxSound: multiple simultaneous outputs.
+void AudioPassthru::setOutputs(const std::vector<OutputConfig>& outputs)
+{
+	data_->setOutputs(outputs);
+}
+
 void AudioPassthru::setAdditionalOutputs(const std::vector<AdditionalOutputConfig>& outputs)
 {
 	data_->setAdditionalOutputs(outputs);
