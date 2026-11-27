@@ -904,6 +904,11 @@ void AudioPassthruPrivate::applyAdditionalOutputs()
 		if (calibration_.getState(NULL) == DelayCalibration::State::Running)
 		{
 			apply_pending_ = true;
+
+			// A carrier switch cannot wait: the carrier's sweeps (solo -1) would now play on another device and be
+			// reported for the old one, which stays silent because it cannot join the router before the end.
+			if (carrier_id != calibration_carrier_id_)
+				calibration_.abort(L"The outputs changed during the measurement. Synchronize again.");
 		}
 		else
 		{
@@ -1024,7 +1029,9 @@ void AudioPassthruPrivate::applyMainDelay(float* buffer, UINT32 frames, UINT32 c
 * DESCRIPTION: BetterFxSound. Starts measuring the delay of every enabled output that is present with the
 * microphone: the carrier if it is enabled, and every output currently playing through the router (those are
 * already limited to enabled, present devices). With nothing to measure it fails at once, with an error that
-* says whether no output is turned on or none of those turned on is connected.
+* says whether no output is turned on or none of those turned on is connected. It also fails at once when the
+* sweeps could not be heard (processing stopped or muted, Windows volume muted or at 0) or a carrier switch is
+* pending. A carrier switch while it runs aborts it (applyAdditionalOutputs()).
 */
 bool AudioPassthruPrivate::startDelayCalibration()
 {
@@ -1054,21 +1061,41 @@ bool AudioPassthruPrivate::startDelayCalibration()
 	{
 		std::lock_guard<std::mutex> lock(config_mutex_);
 
-		// The carrier is measured only if it is enabled, and is not necessarily the first result.
+		// The carrier is measured only if it is enabled, and is not necessarily the first result. Each target
+		// carries its current delay: its sweep arrives that much later and is listened for that much longer.
 		if (wcp_targeted_guid[0] != L'\0' && carrier_enabled_.load(std::memory_order_relaxed))
 		{
-			DelayCalibration::Target carrier_target = { std::wstring(wcp_targeted_guid), -1 };
+			DelayCalibration::Target carrier_target = { std::wstring(wcp_targeted_guid), -1, main_delay_ms_.load(std::memory_order_relaxed) };
 			targets.push_back(carrier_target);
 		}
 		for (size_t i = 0; i < effective_outputs_.size(); i++)
 		{
-			DelayCalibration::Target target = { effective_outputs_[i].device_id, (int)i };
+			DelayCalibration::Target target = { effective_outputs_[i].device_id, (int)i, effective_outputs_[i].delay_ms };
 			targets.push_back(target);
 		}
 
+		// A carrier switch during the measurement aborts it, see applyAdditionalOutputs().
+		if (calibration_.getState(NULL) != DelayCalibration::State::Running)
+			calibration_carrier_id_ = wcp_targeted_guid;
+
+		// The sweeps could not be heard anywhere, or would be played to a carrier that is about to change:
+		// fail at once with the reason rather than play them for nothing.
+		std::wstring cannot_run_error;
+		if (!pending_carrier_id_.empty())
+			cannot_run_error = L"The outputs are not ready yet. Wait a moment, then synchronize again.";
+		else if (mute_ || !isProcessing())
+			cannot_run_error = L"FxSound is not playing sound right now. Make sure it is on, wait a moment, then synchronize again.";
+		else if (masterVolumeGain() <= 0.0f)
+			cannot_run_error = L"The Windows volume is muted or at 0, so the test sound cannot be heard. Turn it up, then synchronize again.";
+
+		if (!targets.empty() && !cannot_run_error.empty())
+		{
+			targets.clear();
+			no_targets_error = cannot_run_error;
+		}
 		// Nothing to measure: say why. No output turned on, or none of those turned on is connected, or
 		// (rarely) the outputs are still being set up, for example during a switch of the carrier.
-		if (targets.empty())
+		else if (targets.empty())
 		{
 			bool any_enabled = false;
 			bool any_connected = false;

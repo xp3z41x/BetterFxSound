@@ -122,6 +122,7 @@ private:
 	// solo_ is declared before calibration_ so it outlives the measurement thread that sets it.
 	std::atomic<int> solo_{ DelayCalibration::kSoloNone };
 	std::vector<AdditionalOutputConfig> effective_outputs_;	// As passed to multi_output_ (guarded by config_mutex_)
+	std::wstring calibration_carrier_id_;	// Carrier when the measurement started, a switch aborts it (guarded by config_mutex_)
 	DelayCalibration calibration_;
 };
 

@@ -29,6 +29,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include <vector>
 
 #include "DelayCalibration.h"
+#include "MasterVolume.h"
 
 namespace
 {
@@ -43,15 +44,30 @@ namespace
 	constexpr double kChirpEndHz = 6000.0;
 	constexpr double kChirpFadeSeconds = 0.005;
 	constexpr float kChirpLevel = 0.5f;
+	// Every output plays the sweep scaled by the Windows volume (gain = slider squared). When that gain is
+	// below kChirpBoostBelowGain (slider 50%) the sweep is made louder, by at most kChirpMaxBoost (+6 dB,
+	// full scale), so it stays audible at low volume. It is never louder than an unboosted sweep at 50%.
+	constexpr float kChirpBoostBelowGain = 0.25f;
+	constexpr float kChirpMaxBoost = 2.0f;
 
 	// Schedule of one measurement.
 	constexpr int kRepetitions = 3;
+	constexpr DWORD kWarmUpMs = 1500;		// Silence played to every output before the first sweep: streams that were
+											// idle start again, outputs fill their delay, devices that wake up slowly
+											// (HDMI, Bluetooth) do not swallow the first sweep
 	constexpr DWORD kSettleMs = 300;		// Silence before the sweep, lets the previous one die out
-	constexpr DWORD kListenMs = 1300;		// Recording after the sweep is queued (it plays ~100 ms later)
-	constexpr double kMaxLatencySeconds = 1.0; // Search window for the arrival
+	constexpr DWORD kListenMs = 1300;		// Recording after the sweep is queued (it plays ~100 ms later), plus the output's delay
+	constexpr DWORD kTailMs = 200;			// Extra recording after the last sweep, so its whole search window is recorded
+	constexpr double kMaxLatencySeconds = 1.0; // Search window for the arrival, plus the output's delay
 
-	// Correlation peak must stand this far above the correlation's RMS to count.
-	constexpr double kMinConfidence = 6.0;
+	// The correlation at the chosen arrival must stand this far above the correlation's RMS to count.
+	constexpr double kMinConfidence = 8.0;
+	// The direct sound is the earliest strong peak, but no earlier than this before the strongest one:
+	// a reflection comes a few ms after the direct sound, while noise can be anywhere.
+	constexpr double kLookBackSeconds = 0.03;
+	// Repetitions of one output must agree within this to be trusted, at least two of them. Noise picks
+	// land anywhere in the window, real arrivals stay together (Bluetooth can drift ~30 ms per repetition).
+	constexpr double kAgreeMs = 40.0;
 
 	constexpr REFERENCE_TIME kStreamBufferHns = 1000000; // 100 ms
 
@@ -206,10 +222,11 @@ namespace
 			return std::wstring();
 		}
 
-		// Plays the sweep from the next frame that is written.
-		void scheduleChirp(const std::vector<float>* chirp)
+		// Plays the sweep from the next frame that is written, at this peak level.
+		void scheduleChirp(const std::vector<float>* chirp, float level)
 		{
 			chirp_ = chirp;
+			chirp_level_ = level;
 			chirp_start_ = written_;
 		}
 
@@ -275,7 +292,7 @@ namespace
 					const UINT64 frame = written_ + i;
 					float sample = 0.0f;
 					if (chirp_ != nullptr && frame >= chirp_start_ && frame - chirp_start_ < chirp_->size())
-						sample = (*chirp_)[static_cast<size_t>(frame - chirp_start_)] * kChirpLevel;
+						sample = (*chirp_)[static_cast<size_t>(frame - chirp_start_)] * chirp_level_;
 					out[2 * i] = sample;
 					out[2 * i + 1] = sample;
 				}
@@ -337,6 +354,7 @@ namespace
 		UINT32 render_frames_ = 0;
 		UINT64 written_ = 0;
 		const std::vector<float>* chirp_ = nullptr;
+		float chirp_level_ = kChirpLevel;
 		UINT64 chirp_start_ = 0;
 		std::vector<Anchor> render_anchors_;
 
@@ -346,16 +364,18 @@ namespace
 		std::vector<Anchor> capture_anchors_;
 	};
 
-	// Finds the sweep in the recording, starting at 'start'. Returns the delay in samples
-	// and the confidence (peak / RMS of the correlation), or false if out of range.
-	bool findArrival(const std::vector<float>& recording, const std::vector<float>& chirp, size_t start, size_t* lag_out, double* confidence_out)
+	// Finds the sweep in the recording, within 'max_lag' samples after 'start'. Returns the delay in
+	// samples and the confidence of that arrival (its correlation / RMS of the correlation), or false
+	// if the recording does not cover the whole window.
+	bool findArrival(const std::vector<float>& recording, const std::vector<float>& chirp, size_t start, size_t max_lag,
+		size_t* lag_out, double* confidence_out)
 	{
-		const size_t max_lag = static_cast<size_t>(kMaxLatencySeconds * kRate);
-		if (start + max_lag + chirp.size() > recording.size())
+		if (max_lag == 0 || start + max_lag + chirp.size() > recording.size())
 			return false;
 
 		std::vector<double> correlation(max_lag);
 		double peak = 0.0;
+		size_t peak_lag = 0;
 		double sum_squares = 0.0;
 
 		for (size_t lag = 0; lag < max_lag; lag++)
@@ -368,7 +388,10 @@ namespace
 			correlation[lag] = magnitude;
 			sum_squares += magnitude * magnitude;
 			if (magnitude > peak)
+			{
 				peak = magnitude;
+				peak_lag = lag;
+			}
 		}
 
 		const double rms = std::sqrt(sum_squares / max_lag);
@@ -376,9 +399,11 @@ namespace
 			return false;
 
 		// Take the earliest strong peak rather than the strongest one: a reflection off a wall
-		// can be louder than the direct sound but always arrives later.
-		size_t lag = 0;
-		while (lag < max_lag && correlation[lag] < 0.5 * peak)
+		// can be louder than the direct sound but always arrives later. Only look a little before
+		// the strongest peak, otherwise a noise peak long before a weak sweep would be taken.
+		const size_t look_back = static_cast<size_t>(kLookBackSeconds * kRate);
+		size_t lag = (peak_lag > look_back) ? peak_lag - look_back : 0;
+		while (lag < peak_lag && correlation[lag] < 0.5 * peak)
 			lag++;
 		const size_t refine_end = (std::min)(max_lag, lag + kRate / 500); // within 2 ms
 		size_t best = lag;
@@ -389,7 +414,48 @@ namespace
 		}
 
 		*lag_out = best;
-		*confidence_out = peak / rms;
+		*confidence_out = correlation[best] / rms;
+		return true;
+	}
+
+	// One output's result from its repetitions: the median of the largest group that agrees within
+	// kAgreeMs, if it has at least two of them. On a tie the group with the higher total confidence wins.
+	bool combineRepetitions(const std::vector<double>& latencies, const std::vector<double>& confidences,
+		double* latency_out, double* confidence_out)
+	{
+		size_t best_count = 0;
+		double best_weight = 0.0;
+		std::vector<double> best_latencies;
+		std::vector<double> best_confidences;
+
+		for (size_t i = 0; i < latencies.size(); i++)
+		{
+			std::vector<double> group_latencies;
+			std::vector<double> group_confidences;
+			double weight = 0.0;
+			for (size_t j = 0; j < latencies.size(); j++)
+			{
+				if (std::fabs(latencies[j] - latencies[i]) <= kAgreeMs)
+				{
+					group_latencies.push_back(latencies[j]);
+					group_confidences.push_back(confidences[j]);
+					weight += confidences[j];
+				}
+			}
+			if (group_latencies.size() > best_count || (group_latencies.size() == best_count && weight > best_weight))
+			{
+				best_count = group_latencies.size();
+				best_weight = weight;
+				best_latencies.swap(group_latencies);
+				best_confidences.swap(group_confidences);
+			}
+		}
+
+		if (best_count < 2)
+			return false;
+
+		*latency_out = median(best_latencies);
+		*confidence_out = median(best_confidences);
 		return true;
 	}
 }
@@ -430,6 +496,7 @@ bool DelayCalibration::start(const std::wstring& virtual_device_id, const std::v
 		std::lock_guard<std::mutex> lock(mutex_);
 		results_.clear();
 		error_.clear();
+		abort_reason_.clear();
 	}
 
 	// Nothing to measure: fail at once with the reason the caller gave, without a measurement thread.
@@ -451,6 +518,18 @@ bool DelayCalibration::start(const std::wstring& virtual_device_id, const std::v
 
 void DelayCalibration::cancel()
 {
+	cancel_.store(true);
+}
+
+void DelayCalibration::abort(const std::wstring& reason)
+{
+	if (state_.load() != static_cast<int>(State::Running))
+		return;
+	{
+		std::lock_guard<std::mutex> lock(mutex_);
+		if (abort_reason_.empty())
+			abort_reason_ = reason;
+	}
 	cancel_.store(true);
 }
 
@@ -536,6 +615,44 @@ void DelayCalibration::run()
 			return true;
 		};
 
+		// Why the streams stopped: a cancel by the user, an abort with its reason, or a device error.
+		auto stopped = [&]()
+		{
+			std::wstring reason;
+			if (cancel_.load())
+			{
+				std::lock_guard<std::mutex> lock(mutex_);
+				reason = abort_reason_.empty() ? std::wstring(L"Cancelled.") : abort_reason_;
+			}
+			else
+			{
+				reason = L"An audio device stopped working during the measurement.";
+			}
+			fail(reason);
+		};
+
+		// How much later an output's sweep arrives because of its own delay (0 to 500 ms).
+		auto extraMs = [](const Target& target) -> DWORD
+		{
+			return static_cast<DWORD>((std::max)(0, (std::min)(target.delay_ms, 500)));
+		};
+
+		// The sweep follows the Windows volume like any other sound. Make it louder at low volume, see kChirpBoostBelowGain.
+		const float master_gain = masterVolumeGain();
+		float boost = 1.0f;
+		if (master_gain < kChirpBoostBelowGain)
+			boost = (master_gain > 0.0f) ? (std::min)(kChirpMaxBoost, std::sqrt(kChirpBoostBelowGain / master_gain)) : kChirpMaxBoost;
+		const float chirp_level = kChirpLevel * boost;
+
+		// Wake every output before the first sweep (they all get silence, the first target is soloed).
+		if (solo_)
+			solo_(targets_.front().solo_index);
+		if (!pumpFor(kWarmUpMs))
+		{
+			stopped();
+			return;
+		}
+
 		for (int repetition = 0; repetition < kRepetitions; repetition++)
 		{
 			for (size_t t = 0; t < targets_.size(); t++)
@@ -545,22 +662,29 @@ void DelayCalibration::run()
 
 				if (!pumpFor(kSettleMs))
 				{
-					fail(cancel_.load() ? L"Cancelled." : L"An audio device stopped working during the measurement.");
+					stopped();
 					return;
 				}
 
-				streams.scheduleChirp(&chirp);
+				streams.scheduleChirp(&chirp, chirp_level);
 				Measurement measurement = { t, streams.lastChirpStart() };
 				measurements.push_back(measurement);
 
-				if (!pumpFor(kListenMs))
+				if (!pumpFor(kListenMs + extraMs(targets_[t])))
 				{
-					fail(cancel_.load() ? L"Cancelled." : L"An audio device stopped working during the measurement.");
+					stopped();
 					return;
 				}
 
 				progress_.store(static_cast<int>(90 * measurements.size() / total));
 			}
+		}
+
+		// The last sweep's search window ends a little after its listening time.
+		if (!pumpFor(kTailMs))
+		{
+			stopped();
+			return;
 		}
 
 		// Analysis. The streams object still holds the recording and the timing anchors.
@@ -586,9 +710,12 @@ void DelayCalibration::run()
 				!streams.captureIndexAt(emit_time, &start_index) || start_index < 0.0)
 				continue;
 
+			const double window_seconds = kMaxLatencySeconds + extraMs(targets_[measurement.target]) / 1000.0;
+			const size_t max_lag = static_cast<size_t>(window_seconds * kRate);
+
 			size_t lag = 0;
 			double confidence = 0.0;
-			if (!findArrival(recording, chirp, static_cast<size_t>(start_index), &lag, &confidence))
+			if (!findArrival(recording, chirp, static_cast<size_t>(start_index), max_lag, &lag, &confidence))
 				continue;
 
 			if (confidence >= kMinConfidence)
@@ -603,12 +730,14 @@ void DelayCalibration::run()
 		{
 			DelayCalibrationResult result;
 			result.device_id = targets_[t].device_id;
-			// Need at least two agreeing measurements out of three to trust the result.
-			if (latencies[t].size() >= 2)
+			// Need at least two of the three measurements to agree to trust the result.
+			double latency = 0.0;
+			double confidence = 0.0;
+			if (combineRepetitions(latencies[t], confidences[t], &latency, &confidence))
 			{
 				result.measured = true;
-				result.latency_ms = median(latencies[t]);
-				result.confidence = median(confidences[t]);
+				result.latency_ms = latency;
+				result.confidence = confidence;
 			}
 			results.push_back(result);
 		}

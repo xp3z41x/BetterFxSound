@@ -2925,6 +2925,24 @@ String FxController::applyDelayCalibrationResults()
 		lines.add(name + ": " + String(delay) + " ms");
 	}
 
+	// Outputs that are turned on but got no test sound, because they were not connected when the
+	// measurement started. Without this they would just seem to have stayed silent.
+	StringArray not_connected;
+	for (const auto& entry : output_entries_)
+	{
+		if (!entry.enabled || entry.id.isEmpty())
+			continue;
+
+		bool measured = false;
+		for (auto& result : results)
+		{
+			if (String(result.device_id.c_str()) == entry.id)
+				measured = true;
+		}
+		if (!measured && findActiveOutput(entry.id) == nullptr)
+			not_connected.add(nameOf(entry.id));
+	}
+
 	saveOutputSettings();
 	pushOutputsToEngine();
 	notifyOutputsChanged();
@@ -2932,6 +2950,8 @@ String FxController::applyDelayCalibrationResults()
 	String summary = TRANS("Delays set:") + " " + lines.joinIntoString(", ") + ".";
 	if (not_heard.size() > 0)
 		summary += " " + TRANS("Not heard clearly, left unchanged:") + " " + not_heard.joinIntoString(", ") + ".";
+	if (not_connected.size() > 0)
+		summary += " " + TRANS("Not connected, not measured:") + " " + not_connected.joinIntoString(", ") + ".";
 	if (clamped)
 		summary += " " + TRANS("Some devices differ by more than 500 ms, the maximum delay.");
 	return summary;

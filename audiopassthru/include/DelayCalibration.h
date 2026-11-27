@@ -37,8 +37,11 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
  * A short sweep ("chirp") is played into the FxSound virtual device, so it travels the same
  * path as any other sound: capture, DSP, then the outputs. While one output is being measured
  * all the others are silenced (solo). The microphone recording is matched against the sweep
- * (cross-correlation) to find when it was heard. Every output is measured several times and
- * the median is used.
+ * (cross-correlation) to find when it was heard. Every output is measured several times, and
+ * the median of the measurements that agree is used (at least two must agree, so noise picked
+ * up from an output that cannot be heard gives no result). Every output first gets a short
+ * stretch of silence, so streams that were idle are running before the first sweep. An output
+ * with a delay is listened to for that much longer.
  *
  * Emission and arrival times are both taken from WASAPI's QPC timestamps, so the results do
  * not depend on how the two streams were buffered. Any delay that is common to all outputs
@@ -53,6 +56,7 @@ public:
 	{
 		std::wstring device_id;
 		int solo_index;			// -1 = carrier output, otherwise index of the additional output
+		int delay_ms;			// The output's current delay: its sweep arrives that much later, so it is listened for that much longer
 	};
 
 	// solo(-1) = carrier only, solo(k) = additional output k only, solo(INT_MIN) = everything back on.
@@ -64,10 +68,12 @@ public:
 
 	// Starts a measurement on its own thread. Returns false if one is already running.
 	// With no target it fails at once (state Failed, no thread) with no_targets_error as the error,
-	// or a generic one if that is empty.
+	// or a generic one if that is empty. Callers also use this to report why a measurement cannot run.
 	bool start(const std::wstring& virtual_device_id, const std::vector<Target>& targets, SoloFunction solo,
 		const std::wstring& no_targets_error = std::wstring());
 	void cancel();
+	// Stops a running measurement because it can no longer be valid; it fails with this reason.
+	void abort(const std::wstring& reason);
 
 	State getState(int* progress_percent) const;
 	std::vector<DelayCalibrationResult> getResults() const;
@@ -92,4 +98,5 @@ private:
 	mutable std::mutex mutex_;
 	std::vector<DelayCalibrationResult> results_;
 	std::wstring error_;
+	std::wstring abort_reason_;		// Set by abort(), under mutex_
 };

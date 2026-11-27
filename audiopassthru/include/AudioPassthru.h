@@ -128,8 +128,9 @@ public:
 	// only if it is enabled) with the default microphone. Runs in the background; poll
 	// getDelayCalibrationState(). State: 0 idle, 1 running, 2 done, 3 failed.
 	// Results have one entry per measured output, keyed by device_id, in no particular order.
-	// With nothing to measure (no output turned on, or none of them connected) the measurement
-	// fails at once and getDelayCalibrationError() says which.
+	// With nothing to measure (no output turned on, or none of them connected), or when the test
+	// sound could not be heard (FxSound not playing, Windows volume muted) the measurement fails at
+	// once and getDelayCalibrationError() says why. A carrier switch while it runs makes it fail too.
 	bool startDelayCalibration();
 	void cancelDelayCalibration();
 	int getDelayCalibrationState(int* progress_percent);
