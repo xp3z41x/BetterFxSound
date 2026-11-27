@@ -170,6 +170,9 @@ func (a *App) toolEnableOutput(ctx context.Context, _ *mcp.CallToolRequest, in o
 	if err := fxsound.ValidateOutputName(in.DeviceName); err != nil {
 		return nil, applyResult{}, err
 	}
+	if err := a.checkOutput(ctx, in.DeviceName, true); err != nil {
+		return nil, applyResult{}, err
+	}
 	if err := fxsound.Apply(ctx, a.Paths, map[string]string{"enable-output": in.DeviceName}, true); err != nil {
 		return nil, applyResult{}, err
 	}
@@ -178,6 +181,9 @@ func (a *App) toolEnableOutput(ctx context.Context, _ *mcp.CallToolRequest, in o
 
 func (a *App) toolDisableOutput(ctx context.Context, _ *mcp.CallToolRequest, in outputNameInput) (*mcp.CallToolResult, applyResult, error) {
 	if err := fxsound.ValidateOutputName(in.DeviceName); err != nil {
+		return nil, applyResult{}, err
+	}
+	if err := a.checkOutput(ctx, in.DeviceName, false); err != nil {
 		return nil, applyResult{}, err
 	}
 	if err := fxsound.Apply(ctx, a.Paths, map[string]string{"disable-output": in.DeviceName}, true); err != nil {
@@ -198,6 +204,9 @@ func (a *App) toolSetOutputVolume(ctx context.Context, _ *mcp.CallToolRequest, i
 	if err := fxsound.ValidateOutputVolume(in.Volume); err != nil {
 		return nil, applyResult{}, err
 	}
+	if err := a.checkOutput(ctx, in.DeviceName, false); err != nil {
+		return nil, applyResult{}, err
+	}
 	flags := map[string]string{"output-volume": fxsound.FormatOutputValue(in.DeviceName, in.Volume)}
 	if err := fxsound.Apply(ctx, a.Paths, flags, true); err != nil {
 		return nil, applyResult{}, err
@@ -215,6 +224,9 @@ func (a *App) toolSetOutputDelay(ctx context.Context, _ *mcp.CallToolRequest, in
 		return nil, applyResult{}, err
 	}
 	if err := fxsound.ValidateOutputDelay(in.DelayMs); err != nil {
+		return nil, applyResult{}, err
+	}
+	if err := a.checkOutput(ctx, in.DeviceName, false); err != nil {
 		return nil, applyResult{}, err
 	}
 	flags := map[string]string{"output-delay": fxsound.FormatOutputValue(in.DeviceName, in.DelayMs)}
@@ -320,4 +332,20 @@ func readyStatus(ctx context.Context, paths *fxsound.Paths) (*fxsound.Status, er
 		return nil, fmt.Errorf("read current state: %w", err)
 	}
 	return status, nil
+}
+
+// checkOutput makes sure FxSound is running and knows an output with this
+// exact name, so a typo is reported (with the available outputs) instead of
+// being silently ignored by FxSound. needPresent also requires the device to
+// be connected, as enabling does.
+func (a *App) checkOutput(ctx context.Context, name string, needPresent bool) error {
+	if err := fxsound.EnsureRunning(ctx, a.Paths); err != nil {
+		return err
+	}
+	status, err := fxsound.ReadStatus(ctx, a.Paths)
+	if err != nil {
+		return err
+	}
+	_, err = status.ResolveOutput(name, needPresent)
+	return err
 }

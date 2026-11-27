@@ -51,3 +51,27 @@ func (s *Status) FindOutput(name string) *OutputInfo {
 	}
 	return nil
 }
+
+// ResolveOutput finds the output with this exact friendly name. If none
+// matches (or needPresent is set and the match is not connected), it returns
+// an error listing the outputs that are available.
+func (s *Status) ResolveOutput(name string, needPresent bool) (*OutputInfo, error) {
+	o := s.FindOutput(name)
+	if o != nil && (o.Present || !needPresent) {
+		return o, nil
+	}
+	var names []string
+	for _, x := range s.Outputs {
+		if x.Present || !needPresent {
+			names = append(names, fmt.Sprintf("%q", x.Name))
+		}
+	}
+	avail := "none"
+	if len(names) > 0 {
+		avail = strings.Join(names, ", ")
+	}
+	if o != nil {
+		return nil, newError(ErrKindValueRejected, nil, "output %q is not connected; available outputs: %s", name, avail)
+	}
+	return nil, newError(ErrKindValueRejected, nil, "no output named %q; available outputs: %s", name, avail)
+}

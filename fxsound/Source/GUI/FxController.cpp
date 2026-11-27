@@ -474,6 +474,7 @@ void FxController::applyConfig(const String& commandline)
 			if (output.present && output.name == output_device)
 			{
 				enableOnlyOutput(output.id);
+				model.notifyOutputListUpdated();
 				break;
 			}
 		}
@@ -505,7 +506,7 @@ void FxController::applyConfig(const String& commandline)
 		if (colon <= 0)
 			return false;
 		auto number = arg.substring(colon + 1).trim();
-		if (number.isEmpty() || !number.containsOnly("0123456789"))
+		if (number.isEmpty() || number.length() > 4 || !number.containsOnly("0123456789"))
 			return false;
 		name = arg.substring(0, colon);
 		value = number.getIntValue();
@@ -513,13 +514,16 @@ void FxController::applyConfig(const String& commandline)
 	};
 
 	String output_id;
+	bool outputs_touched = false;
 	if (enable_output.isNotEmpty() && findOutputByName(enable_output, output_id))
 	{
 		setOutputEnabled(output_id, true);
+		outputs_touched = true;
 	}
 	if (disable_output.isNotEmpty() && findOutputByName(disable_output, output_id))
 	{
 		setOutputEnabled(output_id, false);
+		outputs_touched = true;
 	}
 
 	String output_arg_name;
@@ -528,11 +532,19 @@ void FxController::applyConfig(const String& commandline)
 		output_arg_value <= 100 && findOutputByName(output_arg_name, output_id))
 	{
 		setOutputVolume(output_id, output_arg_value);
+		outputs_touched = true;
 	}
 	if (output_delay.isNotEmpty() && parseNameAndValue(output_delay, output_arg_name, output_arg_value) &&
 		output_arg_value <= 500 && findOutputByName(output_arg_name, output_id))
 	{
 		setOutputDelay(output_id, output_arg_value);
+		outputs_touched = true;
+	}
+
+	// Volume and delay changes do not notify by themselves: refresh any open output panel once.
+	if (outputs_touched)
+	{
+		model.notifyOutputListUpdated();
 	}
 
 	// ------------------------------------------------------------------------------------------
@@ -718,7 +730,7 @@ void FxController::printStatus()
 	settings->setProperty("output_devices", output_devices);
 
 	// BetterFxSound outputs rework: every output with its own state. selected_output is kept for
-	// compatibility: the first enabled output (the carrier, getOutputName(), may be a silent one).
+	// compatibility: the first enabled output in the list below, or empty when none is enabled.
 	Array<var> outputs;
 	String first_enabled_output;
 	for (auto& output : getOutputs())
