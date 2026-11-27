@@ -62,6 +62,9 @@ int DfxDspPrivate::loadPreset(std::wstring preset_file_full_path)
 	//	int legal_free_preset;
 	//	int is_factory_preset;
 
+	// BetterFxSound: one parameter-lock hold for the whole preset apply (see param_lock_).
+	DfxDspParamLock lock(&param_lock_);
+
 	/* Read the file */
 	if (valsRead(&preset_file_full_path[0], IS_FALSE, NULL, &new_vals_hdl) != OKAY)
 		return(NOT_OKAY);
@@ -118,6 +121,9 @@ int DfxDspPrivate::exportPreset(std::wstring preset_source_file_full_path, std::
 {
 	PT_HANDLE* vals_hdl;
 
+	// BetterFxSound: getStateInfoFromVals() below rewrites the live EQ state (see param_lock_).
+	DfxDspParamLock lock(&param_lock_);
+
 	if (valsRead(&preset_source_file_full_path[0], IS_FALSE, NULL, &vals_hdl) != OKAY)
 		return(NOT_OKAY);
 
@@ -147,8 +153,9 @@ int DfxDspPrivate::getStateInfoFromVals(PT_HANDLE *hp_vals, bool b_include_eq)
 	if (hp_vals == NULL)
 		return(NOT_OKAY);
 
-	/* Temporarily make sure the update from registry timer is off. */
-	update_from_registry_ = false;
+	// BetterFxSound: the old "update from registry" flag is gone; the EQ written below is
+	// synced into the processing memory at the end, on this thread (eqSyncFromRegistry()).
+	DfxDspParamLock lock(&param_lock_);
 
 	/* Get the vals file version */
 	if (valsGetFileVersion(hp_vals, &vals_file_version) != OKAY)
@@ -254,13 +261,13 @@ int DfxDspPrivate::getStateInfoFromVals(PT_HANDLE *hp_vals, bool b_include_eq)
 		/* Get the EQ settings from the preset */
 		if (getGraphicEqInfoFromVals(hp_vals) != OKAY)
 		{
-			update_from_registry_ = true;
+			eqSyncFromRegistry();
 			return(NOT_OKAY);
 		}
 	}
 
-	/* Turn the update from registry back on if it was originally on */
-	update_from_registry_ = true;
+	/* Apply the EQ on state (stored in the registry only) and any band change to the processing memory */
+	eqSyncFromRegistry();
 
 	return(OKAY);
 }

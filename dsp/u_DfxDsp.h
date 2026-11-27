@@ -75,6 +75,18 @@ public:
 	PT_HANDLE *hp_dfxg;
 };
 
+// BetterFxSound: scoped holder for DfxDspPrivate::param_lock_ (see there).
+class DfxDspParamLock
+{
+public:
+	explicit DfxDspParamLock(CRITICAL_SECTION *cs) : cs_(cs) { EnterCriticalSection(cs_); }
+	~DfxDspParamLock() { LeaveCriticalSection(cs_); }
+	DfxDspParamLock(const DfxDspParamLock&) = delete;
+	DfxDspParamLock& operator=(const DfxDspParamLock&) = delete;
+private:
+	CRITICAL_SECTION *cs_;
+};
+
 class DfxDspPrivate
 {
 public:
@@ -116,8 +128,8 @@ public:
 
 	bool being_destroyed_ = false;
 private:
-	void processTimer();
 	int eqUpdateFromRegistry(int *ip_eq_changed);
+	int eqSyncFromRegistry();
 	int getStateInfoFromVals(PT_HANDLE *hp_vals, bool b_include_eq = true);
 	int getGraphicEqInfoFromVals(PT_HANDLE *hp_vals);
 	int createValsFromStateInfo(wchar_t *preset_name, PT_HANDLE **hpp_vals);
@@ -147,7 +159,21 @@ private:
 	struct dfxg_section_type dynamic_boost_;
 	struct dfxg_section_type bass_boost_;
 
-	bool update_from_registry_ = true;
+	// BetterFxSound: serializes everything that writes DSP parameters or the registry state
+	// dfxpCommunicateAll() re-reads (effect/bypass setters, EQ setters, preset load, the EQ
+	// registry sync, and a signal format change). Without it a writer could read a value from
+	// the registry before another thread stored the newer one and then communicate the stale
+	// value last. processAudio() never takes it; the processing thread only takes it in
+	// setSignalFormat() when the format really changes, a rare reinit that already re-reads
+	// every setting. Recursive, so a locked method may call another locked method.
+	CRITICAL_SECTION param_lock_;
+
+	// BetterFxSound: last format handed to setSignalFormat() (processing thread only), so the
+	// per-buffer call can skip the lock when nothing changed.
+	int last_signal_bps_ = -1;
+	int last_signal_nch_ = -1;
+	int last_signal_srate_ = -1;
+	int last_signal_valid_bits_ = -1;
 	int headphone_on_;
 	int music_mode_;     /* DFXP_MUSIC_MODE_MUSIC1, DFXP_MUSIC_MODE_MUSIC2, DFXP_MUSIC_MODE_SPEECH */
 
