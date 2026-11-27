@@ -195,10 +195,15 @@ int DfxDspPrivate::setSignalFormat(int i_bps, int i_nch, int i_srate, int i_vali
 	// This runs on the time-critical processing thread and the UI can hold the lock for a long
 	// time (a preset load reads a file and writes/reads dozens of registry values under it), so
 	// only try it: if it is busy, keep the old last_signal_* so the next buffer retries, and let
-	// processAudio() pass the blocks through unprocessed meanwhile.
+	// processAudio() pass the blocks through unprocessed meanwhile. If the format returns to
+	// the applied one before a retry wins the lock, the DSP is already set up for it, so drop
+	// the pending change here or processing would stay bypassed until some later change.
 	if ((i_bps == last_signal_bps_) && (i_nch == last_signal_nch_) &&
 		(i_srate == last_signal_srate_) && (i_valid_bits == last_signal_valid_bits_))
+	{
+		format_pending_ = false;
 		return OKAY;
+	}
 
 	if (!TryEnterCriticalSection(&param_lock_))
 	{
