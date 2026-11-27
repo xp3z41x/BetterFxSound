@@ -204,7 +204,8 @@ jobs:
             $p = Start-Process $exe -ArgumentList (@('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/LOG=`"$logs\$log`"") + $extra) -PassThru
             if (-not $p.WaitForExit(600000)) { throw "$log timed out" }
             Write-Host "::group::$log (exit code $($p.ExitCode))"
-            Select-String -Path "$logs\$log" -Pattern 'FxSound|Run: |Driver|SKIPDRIVER' | ForEach-Object Line
+            # Write-Host, not the pipeline: the function's only output is the exit code.
+            Select-String -Path "$logs\$log" -Pattern 'FxSound|Run: |Driver|SKIPDRIVER' | ForEach-Object { Write-Host $_.Line }
             Write-Host "::endgroup::"
             $p.ExitCode
           }
