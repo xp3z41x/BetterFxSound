@@ -110,6 +110,17 @@ func ReadStatus(ctx context.Context, paths *Paths) (*Status, error) {
 		return nil, err
 	}
 
+	// Without a running instance, "FxSound.exe --status" would itself become
+	// the new instance (it never exits, so Run would kill it at its timeout,
+	// midway through its startup). Report that the app is not running instead.
+	running, err := fxSoundRunning()
+	if err != nil {
+		return nil, fmt.Errorf("check running state: %w", err)
+	}
+	if !running {
+		return nil, newError(ErrKindRequiresRunningInstance, nil, "FxSound is not running (start it first, e.g. with fxsound_set_power)")
+	}
+
 	var before time.Time
 	if info, statErr := os.Stat(path); statErr == nil {
 		before = info.ModTime()

@@ -634,4 +634,14 @@ void FxMainWindow::lookAndFeelChanged()
 {
 	setLookAndFeel();
 	repaint();
+
+	// The outputs popups (the Lite window's outputs list, an output's settings) are CallOutBox
+	// windows of their own, outside this window: pass the theme change on to the open ones, or
+	// they keep the old theme's text colours.
+	auto& desktop = Desktop::getInstance();
+	for (int i = 0; i < desktop.getNumComponents(); i++)
+	{
+		if (auto* callout = dynamic_cast<CallOutBox*>(desktop.getComponent(i)))
+			callout->sendLookAndFeelChange();
+	}
 }

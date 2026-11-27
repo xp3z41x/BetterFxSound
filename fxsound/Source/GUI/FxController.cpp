@@ -509,6 +509,10 @@ void FxController::applyConfig(const String& commandline)
 		if (number.isEmpty() || number.length() > 4 || !number.containsOnly("0123456789"))
 			return false;
 		name = arg.substring(0, colon);
+		// --output-volume="<name>":<number> (quotes around the name only, as typed in cmd.exe)
+		// arrives here as <name>":<number>, its opening quote already removed: drop the closing one.
+		if (name.indexOfChar('"') == name.length() - 1)
+			name = name.dropLastCharacters(1);
 		value = number.getIntValue();
 		return true;
 	};

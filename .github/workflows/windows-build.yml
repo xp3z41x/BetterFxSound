@@ -49,3 +49,32 @@ jobs:
         with:
           name: BetterFxSound-${{ matrix.platform }}-${{ github.sha }}
           path: out\
+
+  # fxmcp's unit tests (internal/...) are pure logic; cmd/fxmcp holds integration tests
+  # that need a running FxSound, so they are not run here.
+  fxmcp:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: fxmcp
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: fxmcp/go.mod
+          cache-dependency-path: fxmcp/go.sum
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Unit tests
+        run: go test ./internal/...
+
+      - name: Docs copy is current
+        shell: pwsh
+        run: |
+          $a = (Get-Content ..\docs\COMMAND_LINE_OPTIONS.md -Raw) -replace "`r`n", "`n"
+          $b = (Get-Content internal\mcpserver\docsdata\command_line_options.md -Raw) -replace "`r`n", "`n"
+          if ($a -ne $b) { throw "run go generate ./... in fxmcp after editing docs/COMMAND_LINE_OPTIONS.md" }

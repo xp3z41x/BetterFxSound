@@ -71,6 +71,9 @@ private:
 	Slider delay_slider_;
 	Label channel_label_;
 	ComboBox channel_list_;
+	// The callout is a window of its own: a TooltipWindow only shows the tips of components in
+	// its own window, so the views' tooltip windows never show this panel's tips.
+	TooltipWindow tooltip_window_;
 
 	JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(FxOutputSettingsPanel)
 };

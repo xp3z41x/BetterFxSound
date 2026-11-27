@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -79,11 +80,12 @@ func buildRawCmdLine(exePath string, args []string) string {
 // returns its captured stdout.
 //
 // Executables in this package are expected to exit quickly: fxdiag.exe
-// always returns promptly, and FxSound.exe invocations either become the
-// running instance's startup (for a cold launch with no status/query
-// flags) or forward their command line to an already-running instance over
-// a Windows message broadcast and exit almost immediately. The timeout
-// guards against a hang, not a normal slow response.
+// always returns promptly, and FxSound.exe is only run this way while an
+// instance is already running, so it forwards its command line to that
+// instance over a Windows message broadcast and exits almost immediately.
+// A cold start never goes through Run (see launch): that process would not
+// exit, and the timeout would kill it. The timeout guards against a hang,
+// not a normal slow response.
 func Run(ctx context.Context, timeout time.Duration, exePath string, args ...string) (stdout string, err error) {
 	if exePath == "" {
 		return "", newError(ErrKindAppNotFound, nil, "executable path not resolved (see fxsound.Locate)")
@@ -106,16 +108,31 @@ func Run(ctx context.Context, timeout time.Duration, exePath string, args ...str
 	return out.String(), nil
 }
 
-// launch starts exePath (FxSound.exe with no arguments) without waiting
-// for it to exit.
+// startProcess starts a process without waiting for it; a package variable
+// so tests can substitute a stub.
+var startProcess = func(exePath string, args []string) error {
+	cmd := exec.Command(exePath)
+	cmd.SysProcAttr = &syscall.SysProcAttr{CmdLine: buildRawCmdLine(exePath, args)}
+	// The installed shortcuts start FxSound in its own folder, where it finds
+	// its built-in presets and fonts.
+	cmd.Dir = filepath.Dir(exePath)
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	return cmd.Process.Release()
+}
+
+// launch starts exePath with args (the new instance's startup command line,
+// parsed by initConfig) without waiting for it to exit.
 //
-// Deliberately takes no context: a cold launch becomes the persistent,
-// long-running FxSound instance, and must not be killed just because the
-// caller's request context is later canceled (e.g. once an MCP tool call
-// that triggered the launch returns). No arguments means no quoting
-// concerns -- see buildRawCmdLine's doc comment for why that matters for
-// Run.
-func launch(exePath string) error {
+// Deliberately takes no context, and never goes through Run: a cold launch
+// becomes the persistent, long-running FxSound instance, so it must not be
+// waited on (Run would time out and kill it a few seconds into its startup,
+// leaving the FxSound virtual device as the Windows default with nothing
+// processing it), nor killed just because the caller's request context is
+// later canceled (e.g. once an MCP tool call that triggered the launch
+// returns).
+func launch(exePath string, args ...string) error {
 	if exePath == "" {
 		return newError(ErrKindAppNotFound, nil, "executable path not resolved (see fxsound.Locate)")
 	}
@@ -123,6 +140,5 @@ func launch(exePath string) error {
 	spawnMu.Lock()
 	defer spawnMu.Unlock()
 
-	cmd := exec.Command(exePath)
-	return cmd.Start()
+	return startProcess(exePath, args)
 }

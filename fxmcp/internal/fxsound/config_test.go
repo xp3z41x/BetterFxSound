@@ -89,6 +89,9 @@ func TestApplySpawnsExactlyOnce(t *testing.T) {
 		return nil
 	}
 	t.Cleanup(func() { runProcess = orig })
+	// A running instance: the flags are forwarded through one Run (a cold start
+	// launches instead, see TestApplyColdStartLaunchesWithoutWaiting).
+	stub(t, &fxSoundRunning, func() (bool, error) { return true, nil })
 
 	paths := &Paths{FxSoundExe: `C:\fake\FxSound.exe`}
 	flags := map[string]string{

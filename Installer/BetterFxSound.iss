@@ -1,4 +1,4 @@
-; BetterFxSound installer (Inno Setup 6.3 or later).
+; BetterFxSound installer (Inno Setup 6.7; CI uses the choco "innosetup" package).
 ;
 ; Replaces the official FxSound Advanced Installer project (fxsound.aip), which
 ; needs a paid Advanced Installer edition. This script reproduces what that
@@ -117,6 +117,12 @@ Root: HKLM; Subkey: "Software\{#AppName}"; Flags: uninsdeletekeyifempty
 Root: HKLM; Subkey: "Software\{#AppName}\{#AppName}"; ValueType: string; ValueName: "Path"; ValueData: "{app}"; Flags: uninsdeletekey
 Root: HKLM; Subkey: "Software\{#AppName}\{#AppName}"; ValueType: string; ValueName: "Version"; ValueData: "{#AppVersion}"
 
+[InstallDelete]
+; On a reinstall or an upgrade with a task now unticked, remove the shortcut an earlier
+; install created for it (Inno Setup does not remove it by itself).
+Type: files; Name: "{commonstartup}\{#AppName}.lnk"; Tasks: not startup
+Type: files; Name: "{autodesktop}\{#AppName}.lnk"; Tasks: not desktopicon
+
 [Run]
 Filename: "{app}\FxSound.exe"; WorkingDir: "{app}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent
 
@@ -132,6 +138,9 @@ const
   RenderKey = 'SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Render';
   DfxDevicesKey = 'Software\DFX\23\devices';
   DeviceStateDisabled = 2;
+  WM_QUERYENDSESSION = $0011;
+  ENDSESSION_CLOSEAPP = 1;
+  PROCESS_QUERY_LIMITED_INFORMATION = $1000;
 
 var
   OfficialFound: Boolean;
@@ -139,6 +148,21 @@ var
   OfficialKeyName: String;
   OfficialDisplay: String;
   RebootNeeded: Boolean;
+  QuitRequests: Integer;
+  AppWasRunning: Boolean;
+
+{ Win32 imports. Types that Inno Setup 6.7 knows: handles as UINT_PTR, CreateCallback
+  results as Longword. }
+function ApiEnumWindows(lpEnumFunc: Longword; lParam: INT_PTR): BOOL;
+  external 'EnumWindows@user32.dll stdcall';
+function ApiGetWindowThreadProcessId(hWnd: HWND; var lpdwProcessId: DWORD): DWORD;
+  external 'GetWindowThreadProcessId@user32.dll stdcall';
+function ApiOpenProcess(dwDesiredAccess: DWORD; bInheritHandle: BOOL; dwProcessId: DWORD): UINT_PTR;
+  external 'OpenProcess@kernel32.dll stdcall';
+function ApiCloseHandle(hObject: UINT_PTR): BOOL;
+  external 'CloseHandle@kernel32.dll stdcall';
+function ApiQueryFullProcessImageName(hProcess: UINT_PTR; dwFlags: DWORD; lpExeName: String; var lpdwSize: DWORD): BOOL;
+  external 'QueryFullProcessImageNameW@kernel32.dll stdcall';
 
 { ---------------------------------------------------------------- helpers -- }
 
@@ -188,15 +212,74 @@ begin
   Log(Format('Run: "%s" %s -> started=%d exit=%d', [Exe, Params, Ord(Result), ResultCode]));
 end;
 
-{ Asks FxSound.exe (official or BetterFxSound, same exe name) to close, then
-  forces it. The official installer does the same through its StopFxSound action. }
-procedure CloseFxSound();
+function FxSoundRunning(): Boolean;
 var
-  ResultCode: Integer;
+  Output: String;
 begin
-  RunWait(ExpandConstant('{sys}\taskkill.exe'), '/IM FxSound.exe', ResultCode);
-  if ResultCode = 0 then
-    Sleep(2000);
+  { The image name is in the output only when it runs (the "no tasks" text is localized). }
+  RunCapture(ExpandConstant('{sys}\tasklist.exe'), '/FI "IMAGENAME eq FxSound.exe" /FO CSV /NH',
+    ExpandConstant('{sys}'), Output);
+  Result := Pos('fxsound.exe', Lowercase(Output)) > 0;
+end;
+
+function IsFxSoundProcess(Pid: DWORD): Boolean;
+var
+  Process: UINT_PTR;
+  Path: String;
+  Size: DWORD;
+begin
+  Result := False;
+  Process := ApiOpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, Pid);
+  if Process = 0 then
+    Exit;
+  Size := 1024;
+  SetLength(Path, Size);
+  if ApiQueryFullProcessImageName(Process, 0, Path, Size) then
+    Result := CompareText(ExtractFileName(Copy(Path, 1, Size)), 'FxSound.exe') = 0;
+  ApiCloseHandle(Process);
+end;
+
+{ EnumWindows callback: asks every top-level window of an FxSound.exe process to end
+  its session, as Windows does at log off. }
+function PostQuitToFxSoundWindow(Wnd: HWND; Param: INT_PTR): BOOL;
+var
+  Pid: DWORD;
+begin
+  Result := True;
+  Pid := 0;
+  ApiGetWindowThreadProcessId(Wnd, Pid);
+  if (Pid <> 0) and IsFxSoundProcess(Pid) then
+    if PostMessage(Wnd, WM_QUERYENDSESSION, 0, ENDSESSION_CLOSEAPP) then
+      QuitRequests := QuitRequests + 1;
+end;
+
+{ Closes FxSound.exe (official or BetterFxSound, same exe name). First the way Windows
+  does at log off: JUCE answers WM_QUERYENDSESSION by quitting, so the app's shutdown
+  runs and gives the Windows default device and the devices' own volume and mute back.
+  WM_CLOSE (taskkill without /F) only hides its window, and a forced kill skips that
+  shutdown: the FxSound virtual device stays the default with nothing processing it,
+  so there is no sound until FxSound starts again. Forced only if it does not quit.
+  Returns whether it was running. }
+function CloseFxSound(): Boolean;
+var
+  ResultCode, I: Integer;
+begin
+  Result := FxSoundRunning();
+  if not Result then
+    Exit;
+  QuitRequests := 0;
+  ApiEnumWindows(CreateCallback(@PostQuitToFxSoundWindow), 0);
+  Log(Format('Asked FxSound to quit through %d window(s)', [QuitRequests]));
+  for I := 1 to 20 do
+  begin
+    Sleep(500);
+    if not FxSoundRunning() then
+    begin
+      Log('FxSound closed gracefully');
+      Exit;
+    end;
+  end;
+  Log('FxSound did not quit within 10 seconds, forcing it');
   RunWait(ExpandConstant('{sys}\taskkill.exe'), '/F /T /IM FxSound.exe', ResultCode);
   if ResultCode = 0 then
     Sleep(1000);
@@ -465,6 +548,12 @@ begin
   DevCon := DrvDir + '\fxdevcon64.exe';
   if FileExists(DevCon) then
     RunCapture(DevCon, 'remove', DrvDir, Output);
+  { The values InstallDriver recorded describe the device that is now gone. }
+  RegDeleteValue(HKLM64, DfxDevicesKey, 'dfx_guid');
+  RegDeleteValue(HKLM64, DfxDevicesKey, 'default_buffer_size');
+  RegDeleteKeyIfEmpty(HKLM64, DfxDevicesKey);
+  RegDeleteKeyIfEmpty(HKLM64, 'Software\DFX\23');
+  RegDeleteKeyIfEmpty(HKLM64, 'Software\DFX');
 end;
 
 { The app's "Launch on system startup" toggle writes HKCU\...\Run\FxSound with the
@@ -513,7 +602,7 @@ var
   ErrorMsg: String;
 begin
   Result := '';
-  CloseFxSound();
+  AppWasRunning := CloseFxSound();
   if OfficialFound then
   begin
     if not UninstallOfficialFxSound(ErrorMsg) then
@@ -529,6 +618,8 @@ begin
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
+var
+  ResultCode: Integer;
 begin
   if CurStep = ssPostInstall then
   begin
@@ -537,6 +628,18 @@ begin
       Log('/SKIPDRIVER: driver step skipped')
     else
       InstallDriver();
+    { A silent upgrade or repair has no "Launch" checkbox: start BetterFxSound again if it
+      was running before, as the user, in its own folder (it loads presets and fonts from
+      there). Not after replacing the official FxSound: that first start is a version
+      change, which resets the engine state and shows a what's-new notice. }
+    if AppWasRunning and not OfficialFound and WizardSilent() then
+    begin
+      if ExecAsOriginalUser(ExpandConstant('{app}\FxSound.exe'), '', ExpandConstant('{app}'),
+                            SW_SHOWNORMAL, ewNoWait, ResultCode) then
+        Log('Started FxSound again: it was running before setup')
+      else
+        Log('Could not start FxSound again: ' + SysErrorMessage(ResultCode));
+    end;
   end;
 end;
 
@@ -553,7 +656,7 @@ var
 begin
   if CurUninstallStep = usUninstall then
   begin
-    CloseFxSound();
+    AppWasRunning := CloseFxSound();
     if HasSwitch('/SKIPDRIVER') then
       Log('/SKIPDRIVER: driver removal skipped')
     else

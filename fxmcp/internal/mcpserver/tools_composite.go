@@ -156,6 +156,12 @@ func (a *App) toolApplySettings(ctx context.Context, _ *mcp.CallToolRequest, in 
 		flags["delete_preset"] = ""
 	}
 	if in.OutputDevice != "" {
+		if err := fxsound.ValidateOutputName(in.OutputDevice); err != nil {
+			return nil, applyResult{}, err
+		}
+		if err := a.checkOutputIfRunning(ctx, in.OutputDevice); err != nil {
+			return nil, applyResult{}, err
+		}
 		flags["output"] = in.OutputDevice
 	}
 	if in.View != "" {

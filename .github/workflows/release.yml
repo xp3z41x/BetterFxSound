@@ -179,6 +179,112 @@ jobs:
           Assert (Test-Path "$presets\SmokeTest.fac") "user preset kept after uninstall"
           Assert ((Get-ItemProperty 'HKCU:\SOFTWARE\DFX').SmokeTest -eq 'keep') "HKCU\SOFTWARE\DFX kept after uninstall"
 
+      # Installs the released v1.0.0, starts it, then runs this build's installer over the
+      # running app (same AppId), repairs it with the Startup task unticked and ticked again,
+      # and uninstalls it while it runs. Checks that setup closes the app gracefully (its
+      # shutdown hands the Windows default device back) and starts it again after a silent
+      # upgrade, that the existing driver is kept, and what the uninstall leaves behind.
+      - name: Smoke test (upgrade over v1.0.0 with the app running, repair, uninstall)
+        shell: pwsh
+        timeout-minutes: 20
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPGRADE_FROM: v1.0.0
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $setup = (Get-ChildItem dist -Filter *-setup.exe).FullName
+          $logs = (New-Item -ItemType Directory -Force smoke-logs).FullName
+          $appDir = Join-Path $env:ProgramFiles 'BetterFxSound'
+          $arpKey = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{D55BD9F9-D5A8-4ADF-8A83-B49AF7CC30D9}_is1'
+          $startup = "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp\BetterFxSound.lnk"
+          $fxLog = "$env:APPDATA\FxSound\fxsound.log"
+          $builtExe = Resolve-Path fxsound\Project\x64\Release\App\FxSound.exe
+          function Assert($cond, $msg) { if (-not $cond) { throw "FAILED: $msg" } else { Write-Host "ok: $msg" } }
+          function Run-Setup($exe, $log, [string[]]$extra = @()) {
+            $p = Start-Process $exe -ArgumentList (@('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/LOG=`"$logs\$log`"") + $extra) -PassThru
+            if (-not $p.WaitForExit(600000)) { throw "$log timed out" }
+            Write-Host "::group::$log (exit code $($p.ExitCode))"
+            # Write-Host, not the pipeline: the function's only output is the exit code.
+            Select-String -Path "$logs\$log" -Pattern 'FxSound|Run: |Driver|SKIPDRIVER' | ForEach-Object { Write-Host $_.Line }
+            Write-Host "::endgroup::"
+            $p.ExitCode
+          }
+          function Start-App {
+            Start-Process "$appDir\FxSound.exe" -WorkingDirectory $appDir | Out-Null
+            $deadline = (Get-Date).AddSeconds(30)
+            while (-not (Get-Process FxSound -ErrorAction SilentlyContinue) -and (Get-Date) -lt $deadline) { Start-Sleep 1 }
+            Start-Sleep 8
+          }
+          function Get-LogSize { if (Test-Path $fxLog) { (Get-Item $fxLog).Length } else { 0 } }
+          function Get-LogSince($size) {
+            if (-not (Test-Path $fxLog)) { return '' }
+            $bytes = [IO.File]::ReadAllBytes($fxLog)
+            if ($bytes.Length -le $size) { return '' }
+            [Text.Encoding]::UTF8.GetString($bytes, $size, $bytes.Length - $size)
+          }
+          function Get-AppProcess { Get-Process FxSound -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq "$appDir\FxSound.exe" } }
+
+          $old = New-Item -ItemType Directory -Force old-release
+          gh release download $env:UPGRADE_FROM --repo $env:GITHUB_REPOSITORY --pattern '*-setup.exe' --dir $old
+          if ($LASTEXITCODE -ne 0) { throw "could not download the $env:UPGRADE_FROM installer" }
+          $oldSetup = (Get-ChildItem $old -Filter *-setup.exe).FullName
+          Assert ((Run-Setup $oldSetup 'old-install.log') -eq 0) "$env:UPGRADE_FROM setup exited with 0"
+          Assert (Test-Path "$appDir\FxSound.exe") "$env:UPGRADE_FROM installed"
+
+          Start-App
+          Assert ($null -ne (Get-AppProcess)) "$env:UPGRADE_FROM app runs before the upgrade"
+          $size = Get-LogSize
+          Assert ((Run-Setup $setup 'upgrade.log') -eq 0) "upgrade setup exited with 0"
+          $log = Get-Content "$logs\upgrade.log" -Raw
+          $appLog = Get-LogSince $size
+          Write-Host "fxsound.log during the upgrade:`n$appLog"
+          Assert ($log -match 'Asked FxSound to quit through [1-9]') "upgrade asked the running app to quit"
+          Assert ($log -match 'FxSound closed gracefully') "upgrade closed the running app gracefully"
+          Assert ($log -notmatch 'forcing it') "upgrade did not force-kill the app"
+          Assert ($appLog -match 'UiaDisconnectAllProviders \(before window teardown\)') "the app ran its shutdown during the upgrade"
+          Assert ((Get-FileHash "$appDir\FxSound.exe").Hash -eq (Get-FileHash $builtExe).Hash) "FxSound.exe replaced by this build"
+          Assert ($log -match 'FxSound Audio Enhancer device node') "upgrade found the driver device the earlier install made"
+          Assert ($log -match 'Driver step finished') "driver step finished on upgrade"
+          Assert ($log -match 'Started FxSound again') "setup started the app again after the silent upgrade"
+          Start-Sleep 5
+          Assert ($null -ne (Get-AppProcess)) "the app runs after the upgrade"
+          $entries = @(Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall' | Get-ItemProperty | Where-Object { $_.DisplayName -eq 'BetterFxSound' })
+          Assert ($entries.Count -eq 1) "one BetterFxSound uninstall entry after the upgrade"
+          Assert (Test-Path $startup) "Startup shortcut kept by the upgrade"
+
+          Assert ((Run-Setup $setup 'repair-no-startup.log' @('/SKIPDRIVER', '/MERGETASKS=!startup')) -eq 0) "repair with the Startup task unticked exited with 0"
+          Assert (-not (Test-Path $startup)) "Startup shortcut removed when its task is unticked"
+          Assert ((Get-Content "$logs\repair-no-startup.log" -Raw) -match 'FxSound closed gracefully') "repair closed the running app gracefully"
+          Assert ((Run-Setup $setup 'repair-startup.log' @('/SKIPDRIVER', '/MERGETASKS=startup')) -eq 0) "repair with the Startup task ticked exited with 0"
+          Assert (Test-Path $startup) "Startup shortcut back when its task is ticked again"
+          Start-Sleep 5
+          Assert ($null -ne (Get-AppProcess)) "the app runs after the repairs"
+
+          $size = Get-LogSize
+          $p = Start-Process "$appDir\unins000.exe" -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/LOG=`"$logs\uninstall-running.log`"" -PassThru
+          $p.WaitForExit()
+          $deadline = (Get-Date).AddMinutes(5)
+          while (((Test-Path $arpKey) -or (Test-Path $appDir)) -and (Get-Date) -lt $deadline) { Start-Sleep 2 }
+          Write-Host "::group::uninstall-running.log"
+          Select-String -Path "$logs\uninstall-running.log" -Pattern 'FxSound|Run: |SKIPDRIVER' -ErrorAction SilentlyContinue | ForEach-Object Line
+          Write-Host "::endgroup::"
+          $log = Get-Content "$logs\uninstall-running.log" -Raw
+          Assert ($log -match 'FxSound closed gracefully') "uninstall closed the running app gracefully"
+          Assert ((Get-LogSince $size) -match 'UiaDisconnectAllProviders \(before window teardown\)') "the app ran its shutdown during the uninstall"
+          Assert ($null -eq (Get-Process FxSound -ErrorAction SilentlyContinue)) "FxSound not running after the uninstall"
+          Assert (-not (Test-Path $arpKey)) "uninstall entry removed"
+          Assert (-not (Test-Path $appDir)) "install folder removed"
+          Assert (-not (Test-Path $startup)) "Startup shortcut removed"
+          Assert (-not (Test-Path "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\BetterFxSound.lnk")) "Start menu shortcut removed"
+          Assert (-not (Test-Path 'HKLM:\SOFTWARE\BetterFxSound')) "HKLM\SOFTWARE\BetterFxSound removed"
+          Assert ($log -match 'fxdevcon64.exe" remove -> started=1 exit=0') "driver removed by the uninstall"
+          $dfxDevices = Get-ItemProperty 'HKLM:\SOFTWARE\DFX\23\devices' -ErrorAction SilentlyContinue
+          Assert ($null -eq $dfxDevices -or ($null -eq $dfxDevices.dfx_guid -and $null -eq $dfxDevices.default_buffer_size)) "driver values setup recorded in HKLM\SOFTWARE\DFX removed"
+          Write-Host "Left behind on purpose: $env:APPDATA\FxSound (settings, presets), HKCU\SOFTWARE\DFX. Other leftovers:"
+          foreach ($path in "$env:ProgramData\FxSound", 'HKLM:\SOFTWARE\DFX') {
+            if (Test-Path $path) { Write-Host "  $path"; Get-ChildItem $path -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "    $($_.Name)" } }
+          }
+
       - name: Upload smoke test logs
         if: always()
         uses: actions/upload-artifact@v4
