@@ -29,7 +29,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 //==============================================================================
 // Fine controls of one output. Shown in a CallOutBox from the gear button of a tile.
 // Every change is applied right away through FxController.
-class FxOutputSettingsPanel : public Component
+class FxOutputSettingsPanel : public Component, public FxModel::Listener
 {
 public:
 	static constexpr int WIDTH = 330;
@@ -49,6 +49,9 @@ public:
 	void resized() override;
 	void paint(Graphics& g) override;
 	void lookAndFeelChanged() override;
+	// Volume, delay and channels can change from the CLI or MCP while the panel is open:
+	// show the new values, and close the panel if its output is gone.
+	void modelChanged(FxModel::Event model_event) override;
 
 private:
 	static constexpr int MARGIN = 14;
@@ -88,6 +91,17 @@ public:
 	void setColumns(int columns);
 	void setMaxVisibleRows(int rows);
 
+	// Outputs that are enabled, and outputs that really play (enabled and connected).
+	struct Counts
+	{
+		int total = 0;
+		int enabled = 0;
+		int playing = 0;
+	};
+	static Counts countOutputs(const std::vector<FxController::OutputState>& outputs);
+	// Counts from the tiles, so they include a click whose OutputListUpdated is still pending.
+	Counts getCounts() const;
+
 	// Rows needed to show every tile, at least 1 (the empty message takes one row).
 	int getRowCount() const;
 	// Height that shows min(getRowCount(), max visible rows) rows.
@@ -106,6 +120,9 @@ public:
 
 	// Short texts shared by the views that show the grid.
 	static String getMutedNotice();
+	static String getDisconnectedNotice();
+	// The muted or disconnected notice for these counts, empty when something plays.
+	static String getSilenceNotice(const Counts& counts);
 	static String getChannelModeText(OutputChannelMode channel_mode);
 
 private:

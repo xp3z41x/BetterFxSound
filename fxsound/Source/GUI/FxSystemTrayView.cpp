@@ -85,24 +85,26 @@ void FxSystemTrayView::setStatus(bool power, bool processing)
 
     String param = power ? TRANS(L"on") : TRANS(L"off");
 
-    // BetterFxSound outputs rework: list every enabled output, there is no main output anymore.
-    StringArray enabled_outputs;
-    for (auto& output : FxController::getInstance().getOutputs())
+    // BetterFxSound outputs rework: list the outputs that really play (enabled and connected),
+    // there is no main output anymore.
+    auto outputs = FxController::getInstance().getOutputs();
+    StringArray playing_outputs;
+    for (auto& output : outputs)
     {
-        if (output.enabled)
+        if (output.enabled && output.present)
         {
-            enabled_outputs.add(output.name);
+            playing_outputs.add(output.name);
         }
     }
 
     String tool_tip = String(TRANS("FxSound is %s.")).replace("%s", param) + "\n\n";
-    if (enabled_outputs.isEmpty())
+    if (playing_outputs.isEmpty())
     {
-        tool_tip += FxOutputsGrid::getMutedNotice();
+        tool_tip += FxOutputsGrid::getSilenceNotice(FxOutputsGrid::countOutputs(outputs));
     }
     else
     {
-        tool_tip += String(TRANS("Outputs: ")) + enabled_outputs.joinIntoString(", ");
+        tool_tip += String(TRANS("Outputs: ")) + playing_outputs.joinIntoString(", ");
     }
 
     NOTIFYICONDATA nid = { sizeof(nid) };
@@ -385,16 +387,23 @@ void FxSystemTrayView::addOutputDeviceMenu(PopupMenu* context_menu)
     {
         menu->addItem(TRANS("No playback devices were found."), false, false, nullptr);
     }
-    else if (FxController::getInstance().getEnabledOutputCount() == 0)
+    else
     {
-        menu->addItem(FxOutputsGrid::getMutedNotice(), false, false, nullptr);
+        // Nothing plays when no output is enabled or every enabled output is disconnected.
+        auto silence_notice = FxOutputsGrid::getSilenceNotice(FxOutputsGrid::countOutputs(outputs));
+        if (silence_notice.isNotEmpty())
+        {
+            menu->addItem(silence_notice, false, false, nullptr);
+        }
     }
 
     auto id = OUTPUT_MENU_ID_START;
     for (auto& output : outputs)
     {
-        auto name = output.present ? output.name : output.name + " (" + TRANS("Not connected") + ")";
-        PopupMenu::Item menu_item(getTruncatedText(name, 40));
+        // The name is truncated before the suffix so "(disconnected)" always shows.
+        auto name = output.present ? getTruncatedText(output.name, 40)
+                                   : getTruncatedText(output.name, 26) + " (" + TRANS("disconnected") + ")";
+        PopupMenu::Item menu_item(name);
         menu_item.setID(id);
         menu_item.setTicked(output.enabled);
 
