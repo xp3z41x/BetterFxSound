@@ -9,7 +9,6 @@ name: Release
 on:
   push:
     tags: ["v*"]
-    branches: ["claude/release-installer-ae8aa4"] # TEMPORARY: test runs before this workflow is on main
   workflow_dispatch:
 
 permissions:
