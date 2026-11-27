@@ -122,7 +122,7 @@ def cmd_list(args):
     import pyaudiowpatch as pa
     p = pa.PyAudio()
     try:
-        out = p.get_default_wasapi_device() if hasattr(p, "get_default_wasapi_device") else None
+        out = p.get_device_info_by_index(p.get_host_api_info_by_type(pa.paWASAPI)["defaultOutputDevice"])
         if out:
             print("default output:", out["name"], int(out["defaultSampleRate"]), "Hz")
         for d in loopbacks(p):
@@ -150,7 +150,8 @@ def cmd_run(args):
                 raise SystemExit(f"'{sub}' matches {len(hits)} loopback devices: {[d['name'] for d in hits]}")
             return hits[0]
 
-        out_info = p.get_default_wasapi_device()
+        wasapi = p.get_host_api_info_by_type(pa.paWASAPI)
+        out_info = p.get_device_info_by_index(wasapi["defaultOutputDevice"])
         print("source ->", out_info["name"])
         src = Source(p, out_info, args.period)
         caps.append(Capture(p, pick(VIRTUAL_NAME), args.seconds, args.out, "ref"))
