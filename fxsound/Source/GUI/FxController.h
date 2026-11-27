@@ -138,8 +138,8 @@ public:
 	int compareOutputDevicePriority(const String& output_device_name1, const String& output_device_name2, const juce::Array<DeviceConfig>& device_configs);
 	// Re-reads the device priority (Output preferences) and elects the carrier again.
 	void refreshOutputList();
-	// Name of the carrier, the enabled output on the low latency path (see docs/OUTPUTS_REWORK.md).
-	// Used to apply a device's preset; not shown to the user as a "main output".
+	// Name of the only enabled output, or empty when zero or several outputs are enabled. A device's
+	// preset (Output preferences) belongs to the outputs only while that device is the one output on.
 	const String& getOutputName();
     bool isNewOutputPrioritized();
     void setNewOutputPrioritized(bool prioritize_new_devices);
@@ -309,6 +309,9 @@ private:
 	void pushOutputsToEngine();
 	void notifyOutputsChanged();
 	void enableNextOutput();
+	bool enableOnlyOutput(const String& id, String* applied_preset);
+	String getSoleEnabledOutputId();
+	String applySoleOutputPreset(const String& previous_sole_id);
 	void handleNoOutput();
 
 	void powerOn(bool on);
@@ -345,13 +348,13 @@ private:
 	bool output_changed_;
     bool playback_device_available_;
 	bool system_sleeping_;
-	String output_device_name_;		// Carrier name, see getOutputName()
+	String output_device_name_;		// See getOutputName()
 
 	// BetterFxSound outputs rework (guarded by lock_).
 	std::vector<OutputEntry> output_entries_;
 	String carrier_id_;				// Carrier the engine uses, or will use once a requested switch is done
 	String requested_carrier_id_;	// Asked for with setAsPlaybackDevice(), not confirmed by a reinit yet
-	String elected_carrier_id_;		// Last carrier chosen by the election; its device preset was applied
+	bool no_enabled_output_present_ = false;	// Logged once: every enabled output is disconnected, silence
 	StringArray failed_carrier_ids_;	// Asked for but not taken by the engine; skipped until the devices change
 	bool no_output_;				// Powered off because no real output device was present
 	String startup_output_name_;	// --output given on the command line before init
