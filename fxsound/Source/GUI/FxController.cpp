@@ -730,7 +730,7 @@ void FxController::printStatus()
 	settings->setProperty("output_devices", output_devices);
 
 	// BetterFxSound outputs rework: every output with its own state. selected_output is kept for
-	// compatibility: the first enabled output (the carrier, getOutputName(), may be a silent one).
+	// compatibility: the first enabled output in the list below, or empty when none is enabled.
 	Array<var> outputs;
 	String first_enabled_output;
 	for (auto& output : getOutputs())
