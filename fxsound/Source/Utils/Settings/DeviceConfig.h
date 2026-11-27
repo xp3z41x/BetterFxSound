@@ -45,6 +45,7 @@ namespace FxSound
         static juce::var toJson(const DeviceConfig& device_config);
         static DeviceConfig fromJson(const juce::var& v);
         static juce::Array<DeviceConfig> removeDuplicates(const juce::Array<DeviceConfig>& device_configs);
+        static void notifyDeviceConfigsUpdate();
     };
 }
 

@@ -726,10 +726,18 @@ void FxController::printStatus()
 	settings->setProperty("selected_preset", model.getPreset(model.getSelectedPreset()).name);
 
 	Array<var> output_devices;
-	for (auto& device : audio_passthru_->getSoundDevices())
 	{
-		if (device.isRealDevice)
-			output_devices.add(String(device.deviceFriendlyName.c_str()));
+		// BetterFxSound: the engine's device list is rebuilt by every enumeration, which the device handling
+		// does under lock_.
+		ScopedLock auto_lock(lock_);
+		if (audio_passthru_ != nullptr)
+		{
+			for (auto& device : audio_passthru_->getSoundDevices())
+			{
+				if (device.isRealDevice)
+					output_devices.add(String(device.deviceFriendlyName.c_str()));
+			}
+		}
 	}
 	settings->setProperty("output_devices", output_devices);
 
@@ -1236,7 +1244,10 @@ bool FxController::isPlaybackDeviceAvailable()
 
 void FxController::checkDeviceChanges()
 {
-	audio_passthru_->checkDeviceChanges();
+	// BetterFxSound: enumerates the engine's devices, serialized with the device handling.
+	ScopedLock auto_lock(lock_);
+	if (audio_passthru_ != nullptr)
+		audio_passthru_->checkDeviceChanges();
 }
 
 void FxController::savePreset(const String& preset_name)
@@ -1799,18 +1810,14 @@ void FxController::syncOutputsWhileOff(std::vector<SoundDevice>& sound_devices, 
 	if (changed)
 	{
 		failed_carrier_ids_.clear();
-		// This runs on the device notification thread (IMMNotificationClient), which must not block or release
-		// device objects: the engine's update (stopping removed outputs' threads, putting devices' own volume
-		// back) goes to the message thread.
-		MessageManager::callAsync([this]() {
-			ScopedLock auto_lock(lock_);
-			pushOutputsToEngine();
-		});
+		// The engine's update (stopping removed outputs' threads, putting devices' own volume back) is handed
+		// over by flushOutputsToEngine() once lock_ is released.
+		pushOutputsToEngine();
 		notifyOutputsChanged();
 	}
 
-	// Processing was stopped because no output device was present: start again now that one is. This runs
-	// on the device notification thread (IMMNotificationClient), so the restart goes to the message thread.
+	// Processing was stopped because no output device was present: start again now that one is. Queued, so
+	// it runs after this device change has been handled and lock_ released.
 	if (no_output_ && !active_output_devices_.empty() && FxModel::getModel().getPowerState())
 	{
 		MessageManager::callAsync([this]() {
@@ -1886,14 +1893,16 @@ void FxController::powerOn(bool on)
 	{
 		dfx_dsp_.powerOn(true);
 
-		if (!isTimerRunning())
+		// BetterFxSound: under lock_ up to startTimer(), so the device handling (which enumerates the engine's
+		// devices while the timer is off) cannot run between the election and the first tick. No engine
+		// (before init or after detachAudioPassthru()): nothing to start.
+		ScopedLock auto_lock(lock_);
+
+		if (!isTimerRunning() && audio_passthru_ != nullptr)
 		{
 			// BetterFxSound outputs rework: elect the carrier before processing starts, so the first
 			// reinit already uses it. While off, the engine takes the Windows default device when it starts.
-			if (audio_passthru_ != nullptr)
 			{
-				ScopedLock auto_lock(lock_);
-
 				auto sound_devices = audio_passthru_->getSoundDevices(true);
 				if (refreshActiveOutputs(sound_devices))
 				{
@@ -1926,14 +1935,21 @@ void FxController::powerOn(bool on)
 	{
 		dfx_dsp_.powerOn(false);
 
-		{
-			ScopedLock auto_lock(lock_);
+		// BetterFxSound: under lock_ as a whole: the device handling runs as soon as the timer is off, and
+		// restoreDefaultPlaybackDevice() reads the engine's device list.
+		ScopedLock auto_lock(lock_);
 
-			if (hdmi_reconnect_pending_)
-			{
-				audio_passthru_->mute(false);
-				clearOutputRestore();
-			}
+		if (audio_passthru_ == nullptr)
+		{
+			if (isTimerRunning())
+				stopTimer();
+			return;
+		}
+
+		if (hdmi_reconnect_pending_)
+		{
+			audio_passthru_->mute(false);
+			clearOutputRestore();
 		}
 
 		if (isTimerRunning())
@@ -2125,6 +2141,11 @@ LRESULT CALLBACK FxController::eventCallback(HWND hwnd, const UINT message, cons
 	static auto os = SystemStats::getOperatingSystemType();
 	FxController* controller = (FxController*)GetWindowLongPtr(hwnd, GWLP_USERDATA);
 
+	// BetterFxSound: no engine yet (before init) or any more (after detachAudioPassthru(), while shutdown
+	// still pumps messages): hotkeys, power and session events have nothing to act on.
+	if (controller == nullptr || controller->audio_passthru_ == nullptr)
+		return DefWindowProc(hwnd, message, w_param, l_param);
+
 	switch (message)
 	{
 	case WM_HOTKEY:
@@ -2253,6 +2274,9 @@ void FxController::timerCallback()
 		}
 	}
 
+	// BetterFxSound: outputs changed above reach the engine before its reinit, with lock_ released.
+	flushOutputsToEngine();
+
 	audio_passthru_->processTimer();
 	{
 		// Sample after processTimer(), once any device reinit has set the availability. This also covers
@@ -2320,10 +2344,36 @@ void FxController::timerCallback()
 
 void FxController::onSoundDeviceChange(bool processing)
 {
+	if (!processing)
+	{
+		// BetterFxSound: called on the IMMNotificationClient thread. Enumerating devices, activating audio
+		// clients or releasing device objects there is not allowed, and taking lock_ there would stall the
+		// notifications behind the UI. The device handling goes to the message thread, where every other
+		// user of the engine's device list and of device_configs runs. Repeated notifications are handled once.
+		if (!device_change_posted_.exchange(true))
+		{
+			MessageManager::callAsync([this]() {
+				device_change_posted_ = false;
+				handleSoundDeviceChange(false);
+				flushOutputsToEngine();
+			});
+		}
+		return;
+	}
+
+	// From the engine's processTimer(), on the message thread.
+	handleSoundDeviceChange(true);
+}
+
+void FxController::handleSoundDeviceChange(bool processing)
+{
 	if (session_id_ != WTSGetActiveConsoleSessionId())
 		return; // Ignore device changes on another user session
 
 	ScopedLock auto_lock(lock_);
+
+	if (audio_passthru_ == nullptr)
+		return;
 
 	if (isTimerRunning())
 	{
@@ -2718,11 +2768,14 @@ void FxController::restartApplication()
 
 juce::Array<DeviceConfig> FxController::getDeviceConfigs()
 {
+	// BetterFxSound: under lock_, like the device handling's load, append and save of the same list.
+	ScopedLock auto_lock(lock_);
 	return DeviceConfig::loadDeviceConfigs(settings_, "device_configs");
 }
 
 void FxController::saveDeviceConfigs(const juce::Array<DeviceConfig>& device_configs)
 {
+	ScopedLock auto_lock(lock_);
 	DeviceConfig::saveDeviceConfigs(settings_, "device_configs", device_configs);
 }
 
@@ -3547,8 +3600,14 @@ String FxController::applySoleOutputPreset(const String& previous_sole_id)
 	return device_config.preset;
 }
 
+// BetterFxSound: only stores the outputs. The engine gets them from flushOutputsToEngine(), queued here,
+// with lock_ released: setOutputs() may wait for removed outputs' render threads to stop, which must not
+// stall every other user of lock_. Every change is made on the message thread and the flush always sends
+// the latest outputs, so the engine gets them in order.
 void FxController::pushOutputsToEngine()
 {
+	ScopedLock auto_lock(lock_);
+
 	if (audio_passthru_ == nullptr)
 		return;
 
@@ -3565,7 +3624,53 @@ void FxController::pushOutputsToEngine()
 		outputs.push_back(config);
 	}
 
-	audio_passthru_->setOutputs(outputs);
+	pending_engine_outputs_.swap(outputs);
+	if (!engine_outputs_pending_)
+	{
+		engine_outputs_pending_ = true;
+		MessageManager::callAsync([this]() {
+			flushOutputsToEngine();
+		});
+	}
+}
+
+// Message thread, with lock_ not held by the caller.
+void FxController::flushOutputsToEngine()
+{
+	AudioPassthru* audio_passthru = nullptr;
+	std::vector< ::OutputConfig> outputs;
+	{
+		ScopedLock auto_lock(lock_);
+
+		if (!engine_outputs_pending_)
+			return;
+
+		engine_outputs_pending_ = false;
+		outputs.swap(pending_engine_outputs_);
+		audio_passthru = audio_passthru_;
+	}
+
+	if (audio_passthru != nullptr)
+		audio_passthru->setOutputs(outputs);
+}
+
+void FxController::detachAudioPassthru()
+{
+	// The last change of the outputs still reaches the engine, as it did when it was handed over at once.
+	flushOutputsToEngine();
+
+	ScopedLock auto_lock(lock_);
+
+	stopTimer();
+
+	if (audio_passthru_ != nullptr)
+	{
+		audio_passthru_->registerCallback(nullptr);
+		audio_passthru_ = nullptr;
+	}
+
+	pending_engine_outputs_.clear();
+	engine_outputs_pending_ = false;
 }
 
 void FxController::notifyOutputsChanged()

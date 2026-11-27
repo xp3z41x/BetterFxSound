@@ -89,8 +89,7 @@ namespace FxSound
         if (save_config)
         {
             saveDeviceConfigs(settings, "device_configs", device_configs);
-            if (onDeviceConfigsUpdate)
-                onDeviceConfigsUpdate();
+            notifyDeviceConfigsUpdate();
             return;
         }
 
@@ -101,10 +100,28 @@ namespace FxSound
                     return device_config.device_name == sound_device.deviceFriendlyName.c_str();
                 }) == sound_devices.end())
             {
-                if (onDeviceConfigsUpdate)
-                    onDeviceConfigsUpdate();
+                // BetterFxSound: one refresh covers every absent device.
+                notifyDeviceConfigsUpdate();
+                break;
             }
         }
+    }
+
+    // BetterFxSound: the listener (Output preferences) updates its components, so it only runs on the
+    // message thread. From any other thread it is queued, and the listener current at that time is called.
+    void DeviceConfig::notifyDeviceConfigsUpdate()
+    {
+        if (juce::MessageManager::existsAndIsCurrentThread())
+        {
+            if (onDeviceConfigsUpdate)
+                onDeviceConfigsUpdate();
+            return;
+        }
+
+        juce::MessageManager::callAsync([]() {
+            if (onDeviceConfigsUpdate)
+                onDeviceConfigsUpdate();
+        });
     }
 
     DeviceConfig DeviceConfig::getDeviceConfig(Settings& settings, const juce::String& device_name)

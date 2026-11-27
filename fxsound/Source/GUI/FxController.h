@@ -23,6 +23,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 #include <JuceHeader.h>
 #include <functional>
+#include <atomic>
 #include "FxModel.h"
 #include "FxTheme.h"
 #include "FxAudioControls.h"
@@ -71,6 +72,10 @@ public:
     void initConfig(const String& commandline);
 	void applyConfig(const String& commandline);
 	void init(FxMainWindow* main_window, FxSystemTrayView* system_tray_view, AudioPassthru* audio_passthru);
+	// BetterFxSound: called by Main::shutdown() before the engine is destroyed. Hands the engine the last
+	// outputs, stops the timer, unregisters the device change callback and forgets the engine, so nothing
+	// queued or delivered later (device notifications, window messages) reaches a freed engine.
+	void detachAudioPassthru();
 	void initPresets();
 	void printStatus();
 	static File getStatusFile();
@@ -273,6 +278,7 @@ private:
 	static LRESULT CALLBACK eventCallback(HWND hwnd, const UINT message, const WPARAM w_param, const LPARAM l_param);
 	void timerCallback() override;
 	void onSoundDeviceChange(bool processing) override;
+	void handleSoundDeviceChange(bool processing);
 	void onSystemSuspend();
 	void onSystemResume();
 	
@@ -307,6 +313,7 @@ private:
 	void applyCarrier();
 	void requestCarrier(const SoundDevice& device);
 	void pushOutputsToEngine();
+	void flushOutputsToEngine();
 	void notifyOutputsChanged();
 	void enableNextOutput();
 	bool enableOnlyOutput(const String& id, String* applied_preset);
@@ -356,6 +363,10 @@ private:
 	String requested_carrier_id_;	// Asked for with setAsPlaybackDevice(), not confirmed by a reinit yet
 	bool no_enabled_output_present_ = false;	// Logged once: every enabled output is disconnected, silence
 	StringArray failed_carrier_ids_;	// Asked for but not taken by the engine; skipped until the devices change
+	// pushOutputsToEngine() stores the outputs here and flushOutputsToEngine() hands them to the engine with
+	// lock_ released: setOutputs() may wait for removed outputs' render threads to stop.
+	std::vector< ::OutputConfig> pending_engine_outputs_;
+	bool engine_outputs_pending_ = false;
 	bool no_output_;				// Powered off because no real output device was present
 	String startup_output_name_;	// --output given on the command line before init
 
@@ -394,4 +405,8 @@ private:
 
 	CriticalSection lock_;
 	CriticalSection save_lock_;
+
+	// BetterFxSound: a device notification is queued for the message thread (onSoundDeviceChange). Set on
+	// the IMMNotificationClient thread, so repeated notifications are handled once.
+	std::atomic<bool> device_change_posted_ { false };
 };

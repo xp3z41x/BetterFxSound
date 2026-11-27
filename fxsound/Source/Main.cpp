@@ -98,7 +98,9 @@ public:
         if (main_window_.get() != nullptr)
         {
             FxController::getInstance().autoSaveModifiedPreset();
-            FxController::getInstance().stopTimer();
+            // BetterFxSound: stops the timer and detaches the controller from the engine first, so a device
+            // notification or a queued call during the engine's teardown never reaches it.
+            FxController::getInstance().detachAudioPassthru();
 
             audio_passthru_.reset();
 
