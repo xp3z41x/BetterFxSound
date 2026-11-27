@@ -823,7 +823,7 @@ void FxController::init(FxMainWindow* main_window, FxSystemTrayView* system_tray
 		{
 			RegDeleteTree(HKEY_CURRENT_USER, L"Software\\DFX");
 
-			FxModel::getModel().pushMessage(" ", { TRANS("Click here to see what's new on this version!"), "https://www.fxsound.com/changelog" });
+			FxModel::getModel().pushMessage(" ", { TRANS("Click here to see what's new on this version!"), "https://github.com/xp3z41x/BetterFxSound/releases" });
 
 			settings_.setString("version", app_version);
 			settings_.setBool("run_minimized", false);
@@ -2579,19 +2579,8 @@ void FxController::setAutoUpdates(bool enable)
 
 void FxController::checkUpdates()
 {
-	if (!isAudioProcessing())
-	{
-		auto current_time = std::time(nullptr);
-		uint32_t last_update_time = settings_.getInt("last_update_time", 0);
-
-		if ((current_time - last_update_time) > (24 * 60 * 60))
-		{
-			settings_.setInt("last_update_time", static_cast<uint32_t>(current_time));
-
-			ChildProcess child_process;
-			child_process.start("updater.exe /silent");
-		}
-	}
+	// BetterFxSound does not ship the official FxSound updater (updater.exe), which would
+	// "update" to official FxSound. New versions are published on GitHub Releases instead.
 }
 
 void FxController::saveWindowPosition(int x, int y)

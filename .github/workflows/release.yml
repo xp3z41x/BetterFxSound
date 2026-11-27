@@ -1,0 +1,218 @@
+name: Release
+
+# Builds the BetterFxSound x64 installer (Installer/BetterFxSound.iss, Inno Setup).
+# - workflow_dispatch: build + smoke test, upload the installer as an artifact.
+# - tag push v*: the same, then publish a GitHub pre-release for the tag with the
+#   installer attached and Installer/release-notes/<tag>.md as the notes.
+# The version comes from fxsound/FxSound.jucer; a tag must match it (v<version>).
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version
+        id: version
+        shell: pwsh
+        run: |
+          $jucer = [xml](Get-Content fxsound\FxSound.jucer -Raw)
+          $version = $jucer.JUCERPROJECT.version
+          if (-not $version) { throw "No version in fxsound/FxSound.jucer" }
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$version") {
+            throw "Tag $env:GITHUB_REF_NAME does not match the app version $version in fxsound/FxSound.jucer"
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+          Write-Host "BetterFxSound $version"
+
+      # Same app build as windows-build.yml. The projects expect JUCE at C:\JUCE.
+      - name: Fetch JUCE 9.0.5
+        shell: pwsh
+        run: git clone --depth 1 --branch 9.0.5 https://github.com/juce-framework/JUCE.git C:\JUCE
+
+      - uses: microsoft/setup-msbuild@v2
+
+      - name: Build FxSound (x64 Release)
+        shell: pwsh
+        run: >
+          msbuild fxsound\Project\FxSound.sln
+          /m /nologo /v:minimal
+          /p:Configuration=Release
+          /p:Platform=x64
+
+      # fxdiag.vcxproj targets v143; the runner's Visual Studio has v145. Its post-build
+      # step copies fxdiag.exe to bin\x64\.
+      - name: Build fxdiag (x64 Release)
+        shell: pwsh
+        run: >
+          msbuild fxdiag\fxdiag.sln
+          /m /nologo /v:minimal
+          /p:Configuration=Release
+          /p:Platform=x64
+          /p:PlatformToolset=v145
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: fxmcp/go.mod
+          cache-dependency-path: fxmcp/go.sum
+
+      - name: Build fxmcp (x64)
+        shell: pwsh
+        run: .\fxmcp\build.ps1 -Platforms x64
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup -y --no-progress
+            if ($LASTEXITCODE -ne 0) { throw "choco install innosetup failed" }
+          }
+          if (-not (Test-Path $iscc)) { throw "ISCC.exe not found at $iscc" }
+          "ISCC=$iscc" >> $env:GITHUB_ENV
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $exe = Resolve-Path fxsound\Project\x64\Release\App\FxSound.exe
+          $ver = (Get-Item $exe).VersionInfo.ProductVersion
+          Write-Host "FxSound.exe product version: $ver"
+          if ($ver -ne '${{ steps.version.outputs.version }}') { throw "FxSound.exe reports version $ver" }
+          & $env:ISCC `
+            /DAppVersion=${{ steps.version.outputs.version }} `
+            "/DFxSoundExe=$exe" `
+            "/DFxDiagExe=$(Resolve-Path bin\x64\fxdiag.exe)" `
+            "/DFxMcpExe=$(Resolve-Path bin\x64\fxmcp.exe)" `
+            "/DOutputDir=$PWD\dist" `
+            Installer\BetterFxSound.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
+          Get-ChildItem dist | ForEach-Object {
+            (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower() + "  " + $_.Name | Out-File -Encoding ascii "$($_.FullName).sha256"
+          }
+          Get-ChildItem dist | Format-Table Name, Length
+
+      # Installs the official FxSound (the copy in release\), then runs the BetterFxSound
+      # installer silently over it and checks the replacement, the files and that the
+      # user's data survives. The driver step runs too: a CI runner may be unable to
+      # install the virtual audio driver, so its outcome is reported, not asserted.
+      - name: Smoke test (replace official FxSound, install, uninstall)
+        shell: pwsh
+        timeout-minutes: 20
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $setup = (Get-ChildItem dist -Filter *-setup.exe).FullName
+          $logs = New-Item -ItemType Directory -Force smoke-logs
+          $appDir = Join-Path $env:ProgramFiles 'BetterFxSound'
+          $arpKey = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{D55BD9F9-D5A8-4ADF-8A83-B49AF7CC30D9}_is1'
+          function Find-Official {
+            foreach ($root in 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall') {
+              Get-ChildItem $root -ErrorAction SilentlyContinue | Get-ItemProperty -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -eq 'FxSound' }
+            }
+          }
+          function Assert($cond, $msg) { if (-not $cond) { throw "FAILED: $msg" } else { Write-Host "ok: $msg" } }
+
+          # User data that must survive everything below.
+          $presets = New-Item -ItemType Directory -Force "$env:APPDATA\FxSound\Presets"
+          Copy-Item Installer\Resources\Factsoft\1.fac "$presets\SmokeTest.fac"
+          New-Item -Force 'HKCU:\SOFTWARE\DFX' | Out-Null
+          Set-ItemProperty 'HKCU:\SOFTWARE\DFX' -Name SmokeTest -Value 'keep'
+
+          Write-Host "::group::Install official FxSound"
+          $p = Start-Process release\fxsound_setup.exe -ArgumentList '/exenoui','/qn','/norestart','/l*v',"`"$logs\official-install.log`"" -PassThru
+          if (-not $p.WaitForExit(600000)) { throw "official FxSound install timed out" }
+          Write-Host "official installer exit code: $($p.ExitCode)"
+          Start-Sleep 5
+          Get-Process FxSound -ErrorAction SilentlyContinue | Format-Table Id, Path
+          Write-Host "::endgroup::"
+          $official = Find-Official
+          Assert ($null -ne $official) "official FxSound is installed ($($official.DisplayVersion))"
+
+          Write-Host "::group::Install BetterFxSound over it"
+          $p = Start-Process $setup -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',"/LOG=`"$logs\install.log`"" -PassThru
+          if (-not $p.WaitForExit(600000)) { throw "BetterFxSound install timed out" }
+          Write-Host "setup exit code: $($p.ExitCode)"
+          Write-Host "::endgroup::"
+          Write-Host "::group::Setup log: replacement and driver steps"
+          Select-String -Path "$logs\install.log" -Pattern 'Official FxSound|Run: |Driver|FxSound Audio Enhancer|SKIPDRIVER|stale' | ForEach-Object Line
+          Write-Host "::endgroup::"
+          Assert ($p.ExitCode -eq 0) "setup exited with 0"
+          Assert ($null -eq (Find-Official)) "official FxSound uninstall entry is gone"
+          Assert (-not (Test-Path "$env:ProgramFiles\FxSound LLC\FxSound\FxSound.exe")) "official FxSound.exe is gone"
+          Assert ((Get-Item "$appDir\FxSound.exe").VersionInfo.ProductVersion -eq '${{ steps.version.outputs.version }}') "FxSound.exe ${{ steps.version.outputs.version }} installed"
+          foreach ($f in 'fxdiag.exe','fxmcp.exe','LICENSE.txt','Apps\DfxSetupDrv.exe','Drivers\win10\x64\fxdevcon64.exe','Drivers\win10\x64\fxvad.inf','Drivers\win10\x64\fxvad.sys','Drivers\win10\x64\fxvadntamd64.cat') {
+            Assert (Test-Path "$appDir\$f") "$f installed"
+          }
+          Assert ((Get-ChildItem "$appDir\Factsoft" -Filter *.fac).Count -ge 13) "built-in presets installed"
+          Assert (Test-Path "$env:ProgramData\FxSound\FxSound.settings") "machine default settings installed"
+          $arp = Get-ItemProperty $arpKey
+          Assert ($arp.DisplayName -eq 'BetterFxSound' -and $arp.DisplayVersion -eq '${{ steps.version.outputs.version }}' -and $arp.Publisher -eq 'BetterFxSound') "uninstall entry BetterFxSound ${{ steps.version.outputs.version }}"
+          Assert (Test-Path "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp\BetterFxSound.lnk") "Startup shortcut"
+          Assert (Test-Path "$presets\SmokeTest.fac") "user preset kept after replacing official FxSound"
+          Assert ((Get-ItemProperty 'HKCU:\SOFTWARE\DFX').SmokeTest -eq 'keep') "HKCU\SOFTWARE\DFX kept after replacing official FxSound"
+
+          Write-Host "::group::Uninstall BetterFxSound"
+          $p = Start-Process "$appDir\unins000.exe" -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',"/LOG=`"$logs\uninstall.log`"" -PassThru
+          $p.WaitForExit()
+          # The uninstaller re-launches itself from %TEMP%; wait for its entry to go.
+          $deadline = (Get-Date).AddMinutes(5)
+          while ((Test-Path $arpKey) -and (Get-Date) -lt $deadline) { Start-Sleep 2 }
+          Select-String -Path "$logs\uninstall.log" -Pattern 'Run: |SKIPDRIVER' -ErrorAction SilentlyContinue | ForEach-Object Line
+          Write-Host "::endgroup::"
+          Assert (-not (Test-Path $arpKey)) "uninstall entry removed"
+          Assert (-not (Test-Path "$appDir\FxSound.exe")) "FxSound.exe removed"
+          Assert (Test-Path "$presets\SmokeTest.fac") "user preset kept after uninstall"
+          Assert ((Get-ItemProperty 'HKCU:\SOFTWARE\DFX').SmokeTest -eq 'keep') "HKCU\SOFTWARE\DFX kept after uninstall"
+
+      - name: Upload smoke test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-test-logs
+          path: smoke-logs\
+          if-no-files-found: ignore
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BetterFxSound-${{ steps.version.outputs.version }}-x64-setup
+          path: dist\
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: BetterFxSound-${{ needs.build.outputs.version }}-x64-setup
+          path: dist
+
+      - name: Create pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          notes="Installer/release-notes/${TAG}.md"
+          if [ ! -f "$notes" ]; then echo "Missing $notes"; exit 1; fi
+          gh release create "$TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --prerelease \
+            --title "BetterFxSound $VERSION" \
+            --notes-file "$notes"

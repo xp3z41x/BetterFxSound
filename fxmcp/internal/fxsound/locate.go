@@ -75,15 +75,25 @@ func fileExists(path string) bool {
 }
 
 // candidateDirs returns install directories to probe, in priority order:
-// the installer's default Program Files location(s) (see
+// fxmcp.exe's own directory, the BetterFxSound installer's default
+// location (Installer/BetterFxSound.iss), the official installer's default
+// Program Files location(s) (see
 // Installer/fxsound.aip: Manufacturer="FxSound LLC", ProductName="FxSound"),
 // then any directory reported by the Windows uninstall registry for
 // FxSound, which covers a custom install directory chosen during setup.
 func candidateDirs() []string {
 	var dirs []string
+	// fxmcp.exe is installed next to FxSound.exe, so its own directory is
+	// the most reliable place to look (covers the BetterFxSound installer's
+	// %ProgramFiles%\BetterFxSound and any custom install directory).
+	if exe, err := os.Executable(); err == nil {
+		dirs = append(dirs, filepath.Dir(exe))
+	}
 	for _, envVar := range []string{"ProgramFiles", "ProgramFiles(x86)"} {
 		if base := os.Getenv(envVar); base != "" {
-			dirs = append(dirs, filepath.Join(base, "FxSound LLC", "FxSound"))
+			dirs = append(dirs,
+				filepath.Join(base, "BetterFxSound"),
+				filepath.Join(base, "FxSound LLC", "FxSound"))
 		}
 	}
 	dirs = append(dirs, registryInstallDirs()...)
@@ -119,7 +129,7 @@ func registryInstallDirs() []string {
 				continue
 			}
 			displayName, _, err := sk.GetStringValue("DisplayName")
-			if err == nil && displayName == "FxSound" {
+			if err == nil && (displayName == "FxSound" || displayName == "BetterFxSound") {
 				if loc, _, err := sk.GetStringValue("InstallLocation"); err == nil && loc != "" {
 					dirs = append(dirs, loc)
 				}
