@@ -152,6 +152,25 @@ public:
 	int getMainOutputDelay();
 	void setMainOutputDelay(int delay_ms);
 
+	// BetterFxSound outputs rework (docs/OUTPUTS_REWORK.md): one flat list of outputs, no "main"
+	// output from the UI's point of view. Every output can be enabled or disabled; zero enabled
+	// outputs means silence. These are the only output APIs the UI should use.
+	struct OutputState {
+		String id;			// Endpoint ID string (SoundDevice::pwszID)
+		String name;		// Friendly name
+		bool enabled = false;
+		bool present = true;	// False for an enabled output whose device is not connected now
+		int volume_percent = 100;	// 0 to 100, fine trim on top of the Windows master volume
+		int delay_ms = 0;			// 0 to 500
+		OutputChannelMode channel_mode = OutputChannelMode::Both;
+	};
+	std::vector<OutputState> getOutputs();
+	void setOutputEnabled(const String& id, bool enabled);
+	void setOutputVolume(const String& id, int volume_percent);
+	void setOutputDelay(const String& id, int delay_ms);
+	void setOutputChannelMode(const String& id, OutputChannelMode channel_mode);
+	int getEnabledOutputCount();
+
 	// BetterFxSound: automatic delay sync with the microphone.
 	bool startDelayCalibration();
 	void cancelDelayCalibration();

@@ -3215,3 +3215,33 @@ String FxController::FormatString(const String& format, const String& arg)
 
 	return String(buffer);
 }
+
+// ---------------------------------------------------------------------------------------------
+// BetterFxSound outputs rework: CONTRACT STUBS (docs/OUTPUTS_REWORK.md).
+// The "Backend - controller" session replaces this whole block with the real implementation.
+// ---------------------------------------------------------------------------------------------
+std::vector<FxController::OutputState> FxController::getOutputs()
+{
+	return {};
+}
+
+void FxController::setOutputEnabled(const String& /*id*/, bool /*enabled*/)
+{
+}
+
+void FxController::setOutputVolume(const String& /*id*/, int /*volume_percent*/)
+{
+}
+
+void FxController::setOutputDelay(const String& /*id*/, int /*delay_ms*/)
+{
+}
+
+void FxController::setOutputChannelMode(const String& /*id*/, OutputChannelMode /*channel_mode*/)
+{
+}
+
+int FxController::getEnabledOutputCount()
+{
+	return 0;
+}
