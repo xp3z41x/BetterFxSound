@@ -71,6 +71,9 @@ private:
 	// Recomputes the carrier settings and the additional outputs from the requested outputs and the
 	// current carrier. Called after every change and after every reinit (the carrier may have changed).
 	void applyAdditionalOutputs();
+	// Puts the own level and mute back on every present device that is owed them (OwedVolume.h) and is not in
+	// in_use, the devices the engine drives right now. UI/timer thread, never under config_mutex_ (COM calls).
+	void handBackUnusedDevices(const std::vector<std::wstring>& in_use);
 	bool isDevicePresent(const std::wstring& device_id) const;
 	bool isProcessing() const;
 
@@ -88,7 +91,7 @@ private:
 	bool b_no_valid_snd_device_dialog_shown_; /* Flag stating whether we have shown the user a message to select a valid snd device.  We only want it shown once per session. */
 	int debug_;
 	std::vector<SoundDevice> sound_devices_;
-	bool mute_;
+	bool mute_ = false;
 	DfxDsp *p_dfx_dsp_;
 	static AudioPassthruCallback *s_callback_;
 

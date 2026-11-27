@@ -20,6 +20,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "u_AudioPassthru.h"
 #include "sndDevices.h"
 #include "MasterVolume.h"
+#include "OwedVolume.h"
 #include <algorithm>
 #include <cstring>
 
@@ -77,6 +78,9 @@ AudioPassthruPrivate::~AudioPassthruPrivate()
 	/* Change the default soundcard to not be the DFX virtual one but instead the proper real one */
 	if (sndDevicesRestoreDefaultDevice(hp_sndDevices_, &i_result_flag) != OKAY)
 		return;
+
+	/* BetterFxSound: anything still owed to a present device goes back on it at exit */
+	handBackUnusedDevices(std::vector<std::wstring>());
 
 	/*
 	* Disable the virtual soundcard
@@ -718,6 +722,9 @@ void AudioPassthruPrivate::restoreDefaultPlaybackDevice()
 	/* Change the default soundcard to not be the DFX virtual one but instead the proper real one */
 	if (sndDevicesRestoreDefaultDevice(hp_sndDevices_, &i_resultFlag) != OKAY)
 		return;
+
+	/* BetterFxSound: anything still owed (a device that was away when it was handed back, or left by a crash) */
+	handBackUnusedDevices(std::vector<std::wstring>());
 }
 
 int AudioPassthruPrivate::setTargetedRealPlaybackDevice(const std::wstring sound_device_guid)
@@ -816,6 +823,9 @@ void AudioPassthruPrivate::applyAdditionalOutputs()
 	const std::wstring dfx_id(wcp_dfx_guid);
 	const bool processing = isProcessing();
 	std::wstring set_full_volume_id;	// Carrier device to set to 100% and unmute, after the lock is released
+	float carrier_own_level = 1.0f;		// And its own setting, recorded as owed before that
+	BOOL carrier_own_mute = FALSE;
+	std::vector<std::wstring> in_use;	// Devices the engine drives now: what is owed to them stays owed
 
 	{
 		std::lock_guard<std::mutex> lock(config_mutex_);
@@ -897,6 +907,8 @@ void AudioPassthruPrivate::applyAdditionalOutputs()
 		{
 			carrier_full_volume_id_ = carrier_id;
 			set_full_volume_id = carrier_id;
+			carrier_own_level = s_sndDevices_.savedPlaybackLevel;
+			carrier_own_mute = s_sndDevices_.savedPlaybackMute;
 		}
 
 		/* The measurement relies on the output order, keep it stable while it runs. processTimer() applies the
@@ -911,14 +923,47 @@ void AudioPassthruPrivate::applyAdditionalOutputs()
 			effective_outputs_ = effective;
 			multi_output_.configure(effective);
 		}
+
+		/* The carrier while it plays (its device is FxSound's), and every output the router has: each of those
+		   takes its device over and hands it back itself. */
+		if (carrier_plays && processing && !handed_back_)
+			in_use.push_back(carrier_id);
+		for (const auto& output : effective_outputs_)
+			in_use.push_back(output.device_id);
 	}
 
 	/*
 	* COM calls, outside the lock. The change is tagged with this app's GUID, so the playback volume callback
 	* does not take it for the user's own mute setting (the one handed back when FxSound stops driving the device).
+	* The device's own setting is recorded as owed first (kept if one is owed already: the reinit then saved it
+	* from the record, see sndDevicesInitialSetupPlaybackDevice()), so it survives an unplug or a crash.
 	*/
 	if (!set_full_volume_id.empty())
+	{
+		owedVolumeRecord(set_full_volume_id, carrier_own_level, carrier_own_mute);
 		setDeviceFullVolumeById(set_full_volume_id, &s_sndDevices_.guidThisApplication);
+	}
+
+	/* A device the engine no longer uses (output turned off while it is the carrier, back after an unplug, left at
+	   100% by a crash) gets its own setting back. */
+	handBackUnusedDevices(in_use);
+}
+
+/*
+* FUNCTION: handBackUnusedDevices()
+* DESCRIPTION: BetterFxSound. Puts the own level and mute back on every present device that is owed them and that
+* the engine does not drive now. Cheap when nothing is owed: one registry read.
+*/
+void AudioPassthruPrivate::handBackUnusedDevices(const std::vector<std::wstring>& in_use)
+{
+	for (const auto& id : owedVolumeDevices())
+	{
+		if (std::find(in_use.begin(), in_use.end(), id) != in_use.end())
+			continue;
+		if (!isDevicePresent(id))
+			continue;
+		handBackOwedVolumeById(id);
+	}
 }
 
 /*
