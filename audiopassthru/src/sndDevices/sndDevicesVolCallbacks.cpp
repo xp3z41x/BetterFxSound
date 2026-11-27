@@ -30,14 +30,13 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include <Functiondiscoverykeys_devpkey.h>
 #include <mmdeviceapi.h>
 #include <endpointvolume.h>
+#include <atomic>
 
 #include "slout.h"
 #include "mry.h"
 #include "u_sndDevices.h"
 #include "sndDevices.h"
 #include "MasterVolume.h"
-
-#include <atomic>
 
 // BetterFxSound: master volume of the FxSound virtual device as a linear gain, mute included.
 // Starts at unity until the first read in sndDevicesReInit().
