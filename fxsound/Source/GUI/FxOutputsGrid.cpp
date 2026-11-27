@@ -95,10 +95,14 @@ FxOutputSettingsPanel::FxOutputSettingsPanel(const FxController::OutputState& ou
 
 	applyTheme();
 	setSize(WIDTH, HEIGHT);
+
+	FxModel::getModel().addListener(this);
 }
 
 FxOutputSettingsPanel::~FxOutputSettingsPanel()
 {
+	FxModel::getModel().removeListener(this);
+
 	// The callout can be closed in the middle of an edit, keep the last delay shown.
 	if (static_cast<int>(delay_slider_.getValue()) != output_.delay_ms)
 		saveDelay();
@@ -110,6 +114,40 @@ void FxOutputSettingsPanel::show(const FxController::OutputState& output, Compon
 	auto panel = std::make_unique<FxOutputSettingsPanel>(output);
 	panel->onChanged = std::move(on_changed);
 	CallOutBox::launchAsynchronously(std::move(panel), target.getScreenBounds(), nullptr);
+}
+
+void FxOutputSettingsPanel::modelChanged(FxModel::Event model_event)
+{
+	if (model_event != FxModel::Event::OutputListUpdated)
+		return;
+
+	for (auto& output : FxController::getInstance().getOutputs())
+	{
+		if (output.id != output_.id)
+			continue;
+
+		// Leave a slider alone while the user drags it, the drag sets the value anyway.
+		if (!volume_slider_.isMouseButtonDown())
+		{
+			output_.volume_percent = output.volume_percent;
+			volume_slider_.setValue(output.volume_percent, NotificationType::dontSendNotification);
+		}
+		if (!delay_slider_.isMouseButtonDown())
+		{
+			output_.delay_ms = output.delay_ms;
+			delay_slider_.setValue(output.delay_ms, NotificationType::dontSendNotification);
+		}
+		output_.channel_mode = output.channel_mode;
+		channel_list_.setSelectedId(static_cast<int>(output.channel_mode) + 1, NotificationType::dontSendNotification);
+		output_.enabled = output.enabled;
+		output_.present = output.present;
+		return;
+	}
+
+	// The output is not listed anymore (a disabled device was unplugged): close the panel.
+	// dismiss() is asynchronous, so the panel is not deleted while the model notifies.
+	if (auto* callout = findParentComponentOfClass<CallOutBox>())
+		callout->dismiss();
 }
 
 void FxOutputSettingsPanel::setupSlider(Slider& slider, double max_value, double interval, const String& suffix)
@@ -232,7 +270,7 @@ void FxOutputsGrid::Tile::setOutput(const FxController::OutputState& output)
 
 	String tooltip = output_.name;
 	if (!output_.present)
-		tooltip += "\n" + TRANS("Not connected");
+		tooltip += "\n" + TRANS("Disconnected, this output does not play");
 	toggle_.setTooltip(tooltip);
 
 	repaint();
@@ -241,7 +279,7 @@ void FxOutputsGrid::Tile::setOutput(const FxController::OutputState& output)
 String FxOutputsGrid::Tile::getSummary() const
 {
 	if (!output_.present)
-		return TRANS("Not connected");
+		return TRANS("Disconnected");
 
 	return String(output_.volume_percent) + " %" + getSeparator()
 		+ String(output_.delay_ms) + " ms" + getSeparator()
@@ -353,6 +391,44 @@ FxOutputsGrid::~FxOutputsGrid()
 String FxOutputsGrid::getMutedNotice()
 {
 	return TRANS("No output enabled") + String(CharPointer_UTF8(" \xe2\x80\x94 ")) + TRANS("sound is muted");
+}
+
+String FxOutputsGrid::getDisconnectedNotice()
+{
+	return TRANS("Enabled outputs are disconnected") + String(CharPointer_UTF8(" \xe2\x80\x94 ")) + TRANS("sound is muted");
+}
+
+String FxOutputsGrid::getSilenceNotice(const Counts& counts)
+{
+	if (counts.enabled == 0)
+		return getMutedNotice();
+	if (counts.playing == 0)
+		return getDisconnectedNotice();
+	return {};
+}
+
+FxOutputsGrid::Counts FxOutputsGrid::countOutputs(const std::vector<FxController::OutputState>& outputs)
+{
+	Counts counts;
+	for (auto& output : outputs)
+	{
+		counts.total++;
+		if (output.enabled)
+		{
+			counts.enabled++;
+			if (output.present)
+				counts.playing++;
+		}
+	}
+	return counts;
+}
+
+FxOutputsGrid::Counts FxOutputsGrid::getCounts() const
+{
+	std::vector<FxController::OutputState> outputs;
+	for (auto& tile : tiles_)
+		outputs.push_back(tile->getOutput());
+	return countOutputs(outputs);
 }
 
 String FxOutputsGrid::getChannelModeText(OutputChannelMode channel_mode)
@@ -543,10 +619,10 @@ FxOutputsPopup::FxOutputsPopup() : tooltip_window_(this)
 
 void FxOutputsPopup::updateNotice()
 {
-	auto enabled_count = FxController::getInstance().getEnabledOutputCount();
-	if (enabled_count == 0)
+	auto silence_notice = FxOutputsGrid::getSilenceNotice(grid_.getCounts());
+	if (silence_notice.isNotEmpty())
 	{
-		notice_.setText(FxOutputsGrid::getMutedNotice(), NotificationType::dontSendNotification);
+		notice_.setText(silence_notice, NotificationType::dontSendNotification);
 		notice_.setColour(Label::ColourIds::textColourId, getThemeColour(FxColor::InvalidTextBorder));
 	}
 	else
@@ -609,12 +685,14 @@ FxOutputsButton::FxOutputsButton() : Button("outputsButton")
 
 void FxOutputsButton::updateText()
 {
-	auto enabled_count = FxController::getInstance().getEnabledOutputCount();
-	muted_ = (enabled_count == 0);
+	// Count what really plays: an enabled output that is disconnected is silent.
+	auto counts = FxOutputsGrid::countOutputs(FxController::getInstance().getOutputs());
+	muted_ = (counts.playing == 0);
 	if (muted_)
 		setButtonText(TRANS("Outputs: muted"));
 	else
-		setButtonText(TRANS("Outputs") + " (" + String(enabled_count) + ")");
+		setButtonText(TRANS("Outputs") + " (" + String(counts.playing) + ")");
+	setTooltip(muted_ ? FxOutputsGrid::getSilenceNotice(counts) : TRANS("Choose the devices that play the sound"));
 	repaint();
 }
 

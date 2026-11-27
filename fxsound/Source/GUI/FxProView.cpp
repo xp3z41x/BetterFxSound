@@ -153,18 +153,18 @@ void FxProView::outputsChanged()
 
 void FxProView::updateOutputsNotice()
 {
-	auto& controller = FxController::getInstance();
-	auto enabled_count = controller.getEnabledOutputCount();
-	auto output_count = outputs_grid_.getOutputCount();
+	// "Playing" means enabled and connected: enabled outputs that are disconnected are silent.
+	auto counts = outputs_grid_.getCounts();
+	auto silence_notice = FxOutputsGrid::getSilenceNotice(counts);
 
 	auto error_colour = Colour(FXCOLOR(InvalidTextBorder)).withAlpha(1.0f);
 	auto text_colour = Colour(FXCOLOR(DefaultText)).withAlpha(1.0f);
 
 	String notice;
 	Colour colour = text_colour;
-	if (enabled_count == 0 && !isTimerRunning())
+	if (silence_notice.isNotEmpty() && !isTimerRunning())
 	{
-		notice = FxOutputsGrid::getMutedNotice();
+		notice = silence_notice;
 		colour = error_colour;
 	}
 	else if (output_error_)
@@ -178,7 +178,7 @@ void FxProView::updateOutputsNotice()
 	}
 	else
 	{
-		notice = TRANS("%1 of %2 outputs playing").replace("%1", String(enabled_count)).replace("%2", String(output_count));
+		notice = TRANS("%1 of %2 outputs playing").replace("%1", String(counts.playing)).replace("%2", String(counts.total));
 		colour = text_colour.withAlpha(0.7f);
 	}
 
@@ -194,7 +194,8 @@ void FxProView::updateOutputsNotice()
 	}
 
 	sync_button_.setButtonText(isTimerRunning() ? TRANS("Cancel sync") : TRANS("Sync delays with microphone"));
-	sync_button_.setEnabled(isTimerRunning() || enabled_count > 0);
+	// Calibration measures the enabled outputs that are connected.
+	sync_button_.setEnabled(isTimerRunning() || counts.playing > 0);
 }
 
 void FxProView::onSyncClicked()
