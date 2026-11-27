@@ -22,9 +22,12 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #endif //WIN32
 #include "AudioPassthru.h"
 #include "sndDevices.h"
+#include "MultiOutput.h"
+#include "DelayCalibration.h"
 #include <Mmdeviceapi.h>
 #include <vector> 
 #include <map>
+#include <atomic>
 
 class DspProcessingModule
 {
@@ -52,8 +55,20 @@ public:
     bool isPlaybackDeviceAvailable();
 	bool checkDeviceChanges();
 	void restoreDefaultPlaybackDevice();
+	void setAdditionalOutputs(const std::vector<AdditionalOutputConfig>& outputs);
+	void setMainOutputChannelMode(OutputChannelMode mode);
+	void setMainOutputDelay(int delay_ms);
+	bool startDelayCalibration();
+	void cancelDelayCalibration();
+	int getDelayCalibrationState(int* progress_percent);
+	std::vector<DelayCalibrationResult> getDelayCalibrationResults();
+	std::wstring getDelayCalibrationError();
 
 private:
+	void applyMainDelay(float* buffer, UINT32 frames, UINT32 channels, UINT32 sample_rate);
+
+	void applyAdditionalOutputs();
+
 	int sndDeviceHandleToSoundDevices(bool active_devices = true);
 	static void onDeviceChange();
 
@@ -71,5 +86,24 @@ private:
 	bool mute_;
 	DfxDsp *p_dfx_dsp_;
 	static AudioPassthruCallback *s_callback_;
+
+	// BetterFxSound: additional outputs, as requested by the UI and as currently applied.
+	std::vector<AdditionalOutputConfig> additional_outputs_;
+	MultiOutputRouter multi_output_;
+	std::atomic<int> main_channel_mode_{ 0 };	// OutputChannelMode of the main output
+
+	// Main output delay line (processing thread only, except main_delay_ms_).
+	static constexpr UINT32 kMainDelayFrames = 1u << 16;	// ~1.36 s at 48 kHz
+	static constexpr UINT32 kMainDelayChannels = 8;
+	std::atomic<int> main_delay_ms_{ 0 };
+	std::vector<float> main_delay_buffer_;
+	UINT32 main_delay_write_ = 0;
+	UINT32 main_delay_format_ = 0;
+
+	// Delay measurement. While it runs only one output plays: -1 = main, k = additional output k.
+	// solo_ is declared before calibration_ so it outlives the measurement thread that sets it.
+	std::atomic<int> solo_{ DelayCalibration::kSoloNone };
+	std::vector<AdditionalOutputConfig> effective_outputs_;	// As passed to multi_output_
+	DelayCalibration calibration_;
 };
 

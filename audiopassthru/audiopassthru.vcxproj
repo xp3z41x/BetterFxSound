@@ -224,6 +224,8 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="src\AudioPassthru\AudioPassthru.cpp" />
+    <ClCompile Include="src\MultiOutput\MultiOutput.cpp" />
+    <ClCompile Include="src\MultiOutput\DelayCalibration.cpp" />
     <ClCompile Include="src\AudioPassthru\AudioPassthruPrivate.cpp" />
     <ClCompile Include="src\FILE\FileDate.cpp" />
     <ClCompile Include="src\FILE\FileGeneral.cpp" />
@@ -274,6 +276,8 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="include\AudioPassthru.h" />
+    <ClInclude Include="include\MultiOutput.h" />
+    <ClInclude Include="include\DelayCalibration.h" />
     <ClInclude Include="include\codedefs.h" />
     <ClInclude Include="include\File.h" />
     <ClInclude Include="include\mry.h" />

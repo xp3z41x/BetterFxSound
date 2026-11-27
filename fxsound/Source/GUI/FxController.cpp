@@ -20,6 +20,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
 #include "FxController.h"
+#include <algorithm>
 #include "FxMainWindow.h"
 #include "FxSystemTrayView.h"
 #include "FxMessage.h"
@@ -739,6 +740,7 @@ void FxController::init(FxMainWindow* main_window, FxSystemTrayView* system_tray
 		audio_passthru_->setDspProcessingModule(&dfx_dsp_);
 		output_devices_ = audio_passthru_->getSoundDevices(false);
 		initOutputs(output_devices_);
+		applyAdditionalOutputs();
 
 		if (!dfx_enabled_ && !SysInfo::isRemoteSession())
 		{
@@ -2825,6 +2827,232 @@ bool FxController::isNewOutputPrioritized()
 void FxController::setNewOutputPrioritized(bool prioritize)
 {
 	settings_.setBool("prioritize_new_output", prioritize);
+}
+
+// BetterFxSound: the additional outputs are stored as a JSON array of
+// { "id": <endpoint id>, "delay_ms": <0..500>, "volume": <0..100>, "channel_mode": <0..3> } objects.
+std::vector<AdditionalOutputConfig> FxController::getAdditionalOutputs()
+{
+	std::vector<AdditionalOutputConfig> outputs;
+
+	auto json = settings_.getJson("additional_outputs");
+	if (auto* array = json.getArray())
+	{
+		for (auto& item : *array)
+		{
+			auto id = item.getProperty("id", "").toString();
+			if (id.isEmpty())
+				continue;
+
+			AdditionalOutputConfig output;
+			output.device_id = id.toWideCharPointer();
+			output.delay_ms = jlimit(0, 500, static_cast<int>(item.getProperty("delay_ms", 0)));
+			output.channel_mode = static_cast<OutputChannelMode>(jlimit(0, 3, static_cast<int>(item.getProperty("channel_mode", 0))));
+			output.volume_percent = jlimit(0, 100, static_cast<int>(item.getProperty("volume", 100)));
+			outputs.push_back(output);
+		}
+	}
+
+	return outputs;
+}
+
+void FxController::setAdditionalOutput(const String& device_id, bool enabled, int delay_ms, int volume_percent, OutputChannelMode channel_mode)
+{
+	if (device_id.isEmpty())
+		return;
+
+	auto outputs = getAdditionalOutputs();
+	auto id = std::wstring(device_id.toWideCharPointer());
+
+	outputs.erase(std::remove_if(outputs.begin(), outputs.end(),
+		[&id](const AdditionalOutputConfig& output) { return output.device_id == id; }), outputs.end());
+
+	if (enabled)
+	{
+		AdditionalOutputConfig output;
+		output.device_id = id;
+		output.delay_ms = jlimit(0, 500, delay_ms);
+		output.volume_percent = jlimit(0, 100, volume_percent);
+		output.channel_mode = channel_mode;
+		outputs.push_back(output);
+	}
+
+	Array<var> array;
+	for (const auto& output : outputs)
+	{
+		auto* object = new DynamicObject();
+		object->setProperty("id", String(output.device_id.c_str()));
+		object->setProperty("delay_ms", output.delay_ms);
+		object->setProperty("volume", output.volume_percent);
+		object->setProperty("channel_mode", static_cast<int>(output.channel_mode));
+		array.add(var(object));
+	}
+	settings_.setJson("additional_outputs", var(array));
+
+	applyAdditionalOutputs();
+}
+
+OutputChannelMode FxController::getMainOutputChannelMode()
+{
+	return static_cast<OutputChannelMode>(jlimit(0, 3, settings_.getInt("main_output_channel_mode", 0)));
+}
+
+void FxController::setMainOutputChannelMode(OutputChannelMode channel_mode)
+{
+	settings_.setInt("main_output_channel_mode", static_cast<int>(channel_mode));
+	applyAdditionalOutputs();
+}
+
+int FxController::getMainOutputDelay()
+{
+	return jlimit(0, 500, settings_.getInt("main_output_delay_ms", 0));
+}
+
+void FxController::setMainOutputDelay(int delay_ms)
+{
+	settings_.setInt("main_output_delay_ms", jlimit(0, 500, delay_ms));
+	applyAdditionalOutputs();
+}
+
+bool FxController::startDelayCalibration()
+{
+	return audio_passthru_ != nullptr && audio_passthru_->startDelayCalibration();
+}
+
+void FxController::cancelDelayCalibration()
+{
+	if (audio_passthru_ != nullptr)
+		audio_passthru_->cancelDelayCalibration();
+}
+
+int FxController::getDelayCalibrationState(int* progress_percent)
+{
+	if (audio_passthru_ == nullptr)
+		return 0;
+	return audio_passthru_->getDelayCalibrationState(progress_percent);
+}
+
+String FxController::getDelayCalibrationError()
+{
+	if (audio_passthru_ == nullptr)
+		return {};
+	return String(audio_passthru_->getDelayCalibrationError().c_str());
+}
+
+String FxController::applyDelayCalibrationResults()
+{
+	if (audio_passthru_ == nullptr)
+		return {};
+
+	auto results = audio_passthru_->getDelayCalibrationResults();
+	if (results.empty())
+		return TRANS("Nothing was measured.");
+
+	// The first result is always the main output.
+	auto main_id = results.front().device_id;
+	auto outputs = getAdditionalOutputs();
+
+	auto deviceName = [](const std::wstring& id) {
+		for (auto& device : FxModel::getModel().getOutputDevices())
+		{
+			if (device.pwszID == id)
+				return String(device.deviceFriendlyName.c_str());
+		}
+		return String(id.c_str());
+	};
+
+	auto currentDelay = [&](const std::wstring& id) {
+		if (id == main_id)
+			return getMainOutputDelay();
+		for (auto& output : outputs)
+		{
+			if (output.device_id == id)
+				return output.delay_ms;
+		}
+		return 0;
+	};
+
+	if (!results.front().measured)
+		return TRANS("The main output could not be heard clearly, so no delay was changed. Turn the volume up, move the microphone closer and try again.");
+
+	// Each measurement includes the delay the output already had. Remove it to get the output's
+	// own latency, then delay every output so they all match the slowest one.
+	double slowest = 0.0;
+	for (auto& result : results)
+	{
+		if (result.measured)
+			slowest = jmax(slowest, result.latency_ms - currentDelay(result.device_id));
+	}
+
+	StringArray lines;
+	StringArray not_heard;
+	bool clamped = false;
+
+	for (auto& result : results)
+	{
+		auto name = deviceName(result.device_id);
+		if (!result.measured)
+		{
+			not_heard.add(name);
+			continue;
+		}
+
+		auto own_latency = result.latency_ms - currentDelay(result.device_id);
+		auto delay = roundToInt(slowest - own_latency);
+		if (delay > 500)
+		{
+			delay = 500;
+			clamped = true;
+		}
+		delay = jmax(0, delay);
+
+		if (result.device_id == main_id)
+		{
+			settings_.setInt("main_output_delay_ms", delay);
+		}
+		else
+		{
+			for (auto& output : outputs)
+			{
+				if (output.device_id == result.device_id)
+					output.delay_ms = delay;
+			}
+		}
+
+		lines.add(name + ": " + String(delay) + " ms");
+	}
+
+	// Save the additional outputs with their new delays.
+	Array<var> array;
+	for (const auto& output : outputs)
+	{
+		auto* object = new DynamicObject();
+		object->setProperty("id", String(output.device_id.c_str()));
+		object->setProperty("delay_ms", output.delay_ms);
+		object->setProperty("volume", output.volume_percent);
+		object->setProperty("channel_mode", static_cast<int>(output.channel_mode));
+		array.add(var(object));
+	}
+	settings_.setJson("additional_outputs", var(array));
+
+	applyAdditionalOutputs();
+
+	String summary = TRANS("Delays set:") + " " + lines.joinIntoString(", ") + ".";
+	if (not_heard.size() > 0)
+		summary += " " + TRANS("Not heard clearly, left unchanged:") + " " + not_heard.joinIntoString(", ") + ".";
+	if (clamped)
+		summary += " " + TRANS("Some devices differ by more than 500 ms, the maximum delay.");
+	return summary;
+}
+
+void FxController::applyAdditionalOutputs()
+{
+	if (audio_passthru_ != nullptr)
+	{
+		audio_passthru_->setAdditionalOutputs(getAdditionalOutputs());
+		audio_passthru_->setMainOutputChannelMode(getMainOutputChannelMode());
+		audio_passthru_->setMainOutputDelay(getMainOutputDelay());
+	}
 }
 
 FxThemeMode FxController::getThemeMode()

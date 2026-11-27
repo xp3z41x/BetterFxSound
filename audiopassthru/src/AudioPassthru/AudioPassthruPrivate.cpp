@@ -19,6 +19,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 //#include "stdafx.h"
 #include "u_AudioPassthru.h"
 #include "sndDevices.h"
+#include <algorithm>
+#include <cstring>
 
 #define DFXG_SND_SERVER_KILL_THREAD_TIMEOUT_MSECS		  3000
 #define DFXG_SND_SERVER_KILL_THREAD_WAIT_PER_LOOP_MSECS   50
@@ -37,6 +39,7 @@ AudioPassthruCallback* AudioPassthruPrivate::s_callback_ = nullptr;
 AudioPassthruPrivate::AudioPassthruPrivate()
 {
 	hp_sndDevices_ = (PT_HANDLE *)&(s_sndDevices_);
+	main_delay_buffer_.assign((size_t)kMainDelayFrames * kMainDelayChannels, 0.0f);
 	//hp_sndDevices_ = hp_sndDevices;
 	hProcessingThread_ = NULL;
 	ProcessingThreadID_ = (DWORD)0;
@@ -53,6 +56,10 @@ AudioPassthruPrivate::~AudioPassthruPrivate()
 
 	if (hp_sndDevices_ == NULL)
 		return;
+
+	/* BetterFxSound: stop a running delay measurement and close the additional outputs first */
+	calibration_.cancel();
+	multi_output_.stopAll();
 
 	/* If the processing thread is running, kill it */
 	if (killProcessingThread(&i_timed_out) != OKAY)
@@ -437,6 +444,9 @@ int AudioPassthruPrivate::processTimer()
 		if ((numRealDevices > 0) && (DfxDeviceEnabledFlag == IS_TRUE))
 		{
 			hProcessingThread_ = CreateThread(NULL, 0, processingThread, (LPVOID)this, 0L, &ProcessingThreadID_);
+
+			/* BetterFxSound: the main output may have changed, re-check the additional outputs against it */
+			applyAdditionalOutputs();
 		}
 		else
 		{
@@ -547,6 +557,30 @@ DWORD AudioPassthruPrivate::threadWorker(void)
 				p_dfx_dsp_->processAudio((short int *)fp_buffer, (short int *)fp_buffer, numSampleSets, i_check_for_duplicate_buffers);
 			}
 
+			/*
+			* BetterFxSound: queue the processed block for the additional outputs. This copies the
+			* data and never blocks, so it has to happen here, before sndDevicesDoPlayback() reuses
+			* the buffer for upsampling.
+			*/
+			if (!mute_)
+			{
+				multi_output_.write(fp_buffer, (UINT32)numSampleSets, pwfx->nChannels, pwfx->nSamplesPerSec, solo_.load(std::memory_order_relaxed));
+			}
+
+			/* BetterFxSound: optional channel mode for the main output (left only, right only or mono) */
+			applyOutputChannelMode(fp_buffer, (UINT32)numSampleSets, pwfx->nChannels,
+				static_cast<OutputChannelMode>(main_channel_mode_.load(std::memory_order_relaxed)));
+
+			/* BetterFxSound: optional delay for the main output */
+			applyMainDelay(fp_buffer, (UINT32)numSampleSets, pwfx->nChannels, pwfx->nSamplesPerSec);
+
+			/* BetterFxSound: while an additional output is being measured, the main output is silent */
+			{
+				int solo = solo_.load(std::memory_order_relaxed);
+				if (solo >= 0)
+					memset(fp_buffer, 0, sizeof(float) * (size_t)numSampleSets * pwfx->nChannels);
+			}
+
 			/* Check if thread has been signaled to end */
 			if (i_kill_processing_thread_)
 				goto KillProcessingThread;
@@ -654,4 +688,157 @@ int AudioPassthruPrivate::setTargetedRealPlaybackDevice(const std::wstring sound
 		return(NOT_OKAY);
 
 	return(OKAY);
+}
+/*
+* FUNCTION: setAdditionalOutputs()
+* DESCRIPTION: BetterFxSound. Stores the additional outputs requested by the UI and applies them.
+*/
+void AudioPassthruPrivate::setAdditionalOutputs(const std::vector<AdditionalOutputConfig>& outputs)
+{
+	additional_outputs_ = outputs;
+	applyAdditionalOutputs();
+}
+
+/*
+* FUNCTION: applyAdditionalOutputs()
+* DESCRIPTION: BetterFxSound. Opens the requested additional outputs, leaving out the device that is
+* currently the main output (it already plays the audio) and the FxSound virtual device (playing
+* into it would feed the output back into the capture).
+*/
+void AudioPassthruPrivate::applyAdditionalOutputs()
+{
+	int i_resultFlag;
+	wchar_t wcp_targeted_guid[PT_MAX_GENERIC_STRLEN];
+	wchar_t wcp_dfx_guid[PT_MAX_GENERIC_STRLEN];
+
+	wcp_targeted_guid[0] = L'\0';
+	wcp_dfx_guid[0] = L'\0';
+
+	if (sndDevicesGetID(hp_sndDevices_, SND_DEVICES_TARGETED_REAL_PLAYBACK, wcp_targeted_guid, &i_resultFlag) != OKAY)
+		wcp_targeted_guid[0] = L'\0';
+	if (sndDevicesGetID(hp_sndDevices_, SND_DEVICES_VIRTUAL_PLAYBACK_DFX, wcp_dfx_guid, &i_resultFlag) != OKAY)
+		wcp_dfx_guid[0] = L'\0';
+
+	std::vector<AdditionalOutputConfig> effective;
+	for (const auto& output : additional_outputs_)
+	{
+		if (output.device_id.empty())
+			continue;
+		if (output.device_id == wcp_targeted_guid || output.device_id == wcp_dfx_guid)
+			continue;
+		effective.push_back(output);
+	}
+
+	/* The measurement relies on the output order, keep it stable while it runs */
+	if (calibration_.getState(NULL) == DelayCalibration::State::Running)
+		return;
+
+	effective_outputs_ = effective;
+	multi_output_.configure(effective);
+}
+
+/*
+* FUNCTION: setMainOutputChannelMode()
+* DESCRIPTION: BetterFxSound. Selects which channels the main output plays.
+*/
+void AudioPassthruPrivate::setMainOutputChannelMode(OutputChannelMode mode)
+{
+	main_channel_mode_.store(static_cast<int>(mode), std::memory_order_relaxed);
+}
+
+/*
+* FUNCTION: setMainOutputDelay()
+* DESCRIPTION: BetterFxSound. Sets the extra delay of the main output.
+*/
+void AudioPassthruPrivate::setMainOutputDelay(int delay_ms)
+{
+	if (delay_ms < 0) delay_ms = 0;
+	if (delay_ms > 500) delay_ms = 500;
+	main_delay_ms_.store(delay_ms, std::memory_order_relaxed);
+}
+
+/*
+* FUNCTION: applyMainDelay()
+* DESCRIPTION: BetterFxSound. Delays the main output in place. Processing thread only, no allocation.
+* With a delay of 0 the audio passes through unchanged.
+*/
+void AudioPassthruPrivate::applyMainDelay(float* buffer, UINT32 frames, UINT32 channels, UINT32 sample_rate)
+{
+	if (buffer == NULL || channels == 0 || channels > kMainDelayChannels || sample_rate == 0 || main_delay_buffer_.empty())
+		return;
+
+	// A new format invalidates what is stored, start over with silence.
+	UINT32 format = (sample_rate << 4) | channels;
+	if (format != main_delay_format_)
+	{
+		std::fill(main_delay_buffer_.begin(), main_delay_buffer_.end(), 0.0f);
+		main_delay_write_ = 0;
+		main_delay_format_ = format;
+	}
+
+	UINT32 delay_frames = (UINT32)((UINT64)main_delay_ms_.load(std::memory_order_relaxed) * sample_rate / 1000);
+	if (delay_frames >= kMainDelayFrames)
+		delay_frames = kMainDelayFrames - 1;
+
+	const UINT32 mask = kMainDelayFrames - 1;
+	for (UINT32 i = 0; i < frames; i++)
+	{
+		float* frame = buffer + (size_t)i * channels;
+		float* slot_in = &main_delay_buffer_[(size_t)(main_delay_write_ & mask) * kMainDelayChannels];
+		memcpy(slot_in, frame, sizeof(float) * channels);
+		const float* slot_out = &main_delay_buffer_[(size_t)((main_delay_write_ - delay_frames) & mask) * kMainDelayChannels];
+		memcpy(frame, slot_out, sizeof(float) * channels);
+		main_delay_write_++;
+	}
+}
+
+/*
+* FUNCTION: startDelayCalibration()
+* DESCRIPTION: BetterFxSound. Starts measuring the delay of every active output with the microphone.
+*/
+bool AudioPassthruPrivate::startDelayCalibration()
+{
+	int i_resultFlag;
+	wchar_t wcp_targeted_guid[PT_MAX_GENERIC_STRLEN];
+	wchar_t wcp_dfx_guid[PT_MAX_GENERIC_STRLEN];
+
+	if (sndDevicesGetID(hp_sndDevices_, SND_DEVICES_TARGETED_REAL_PLAYBACK, wcp_targeted_guid, &i_resultFlag) != OKAY)
+		wcp_targeted_guid[0] = L'\0';
+	if (sndDevicesGetID(hp_sndDevices_, SND_DEVICES_VIRTUAL_PLAYBACK_DFX, wcp_dfx_guid, &i_resultFlag) != OKAY)
+		wcp_dfx_guid[0] = L'\0';
+
+	if (wcp_dfx_guid[0] == L'\0' || wcp_targeted_guid[0] == L'\0')
+		return false;
+
+	std::vector<DelayCalibration::Target> targets;
+	DelayCalibration::Target main_target = { std::wstring(wcp_targeted_guid), -1 };
+	targets.push_back(main_target);
+	for (size_t i = 0; i < effective_outputs_.size(); i++)
+	{
+		DelayCalibration::Target target = { effective_outputs_[i].device_id, (int)i };
+		targets.push_back(target);
+	}
+
+	std::atomic<int>* solo = &solo_;
+	return calibration_.start(std::wstring(wcp_dfx_guid), targets, [solo](int index) { solo->store(index, std::memory_order_relaxed); });
+}
+
+void AudioPassthruPrivate::cancelDelayCalibration()
+{
+	calibration_.cancel();
+}
+
+int AudioPassthruPrivate::getDelayCalibrationState(int* progress_percent)
+{
+	return (int)calibration_.getState(progress_percent);
+}
+
+std::vector<DelayCalibrationResult> AudioPassthruPrivate::getDelayCalibrationResults()
+{
+	return calibration_.getResults();
+}
+
+std::wstring AudioPassthruPrivate::getDelayCalibrationError()
+{
+	return calibration_.getError();
 }
