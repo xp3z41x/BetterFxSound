@@ -483,8 +483,8 @@ void FxMainWindow::showMenu()
 	};
 
 	auto checkForUpdatesClicked = []() {
-		ChildProcess child_process;
-		child_process.start("updater.exe /checknow");
+		URL url("https://github.com/xp3z41x/BetterFxSound/releases");
+		url.launchInDefaultBrowser();
 	};
 
 	auto donateClicked = []() {
