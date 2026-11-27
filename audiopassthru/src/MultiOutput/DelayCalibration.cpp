@@ -615,14 +615,20 @@ void DelayCalibration::run()
 			return true;
 		};
 
-		// Why the streams stopped: a cancel by the user, an abort with its reason, or a device error.
+		// Why the streams stopped: a cancel by the user (back to Idle), an abort with its reason, or a device error.
 		auto stopped = [&]()
 		{
 			std::wstring reason;
 			if (cancel_.load())
 			{
 				std::lock_guard<std::mutex> lock(mutex_);
-				reason = abort_reason_.empty() ? std::wstring(L"Cancelled.") : abort_reason_;
+				if (abort_reason_.empty())
+				{
+					error_ = L"Cancelled.";
+					state_.store(static_cast<int>(State::Idle));
+					return;
+				}
+				reason = abort_reason_;
 			}
 			else
 			{

@@ -126,7 +126,7 @@ public:
 
 	// BetterFxSound: measures the delay of every enabled output that is present (the carrier
 	// only if it is enabled) with the default microphone. Runs in the background; poll
-	// getDelayCalibrationState(). State: 0 idle, 1 running, 2 done, 3 failed.
+	// getDelayCalibrationState(). State: 0 idle (also after a cancel), 1 running, 2 done, 3 failed.
 	// Results have one entry per measured output, keyed by device_id, in no particular order.
 	// With nothing to measure (no output turned on, or none of them connected), or when the test
 	// sound could not be heard (FxSound not playing, Windows volume muted) the measurement fails at
