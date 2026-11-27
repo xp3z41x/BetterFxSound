@@ -741,7 +741,6 @@ void AudioPassthruPrivate::setOutputs(const std::vector<OutputConfig>& outputs)
 {
 	{
 		std::lock_guard<std::mutex> lock(config_mutex_);
-		legacy_mode_ = false;
 		outputs_ = outputs;
 	}
 	applyAdditionalOutputs();
@@ -811,57 +810,35 @@ void AudioPassthruPrivate::applyAdditionalOutputs()
 		return !isDevicePresent(id);
 	};
 
-	bool carrier_enabled;
-	int carrier_delay_ms;
-	OutputChannelMode carrier_channel_mode;
-	int carrier_volume_percent;
+	// The carrier's own entry decides whether it plays. Missing or disabled: it plays silence.
+	bool carrier_enabled = false;
+	int carrier_delay_ms = 0;
+	OutputChannelMode carrier_channel_mode = OutputChannelMode::Both;
+	int carrier_volume_percent = 100;
 
-	if (legacy_mode_)
+	for (const auto& output : outputs_)
 	{
-		carrier_enabled = true;
-		carrier_delay_ms = legacy_main_delay_ms_;
-		carrier_channel_mode = legacy_main_channel_mode_;
-		carrier_volume_percent = 100;
-
-		for (const auto& output : additional_outputs_)
+		if (!carrier_id.empty() && output.device_id == carrier_id && carrier_id != dfx_id)
 		{
-			if (excluded(output.device_id))
-				continue;
-			effective.push_back(output);
+			carrier_enabled = output.enabled;
+			carrier_delay_ms = output.delay_ms;
+			carrier_channel_mode = output.channel_mode;
+			carrier_volume_percent = output.volume_percent;
+			break;
 		}
 	}
-	else
+
+	for (const auto& output : outputs_)
 	{
-		carrier_enabled = false;
-		carrier_delay_ms = 0;
-		carrier_channel_mode = OutputChannelMode::Both;
-		carrier_volume_percent = 100;
+		if (!output.enabled || excluded(output.device_id))
+			continue;
 
-		// The carrier's own entry decides whether it plays. Missing or disabled: it plays silence.
-		for (const auto& output : outputs_)
-		{
-			if (!carrier_id.empty() && output.device_id == carrier_id && carrier_id != dfx_id)
-			{
-				carrier_enabled = output.enabled;
-				carrier_delay_ms = output.delay_ms;
-				carrier_channel_mode = output.channel_mode;
-				carrier_volume_percent = output.volume_percent;
-				break;
-			}
-		}
-
-		for (const auto& output : outputs_)
-		{
-			if (!output.enabled || excluded(output.device_id))
-				continue;
-
-			AdditionalOutputConfig config;
-			config.device_id = output.device_id;
-			config.delay_ms = output.delay_ms;
-			config.channel_mode = output.channel_mode;
-			config.volume_percent = output.volume_percent;
-			effective.push_back(config);
-		}
+		AdditionalOutputConfig config;
+		config.device_id = output.device_id;
+		config.delay_ms = output.delay_ms;
+		config.channel_mode = output.channel_mode;
+		config.volume_percent = output.volume_percent;
+		effective.push_back(config);
 	}
 
 	if (carrier_delay_ms < 0) carrier_delay_ms = 0;
@@ -935,7 +912,7 @@ void AudioPassthruPrivate::applyCarrierGain(float* buffer, UINT32 frames, UINT32
 
 /*
 * FUNCTION: applyMainDelay()
-* DESCRIPTION: BetterFxSound. Delays the main output in place. Processing thread only, no allocation.
+* DESCRIPTION: BetterFxSound. Delays the carrier in place. Processing thread only, no allocation.
 * With a delay of 0 the audio passes through unchanged.
 */
 void AudioPassthruPrivate::applyMainDelay(float* buffer, UINT32 frames, UINT32 channels, UINT32 sample_rate)

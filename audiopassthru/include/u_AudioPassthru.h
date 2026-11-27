@@ -94,19 +94,15 @@ private:
 	// BetterFxSound: requested outputs (UI/timer threads only, guarded by config_mutex_, never
 	// touched by the audio threads).
 	std::mutex config_mutex_;
-	bool legacy_mode_ = true;					// setOutputs() not called yet
-	std::vector<OutputConfig> outputs_;			// As passed to setOutputs()
-	std::vector<AdditionalOutputConfig> additional_outputs_;	// Legacy: as passed to setAdditionalOutputs()
-	int legacy_main_delay_ms_ = 0;
-	OutputChannelMode legacy_main_channel_mode_ = OutputChannelMode::Both;
+	std::vector<OutputConfig> outputs_;			// As passed to setOutputs(), carrier included
 	std::wstring pending_carrier_id_;			// Asked for by setAsPlaybackDevice(), until the next reinit
 	bool apply_pending_ = false;				// A change arrived during a measurement, apply it afterwards
 
 	MultiOutputRouter multi_output_;
 
 	// Carrier output, the device on the original low latency path. Written by the UI/timer threads,
-	// read by the processing thread.
-	std::atomic<bool> carrier_enabled_{ true };
+	// read by the processing thread. Silent until setOutputs() enables it, like an empty set of outputs.
+	std::atomic<bool> carrier_enabled_{ false };
 	std::atomic<float> carrier_trim_{ 1.0f };
 	std::atomic<int> main_channel_mode_{ 0 };	// OutputChannelMode of the carrier
 	float carrier_gain_ = 0.0f;					// Processing thread only: current, ramped gain
