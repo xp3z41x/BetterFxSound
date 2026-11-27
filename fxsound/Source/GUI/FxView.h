@@ -41,6 +41,9 @@ protected:
 	
     void showErrorNotification(bool show);
 
+	// Called on the message thread after the outputs or the output error state changed.
+	virtual void outputsChanged() {}
+
 	void comboBoxChanged(ComboBox* combobox) override;
 	void modelChanged(FxModel::Event model_event) override;
 
@@ -56,8 +59,12 @@ protected:
 	std::unique_ptr<Drawable> undo_image_;
 	std::unique_ptr<Drawable> undo_hover_image_;
 	FxComboBox preset_list_;
-	FxComboBox endpoint_list_;
     FxNotification error_notification_;
+
+	// The outputs control the error notification points at (set by the derived views), and
+	// whether FxSound can't play through its playback device (FxModel::Event::OutputError).
+	Component* output_anchor_ = nullptr;
+	bool output_error_ = false;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(FxView)
 };

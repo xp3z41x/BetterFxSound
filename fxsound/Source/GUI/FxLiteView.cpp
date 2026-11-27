@@ -21,8 +21,14 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "FxController.h"
 
 //==============================================================================
-FxLiteView::FxLiteView()
-{	
+FxLiteView::FxLiteView() : tool_tip_(this)
+{
+	outputs_button_.setSize(LIST_WIDTH, LIST_HEIGHT);
+	outputs_button_.setTitle(TRANS("Outputs"));
+	outputs_button_.addMouseListener(this, true);
+	addAndMakeVisible(outputs_button_);
+	output_anchor_ = &outputs_button_;
+
 	setOpaque(false);
 	setSize(WIDTH, HEIGHT);
 }
@@ -38,10 +44,27 @@ void FxLiteView::resized()
 	component_bounds.setY(LIST_Y);
 	preset_list_.setBounds(component_bounds);
 
-	component_bounds = endpoint_list_.getLocalBounds();
+	component_bounds = outputs_button_.getLocalBounds();
 	component_bounds.setX(OUTPUT_LIST_X);
 	component_bounds.setY(LIST_Y);
-	endpoint_list_.setBounds(component_bounds);
+	outputs_button_.setBounds(component_bounds);
+}
+
+void FxLiteView::outputsChanged()
+{
+	outputs_button_.updateText();
+	outputs_button_.setError(output_error_);
+}
+
+void FxLiteView::mouseEnter(const MouseEvent& mouse_event)
+{
+	FxView::mouseEnter(mouse_event);
+}
+
+void FxLiteView::mouseExit(const MouseEvent& mouse_event)
+{
+	// Re-evaluates the error notification once the mouse left the outputs button.
+	FxView::mouseEnter(mouse_event);
 }
 
 void FxLiteView::paint(Graphics& g)

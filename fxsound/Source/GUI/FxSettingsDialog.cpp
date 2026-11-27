@@ -95,12 +95,6 @@ FxSettingsDialog::SettingsComponent::SettingsComponent()
 	audio_button_->setImage(Drawable::createFromImageData(BinaryData::speaker_svg, BinaryData::speaker_svgSize).get());
 	audio_button_->addListener(this);
 
-	// BetterFxSound
-	outputs_button_ = std::make_unique<SettingsButton>("Outputs");
-	outputs_button_->setToggleState(false, NotificationType::dontSendNotification);
-	outputs_button_->setImage(Drawable::createFromImageData(BinaryData::speaker_svg, BinaryData::speaker_svgSize).get());
-	outputs_button_->addListener(this);
-
 	general_button_ = std::make_unique<SettingsButton>("General");
 	general_button_->setToggleState(false, NotificationType::dontSendNotification);
 	general_button_->setImage(Drawable::createFromImageData(BinaryData::settings_svg, BinaryData::settings_svgSize).get());
@@ -112,12 +106,10 @@ FxSettingsDialog::SettingsComponent::SettingsComponent()
 	help_button_->addListener(this);    
 
 	addAndMakeVisible(audio_button_.get());
-	addAndMakeVisible(outputs_button_.get());
 	addAndMakeVisible(general_button_.get());
 	addAndMakeVisible(help_button_.get());
 
 	addAndMakeVisible(audio_settings_pane_);
-	addChildComponent(outputs_settings_pane_);
 	addChildComponent(general_settings_pane_);
 	addChildComponent(help_settings_pane_);
 
@@ -127,13 +119,11 @@ FxSettingsDialog::SettingsComponent::SettingsComponent()
 void FxSettingsDialog::SettingsComponent::resized()
 {
 	audio_button_->setBounds(BUTTON_X, BUTTON_Y, BUTTON_WIDTH, BUTTON_HEIGHT);
-	outputs_button_->setBounds(BUTTON_X, audio_button_->getBottom() + 20, BUTTON_WIDTH, BUTTON_HEIGHT);
-	general_button_->setBounds(BUTTON_X, outputs_button_->getBottom() + 20, BUTTON_WIDTH, BUTTON_HEIGHT);
+	general_button_->setBounds(BUTTON_X, audio_button_->getBottom() + 20, BUTTON_WIDTH, BUTTON_HEIGHT);
 	help_button_->setBounds(BUTTON_X, general_button_->getBottom() + 20, BUTTON_WIDTH, BUTTON_HEIGHT);
 
 	juce::Rectangle<int> pane_rect(SEPARATOR_X + 1, 1, getWidth() - SEPARATOR_X + 1, getHeight() - 1);
 	audio_settings_pane_.setBounds(pane_rect);
-	outputs_settings_pane_.setBounds(pane_rect);
 	general_settings_pane_.setBounds(pane_rect);
 	help_settings_pane_.setBounds(pane_rect);
 }
@@ -148,7 +138,6 @@ void FxSettingsDialog::SettingsComponent::showPane(Button* button)
 	struct Entry { SettingsButton* button; Component* pane; };
 	Entry entries[] = {
 		{ audio_button_.get(), &audio_settings_pane_ },
-		{ outputs_button_.get(), &outputs_settings_pane_ },
 		{ general_button_.get(), &general_settings_pane_ },
 		{ help_button_.get(), &help_settings_pane_ },
 	};
@@ -338,339 +327,6 @@ void FxSettingsDialog::AudioSettingsPane::mouseEnter(const MouseEvent& mouse_eve
 void FxSettingsDialog::AudioSettingsPane::mouseExit(const MouseEvent& mouse_event)
 {
 	Component::mouseEnter(mouse_event);
-}
-
-// BetterFxSound: additional outputs pane.
-FxSettingsDialog::OutputsSettingsPane::OutputsSettingsPane() :
-	SettingsPane("Additional Outputs")
-{
-	setFocusContainerType(FocusContainerType::keyboardFocusContainer);
-
-	description_.setColour(Label::ColourIds::textColourId, getLookAndFeel().findColour(TextButton::textColourOnId));
-	description_.setJustificationType(Justification::topLeft);
-	description_.setMinimumHorizontalScale(1.0f);
-
-	empty_label_.setColour(Label::ColourIds::textColourId, getLookAndFeel().findColour(TextButton::textColourOnId).withAlpha(0.7f));
-	empty_label_.setJustificationType(Justification::centred);
-
-	viewport_.setViewedComponent(&rows_container_, false);
-	viewport_.setScrollBarsShown(true, false);
-
-	sync_button_.setMouseCursor(MouseCursor::PointingHandCursor);
-	sync_button_.onClick = [this]() { onSyncClicked(); };
-
-	sync_status_.setColour(Label::ColourIds::textColourId, getLookAndFeel().findColour(TextButton::textColourOnId));
-	sync_status_.setJustificationType(Justification::topLeft);
-	sync_status_.setMinimumHorizontalScale(1.0f);
-
-	setText();
-
-	addAndMakeVisible(description_);
-	addAndMakeVisible(sync_button_);
-	addAndMakeVisible(sync_status_);
-	addChildComponent(empty_label_);
-	addAndMakeVisible(viewport_);
-}
-
-FxSettingsDialog::OutputsSettingsPane::~OutputsSettingsPane()
-{
-	// Closing the settings while measuring stops the measurement.
-	if (isTimerRunning())
-	{
-		stopTimer();
-		FxController::getInstance().cancelDelayCalibration();
-	}
-}
-
-void FxSettingsDialog::OutputsSettingsPane::resized()
-{
-	auto bounds = getLocalBounds().withLeft(X_MARGIN).withTop(Y_MARGIN).withHeight(TITLE_HEIGHT);
-	title_.setBounds(bounds);
-
-	auto width = getWidth() - ((X_MARGIN + 5) * 2);
-	description_.setBounds(X_MARGIN, DESCRIPTION_Y, width, DESCRIPTION_HEIGHT);
-	sync_button_.setBounds(X_MARGIN, description_.getBottom() + 4, jmin(width, 260), SYNC_BUTTON_HEIGHT);
-	sync_status_.setBounds(X_MARGIN, sync_button_.getBottom() + 2, width, SYNC_STATUS_HEIGHT);
-
-	auto list_y = sync_status_.getBottom() + 4;
-	auto list_height = jmax(60, getHeight() - list_y - 20);
-	viewport_.setBounds(X_MARGIN, list_y, width, list_height);
-	empty_label_.setBounds(viewport_.getBounds());
-
-	int total_height = 0;
-	for (auto& row : rows_)
-		total_height += row->getPreferredHeight() + ROW_SPACING;
-
-	auto row_width = width;
-	if (total_height > list_height)
-		row_width = width - viewport_.getScrollBarThickness();
-
-	rows_container_.setSize(row_width, total_height);
-	int y = 0;
-	for (auto& row : rows_)
-	{
-		auto height = row->getPreferredHeight();
-		row->setBounds(0, y, row_width, height);
-		y += height + ROW_SPACING;
-	}
-}
-
-void FxSettingsDialog::OutputsSettingsPane::paint(Graphics& g)
-{
-	g.fillAll(getLookAndFeel().findColour(ResizableWindow::backgroundColourId));
-
-	setText();
-
-	SettingsPane::paint(g);
-}
-
-void FxSettingsDialog::OutputsSettingsPane::setText()
-{
-	auto& theme = dynamic_cast<FxTheme&>(LookAndFeel::getDefaultLookAndFeel());
-
-	description_.setFont(theme.getNormalFont().withHeight(13.0f));
-	description_.setText(TRANS("Play the enhanced sound on these devices at the same time as the main output. "
-		"Each device can have its own volume and play both channels, only the left or right one, or mono. "
-		"Use the delay to line the devices up, or let the microphone do it."), NotificationType::dontSendNotification);
-
-	sync_status_.setFont(theme.getNormalFont().withHeight(13.0f));
-	if (isTimerRunning())
-		sync_button_.setButtonText(TRANS("Cancel sync"));
-	else
-		sync_button_.setButtonText(TRANS("Sync delays with microphone"));
-
-	empty_label_.setFont(theme.getNormalFont().withHeight(14.0f));
-	empty_label_.setText(TRANS("No other output devices were found."), NotificationType::dontSendNotification);
-}
-
-void FxSettingsDialog::OutputsSettingsPane::visibilityChanged()
-{
-	if (isVisible() && !isTimerRunning())
-	{
-		rebuild();
-	}
-}
-
-void FxSettingsDialog::OutputsSettingsPane::onSyncClicked()
-{
-	auto& controller = FxController::getInstance();
-
-	if (isTimerRunning())
-	{
-		controller.cancelDelayCalibration();
-		return;
-	}
-
-	if (!controller.startDelayCalibration())
-	{
-		sync_status_.setText(TRANS("Sync could not start. Make sure FxSound is on and playing to a main output."), NotificationType::dontSendNotification);
-		return;
-	}
-
-	sync_status_.setText(TRANS("Measuring... Keep the room quiet, the beeps will play on each device in turn."), NotificationType::dontSendNotification);
-	rows_container_.setEnabled(false);
-	startTimer(200);
-	setText();
-}
-
-void FxSettingsDialog::OutputsSettingsPane::timerCallback()
-{
-	auto& controller = FxController::getInstance();
-	int progress = 0;
-	auto state = controller.getDelayCalibrationState(&progress);
-
-	if (state == 1)
-	{
-		sync_status_.setText(TRANS("Measuring... Keep the room quiet, the beeps will play on each device in turn.") + " " + String(progress) + "%", NotificationType::dontSendNotification);
-		return;
-	}
-
-	stopTimer();
-	rows_container_.setEnabled(true);
-
-	if (state == 2)
-	{
-		auto summary = controller.applyDelayCalibrationResults();
-		rebuild();
-		sync_status_.setText(summary, NotificationType::dontSendNotification);
-	}
-	else
-	{
-		sync_status_.setText(TRANS("Sync failed:") + " " + controller.getDelayCalibrationError(), NotificationType::dontSendNotification);
-	}
-
-	setText();
-}
-
-void FxSettingsDialog::OutputsSettingsPane::rebuild()
-{
-	auto& controller = FxController::getInstance();
-	auto additional_outputs = controller.getAdditionalOutputs();
-	auto main_channel_mode = controller.getMainOutputChannelMode();
-	auto main_output = FxModel::getModel().getSelectedOutput();
-
-	rows_.clear();
-
-	for (auto& device : FxModel::getModel().getOutputDevices())
-	{
-		if (!device.isRealDevice || device.isDFXDevice || device.pwszID.empty())
-			continue;
-
-		bool is_main = (device.pwszID == main_output.pwszID);
-		const AdditionalOutputConfig* config = nullptr;
-		for (auto& output : additional_outputs)
-		{
-			if (output.device_id == device.pwszID)
-				config = &output;
-		}
-
-		auto row = std::make_unique<OutputRow>(device, is_main, config, main_channel_mode);
-		row->onLayoutChanged = [this]() { resized(); };
-		rows_container_.addAndMakeVisible(row.get());
-		rows_.push_back(std::move(row));
-	}
-
-	empty_label_.setVisible(rows_.size() <= 1);
-	viewport_.setVisible(rows_.size() > 1);
-
-	resized();
-}
-
-FxSettingsDialog::OutputsSettingsPane::OutputRow::OutputRow(const SoundDevice& device, bool is_main_output, const AdditionalOutputConfig* config, OutputChannelMode main_channel_mode) :
-	device_id_(device.pwszID.c_str()),
-	is_main_output_(is_main_output)
-{
-	auto text_colour = getLookAndFeel().findColour(TextButton::textColourOnId);
-	auto name = String(device.deviceFriendlyName.c_str());
-	if (is_main_output_)
-		name += " " + TRANS("(main output)");
-
-	bool enabled = (config != nullptr);
-	int delay_ms = is_main_output_ ? FxController::getInstance().getMainOutputDelay() : (enabled ? config->delay_ms : 0);
-	int volume = enabled ? config->volume_percent : 100;
-	auto channel_mode = is_main_output_ ? main_channel_mode : (enabled ? config->channel_mode : OutputChannelMode::Both);
-
-	toggle_.setButtonText(name);
-	toggle_.setColour(ToggleButton::ColourIds::tickColourId, text_colour);
-	toggle_.setColour(ToggleButton::ColourIds::textColourId, text_colour);
-	toggle_.setMouseCursor(MouseCursor::PointingHandCursor);
-	toggle_.setWantsKeyboardFocus(true);
-	toggle_.setToggleState(is_main_output_ || enabled, NotificationType::dontSendNotification);
-	toggle_.setEnabled(!is_main_output_);
-	toggle_.onClick = [this]() {
-		updateControlsState();
-		save();
-		if (onLayoutChanged)
-			onLayoutChanged();
-	};
-
-	// Item ids are OutputChannelMode + 1 (ComboBox ids must not be 0).
-	channel_list_.addItem(TRANS("Both channels"), static_cast<int>(OutputChannelMode::Both) + 1);
-	channel_list_.addItem(TRANS("Left only"), static_cast<int>(OutputChannelMode::Left) + 1);
-	channel_list_.addItem(TRANS("Right only"), static_cast<int>(OutputChannelMode::Right) + 1);
-	channel_list_.addItem(TRANS("Mono"), static_cast<int>(OutputChannelMode::Mono) + 1);
-	channel_list_.setSelectedId(static_cast<int>(channel_mode) + 1, NotificationType::dontSendNotification);
-	channel_list_.setMouseCursor(MouseCursor::PointingHandCursor);
-	channel_list_.setTooltip(TRANS("Which channels this device plays"));
-	channel_list_.onChange = [this]() { save(); };
-
-	delay_label_.setText(TRANS("Delay"), NotificationType::dontSendNotification);
-	delay_label_.setColour(Label::ColourIds::textColourId, text_colour);
-	delay_label_.setJustificationType(Justification::centredLeft);
-	setupSlider(delay_slider_, 500.0, " ms", text_colour);
-	delay_slider_.setValue(delay_ms, NotificationType::dontSendNotification);
-	delay_slider_.onDragEnd = [this]() { save(); };
-	delay_slider_.onValueChange = [this]() {
-		// Typed values and arrow keys do not produce a drag end, save those right away.
-		if (!delay_slider_.isMouseButtonDown())
-			save();
-	};
-
-	volume_label_.setText(TRANS("Volume"), NotificationType::dontSendNotification);
-	volume_label_.setColour(Label::ColourIds::textColourId, text_colour);
-	volume_label_.setJustificationType(Justification::centredLeft);
-	setupSlider(volume_slider_, 100.0, " %", text_colour);
-	volume_slider_.setValue(volume, NotificationType::dontSendNotification);
-	// Volume is applied live while dragging so it can be set by ear.
-	volume_slider_.onValueChange = [this]() { save(); };
-
-	addAndMakeVisible(toggle_);
-	addAndMakeVisible(channel_list_);
-	addAndMakeVisible(delay_label_);
-	addAndMakeVisible(delay_slider_);
-	addAndMakeVisible(volume_label_);
-	addAndMakeVisible(volume_slider_);
-
-	updateControlsState();
-}
-
-void FxSettingsDialog::OutputsSettingsPane::OutputRow::setupSlider(Slider& slider, double max_value, const String& suffix, Colour text_colour)
-{
-	slider.setSliderStyle(Slider::SliderStyle::LinearHorizontal);
-	slider.setTextBoxStyle(Slider::TextBoxRight, false, 70, 20);
-	slider.setRange(0.0, max_value, max_value > 100.0 ? 5.0 : 1.0);
-	slider.setTextValueSuffix(suffix);
-	slider.setColour(Slider::ColourIds::textBoxTextColourId, text_colour);
-	slider.setMouseCursor(MouseCursor::PointingHandCursor);
-}
-
-int FxSettingsDialog::OutputsSettingsPane::OutputRow::getPreferredHeight() const
-{
-	// Name line, plus delay (main and active outputs) and volume (active additional outputs).
-	if (is_main_output_)
-		return 8 + LINE_HEIGHT * 2;
-	return 8 + LINE_HEIGHT * (toggle_.getToggleState() ? 3 : 1);
-}
-
-void FxSettingsDialog::OutputsSettingsPane::OutputRow::resized()
-{
-	auto bounds = getLocalBounds().reduced(8, 4);
-
-	auto top = bounds.removeFromTop(LINE_HEIGHT);
-	channel_list_.setBounds(top.removeFromRight(120).reduced(0, 2));
-	toggle_.setBounds(top.withTrimmedRight(6));
-
-	auto delay_bounds = bounds.removeFromTop(LINE_HEIGHT).withTrimmedLeft(28);
-	delay_label_.setBounds(delay_bounds.removeFromLeft(60));
-	delay_slider_.setBounds(delay_bounds);
-
-	auto volume_bounds = bounds.removeFromTop(LINE_HEIGHT).withTrimmedLeft(28);
-	volume_label_.setBounds(volume_bounds.removeFromLeft(60));
-	volume_slider_.setBounds(volume_bounds);
-}
-
-void FxSettingsDialog::OutputsSettingsPane::OutputRow::paint(Graphics& g)
-{
-	g.setColour(Colour(FXCOLOR(DefaultFill)).withAlpha(0.2f));
-	g.fillRoundedRectangle(getLocalBounds().toFloat(), 6.0f);
-}
-
-void FxSettingsDialog::OutputsSettingsPane::OutputRow::updateControlsState()
-{
-	bool active = is_main_output_ || toggle_.getToggleState();
-	bool show_volume = !is_main_output_ && toggle_.getToggleState();
-
-	channel_list_.setVisible(active);
-	delay_label_.setVisible(active);
-	delay_slider_.setVisible(active);
-	volume_label_.setVisible(show_volume);
-	volume_slider_.setVisible(show_volume);
-}
-
-void FxSettingsDialog::OutputsSettingsPane::OutputRow::save()
-{
-	auto channel_mode = static_cast<OutputChannelMode>(jlimit(0, 3, channel_list_.getSelectedId() - 1));
-	auto& controller = FxController::getInstance();
-
-	if (is_main_output_)
-	{
-		controller.setMainOutputChannelMode(channel_mode);
-		controller.setMainOutputDelay(static_cast<int>(delay_slider_.getValue()));
-		return;
-	}
-
-	controller.setAdditionalOutput(device_id_, toggle_.getToggleState(),
-		static_cast<int>(delay_slider_.getValue()), static_cast<int>(volume_slider_.getValue()), channel_mode);
 }
 
 FxSettingsDialog::GeneralSettingsPane::GeneralSettingsPane() :

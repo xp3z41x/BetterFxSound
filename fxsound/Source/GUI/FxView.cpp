@@ -38,18 +38,6 @@ FxView::FxView() : undo_button_("presetUndoButton", DrawableButton::ButtonStyle:
 	preset_list_.addListener(this);
 	preset_list_.addMouseListener(this, true);
 
-	endpoint_list_.setJustificationType(Justification::centredLeft);
-	endpoint_list_.setTextWhenNoChoicesAvailable(L"");
-	endpoint_list_.setSize(LIST_WIDTH, LIST_HEIGHT);
-	endpoint_list_.setDescription(TRANS("Playback Device List"));
-	endpoint_list_.setWantsKeyboardFocus(true);
-	addAndMakeVisible(&endpoint_list_);
-	endpoint_list_.addListener(this);
-	endpoint_list_.addMouseListener(this, true);
-	endpoint_list_.onShowPopup = []() {
-		FxController::getInstance().checkDeviceChanges();
-		};
-
     addChildComponent(&error_notification_);
 }
 
@@ -64,8 +52,14 @@ void FxView::showErrorNotification(bool show)
     {
         error_notification_.setMessage(TRANS("FxSound is unable to play processed audio through the selected output device.\nAnother application could be using it in exclusive mode or the device could be\ndisconnected. To disable exclusive mode follow these "),
             { TRANS("steps."), "https://www.fxsound.com/learning-center/no-sound-with-fxsound-realtek" });
-        auto component_bounds = endpoint_list_.getBounds();
-        auto x = component_bounds.getX() - (FxNotification::MAX_WIDTH - component_bounds.getWidth());
+        if (output_anchor_ == nullptr)
+        {
+            return;
+        }
+
+        // Right aligned under the outputs control, as it was under the old output dropdown.
+        auto component_bounds = getLocalArea(output_anchor_->getParentComponent(), output_anchor_->getBounds());
+        auto x = jmax(0, component_bounds.getRight() - FxNotification::MAX_WIDTH);
         component_bounds.setX(x);
         component_bounds.setY(component_bounds.getBottom() + 5);
         component_bounds.setWidth(FxNotification::MAX_WIDTH);
@@ -106,60 +100,26 @@ void FxView::comboBoxChanged(ComboBox* combobox)
 		{
 			FxController::getInstance().setPreset(index);
 		}
-		else if (combobox == &endpoint_list_)
-		{
-			FxController::getInstance().setOutput(index, false);
-		}
 	}
 }
 
 void FxView::modelChanged(FxModel::Event model_event)
 {
+	// BetterFxSound outputs rework: the outputs grid refreshes itself on OutputListUpdated,
+	// the views only update their notices. OutputSelected is not used anymore.
 	if (model_event == FxModel::Event::OutputListUpdated)
 	{
-		auto output_devices = FxModel::getModel().getOutputDevices();
-
-		endpoint_list_.clear(NotificationType::dontSendNotification);
-		int id = 1;
-		for (auto device : output_devices)
-		{
-			endpoint_list_.addItem(device.deviceFriendlyName.c_str(), id);
-			if (device.deviceNumChannel < 2)
-			{
-				endpoint_list_.setItemEnabled(id, false);
-			}
-
-			id++;
-		}
-	}
-
-	if (model_event == FxModel::Event::OutputSelected)
-	{
-		endpoint_list_.setSelectedId(FxModel::getModel().getSelectedOutputIndex() + 1, NotificationType::dontSendNotification);
-
-        if (endpoint_list_.getError())
-        {
-            showErrorNotification(true);
-        }
-        else
-        {
-            showErrorNotification(false);
-        }
+		outputsChanged();
 	}
 
     if (model_event == FxModel::Event::OutputError)
     {
-        if (!FxController::getInstance().isPlaybackDeviceAvailable())
+        output_error_ = !FxController::getInstance().isPlaybackDeviceAvailable();
+        if (!output_error_)
         {
-            endpoint_list_.setItemEnabled(FxModel::getModel().getSelectedOutputIndex() + 1, false);
-            endpoint_list_.setError(true);
-        }
-        else
-        {
-            endpoint_list_.setItemEnabled(FxModel::getModel().getSelectedOutputIndex() + 1, true);
-            endpoint_list_.setError(false);
             error_notification_.setVisible(false);
         }
+        outputsChanged();
     }
 	
 	if (model_event == FxModel::Event::PresetSelected)
@@ -227,9 +187,9 @@ void FxView::modelChanged(FxModel::Event model_event)
 void FxView::mouseEnter(const MouseEvent&)
 {
 	preset_list_.highlightText(preset_list_.isMouseOver(true));
-	endpoint_list_.highlightText(endpoint_list_.isMouseOver(true));
 
-    if (endpoint_list_.getError() && (endpoint_list_.isMouseOver(true) || error_notification_.isMouseOver(true)))
+    auto anchor_hovered = output_anchor_ != nullptr && output_anchor_->isMouseOver(true);
+    if (output_error_ && (anchor_hovered || error_notification_.isMouseOver(true)))
     {   
         showErrorNotification(true);
     }
@@ -242,5 +202,4 @@ void FxView::mouseEnter(const MouseEvent&)
 void FxView::mouseExit(const MouseEvent&)
 {
 	preset_list_.highlightText(preset_list_.isMouseOver(true));
-	endpoint_list_.highlightText(endpoint_list_.isMouseOver(true));
 }

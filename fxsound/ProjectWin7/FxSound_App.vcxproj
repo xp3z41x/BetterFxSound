@@ -277,6 +277,7 @@ copy $(TargetDir)$(TargetName).pdb ..\..\bin\$(PlatformTarget)\Win7\ /y</Command
     <ClCompile Include="..\Source\GUI\FxDrawable.cpp" />
     <ClCompile Include="..\Source\GUI\FxAudioControls.cpp" />
     <ClCompile Include="..\Source\GUI\FxOutputPreference.cpp" />
+    <ClCompile Include="..\Source\GUI\FxOutputsGrid.cpp" />
     <ClCompile Include="..\Source\GUI\FxAudioSlider.cpp" />
     <ClCompile Include="..\Source\GUI\FxBalanceSlider.cpp" />
     <ClCompile Include="..\Source\GUI\FxPresetNameEditor.cpp" />
@@ -1593,6 +1594,7 @@ copy $(TargetDir)$(TargetName).pdb ..\..\bin\$(PlatformTarget)\Win7\ /y</Command
     <ClInclude Include="..\Source\GUI\FxDrawable.h" />
     <ClInclude Include="..\Source\GUI\FxAudioControls.h" />
     <ClInclude Include="..\Source\GUI\FxOutputPreference.h" />
+    <ClInclude Include="..\Source\GUI\FxOutputsGrid.h" />
     <ClInclude Include="..\Source\GUI\FxAudioSlider.h" />
     <ClInclude Include="..\Source\GUI\FxBalanceSlider.h" />
     <ClInclude Include="..\Source\GUI\FxPresetNameEditor.h" />
