@@ -563,6 +563,10 @@ DWORD AudioPassthruPrivate::threadWorker(void)
 				multi_output_.write(fp_buffer, (UINT32)numSampleSets, pwfx->nChannels, pwfx->nSamplesPerSec);
 			}
 
+			/* BetterFxSound: optional channel mode for the main output (left only, right only or mono) */
+			applyOutputChannelMode(fp_buffer, (UINT32)numSampleSets, pwfx->nChannels,
+				static_cast<OutputChannelMode>(main_channel_mode_.load(std::memory_order_relaxed)));
+
 			/* Check if thread has been signaled to end */
 			if (i_kill_processing_thread_)
 				goto KillProcessingThread;
@@ -712,4 +716,13 @@ void AudioPassthruPrivate::applyAdditionalOutputs()
 	}
 
 	multi_output_.configure(effective);
+}
+
+/*
+* FUNCTION: setMainOutputChannelMode()
+* DESCRIPTION: BetterFxSound. Selects which channels the main output plays.
+*/
+void AudioPassthruPrivate::setMainOutputChannelMode(OutputChannelMode mode)
+{
+	main_channel_mode_.store(static_cast<int>(mode), std::memory_order_relaxed);
 }

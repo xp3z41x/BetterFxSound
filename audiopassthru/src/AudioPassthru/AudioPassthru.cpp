@@ -117,3 +117,8 @@ void AudioPassthru::setAdditionalOutputs(const std::vector<AdditionalOutputConfi
 {
 	data_->setAdditionalOutputs(outputs);
 }
+
+void AudioPassthru::setMainOutputChannelMode(OutputChannelMode mode)
+{
+	data_->setMainOutputChannelMode(mode);
+}

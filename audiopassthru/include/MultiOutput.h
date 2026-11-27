@@ -31,6 +31,10 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 class SecondaryOutput;
 
+// Rewrites an interleaved block in place for the given channel mode (no-op for Both).
+// Channel 0 is front left and channel 1 is front right in every standard layout.
+void applyOutputChannelMode(float* buffer, UINT32 frames, UINT32 channels, OutputChannelMode mode);
+
 /*
  * Fans the processed audio out to any number of additional ("secondary") output devices.
  *

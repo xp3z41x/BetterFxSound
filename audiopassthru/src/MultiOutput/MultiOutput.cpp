@@ -88,11 +88,11 @@ public:
 	static constexpr DWORD kRetryMs = 1000;                   // Retry interval when the device is missing
 	static constexpr DWORD kIdleStopMs = 2000;                // Stop the stream after this much silence
 
-	SecondaryOutput(const std::wstring& device_id, int delay_ms, OutputChannelMode channel_mode)
-		: device_id_(device_id), ring_(static_cast<size_t>(kRingFrames) * kMaxChannels, 0.0f)
+	explicit SecondaryOutput(const AdditionalOutputConfig& config)
+		: device_id_(config.device_id), ring_(static_cast<size_t>(kRingFrames) * kMaxChannels, 0.0f)
 	{
-		setDelayMs(delay_ms);
-		setChannelMode(channel_mode);
+		applyConfig(config);
+		current_gain_ = target_gain_.load(std::memory_order_relaxed);
 		stop_event_ = CreateEvent(NULL, FALSE, FALSE, NULL);
 		audio_event_ = CreateEvent(NULL, FALSE, FALSE, NULL);
 		if (stop_event_ != NULL && audio_event_ != NULL)
@@ -133,6 +133,22 @@ public:
 	void setChannelMode(OutputChannelMode mode)
 	{
 		channel_mode_.store(static_cast<int>(mode), std::memory_order_relaxed);
+	}
+
+	void setVolumePercent(int percent)
+	{
+		if (percent < 0) percent = 0;
+		if (percent > 100) percent = 100;
+		// Squared curve so the slider feels even: 50% is about -12 dB.
+		const float level = static_cast<float>(percent) / 100.0f;
+		target_gain_.store(level * level, std::memory_order_relaxed);
+	}
+
+	void applyConfig(const AdditionalOutputConfig& config)
+	{
+		setDelayMs(config.delay_ms);
+		setChannelMode(config.channel_mode);
+		setVolumePercent(config.volume_percent);
 	}
 
 	// Audio thread. Never blocks.
@@ -431,6 +447,8 @@ private:
 
 		float* out = reinterpret_cast<float*>(buffer);
 		UINT32 produced = 0;
+		const float gain_target = target_gain_.load(std::memory_order_relaxed);
+		const float gain_step = static_cast<float>(1.0 / (0.01 * rate)); // One-pole ramp, ~10 ms
 		bool underflow = false;
 
 		for (; produced < space; produced++)
@@ -447,6 +465,10 @@ private:
 			if (underflow)
 				break;
 
+			// Volume changes are ramped over about 10 ms so they do not click.
+			current_gain_ += (gain_target - current_gain_) * gain_step;
+			const float gain = current_gain_;
+
 			const float t = static_cast<float>(frac_);
 			for (UINT32 c = 0; c < channels_; c++)
 			{
@@ -457,7 +479,7 @@ private:
 				const float c1 = 0.5f * (x1 - xm1);
 				const float c2 = xm1 - 2.5f * x0 + 2.0f * x1 - 0.5f * x2;
 				const float c3 = 0.5f * (x2 - xm1) + 1.5f * (x0 - x1);
-				out[produced * channels_ + c] = ((c3 * t + c2) * t + c1) * t + x0;
+				out[produced * channels_ + c] = (((c3 * t + c2) * t + c1) * t + x0) * gain;
 			}
 			frac_ += ratio_;
 		}
@@ -490,6 +512,7 @@ private:
 	const std::wstring device_id_;
 	std::atomic<int> delay_ms_{ 0 };
 	std::atomic<int> channel_mode_{ 0 };
+	std::atomic<float> target_gain_{ 1.0f };
 
 	// Ring buffer, frames are stored with a fixed stride of kMaxChannels floats.
 	std::vector<float> ring_;
@@ -517,7 +540,29 @@ private:
 	double frac_ = 3.0;
 	double ratio_ = 1.0;
 	double error_avg_ = 0.0;
+	float current_gain_ = 1.0f;
 };
+
+void applyOutputChannelMode(float* buffer, UINT32 frames, UINT32 channels, OutputChannelMode mode)
+{
+	if (buffer == nullptr || mode == OutputChannelMode::Both || channels < 2)
+		return;
+
+	for (UINT32 i = 0; i < frames; i++)
+	{
+		float* frame = buffer + static_cast<size_t>(i) * channels;
+		float value;
+		if (mode == OutputChannelMode::Left)
+			value = frame[0];
+		else if (mode == OutputChannelMode::Right)
+			value = frame[1];
+		else
+			value = 0.5f * (frame[0] + frame[1]);
+
+		for (UINT32 c = 0; c < channels; c++)
+			frame[c] = value;
+	}
+}
 
 MultiOutputRouter::MultiOutputRouter()
 {
@@ -531,6 +576,28 @@ MultiOutputRouter::~MultiOutputRouter()
 
 void MultiOutputRouter::configure(const std::vector<AdditionalOutputConfig>& outputs)
 {
+	// Fast path: same devices as now, only settings (delay, volume, channels) changed. Those
+	// are atomics, so a shared lock is enough and the audio thread keeps running untouched.
+	// This is what happens while a slider is being dragged.
+	{
+		AcquireSRWLockShared(&lock_);
+		bool same_devices = (outputs.size() == outputs_.size());
+		for (size_t i = 0; same_devices && i < outputs.size(); i++)
+		{
+			if (outputs_[i] == nullptr || outputs_[i]->deviceId() != outputs[i].device_id)
+				same_devices = false;
+		}
+		if (same_devices)
+		{
+			for (size_t i = 0; i < outputs.size(); i++)
+				outputs_[i]->applyConfig(outputs[i]);
+		}
+		ReleaseSRWLockShared(&lock_);
+
+		if (same_devices)
+			return;
+	}
+
 	std::vector<std::unique_ptr<SecondaryOutput>> next;
 	std::vector<std::unique_ptr<SecondaryOutput>> removed;
 
@@ -561,14 +628,9 @@ void MultiOutputRouter::configure(const std::vector<AdditionalOutputConfig>& out
 		}
 
 		if (output != nullptr)
-		{
-			output->setDelayMs(config.delay_ms);
-			output->setChannelMode(config.channel_mode);
-		}
+			output->applyConfig(config);
 		else
-		{
-			output.reset(new SecondaryOutput(config.device_id, config.delay_ms, config.channel_mode));
-		}
+			output.reset(new SecondaryOutput(config));
 
 		next.push_back(std::move(output));
 	}

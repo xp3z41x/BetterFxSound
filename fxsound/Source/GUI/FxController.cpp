@@ -2830,7 +2830,7 @@ void FxController::setNewOutputPrioritized(bool prioritize)
 }
 
 // BetterFxSound: the additional outputs are stored as a JSON array of
-// { "id": <endpoint id>, "delay_ms": <0..500> } objects.
+// { "id": <endpoint id>, "delay_ms": <0..500>, "volume": <0..100>, "channel_mode": <0..3> } objects.
 std::vector<AdditionalOutputConfig> FxController::getAdditionalOutputs()
 {
 	std::vector<AdditionalOutputConfig> outputs;
@@ -2848,6 +2848,7 @@ std::vector<AdditionalOutputConfig> FxController::getAdditionalOutputs()
 			output.device_id = id.toWideCharPointer();
 			output.delay_ms = jlimit(0, 500, static_cast<int>(item.getProperty("delay_ms", 0)));
 			output.channel_mode = static_cast<OutputChannelMode>(jlimit(0, 3, static_cast<int>(item.getProperty("channel_mode", 0))));
+			output.volume_percent = jlimit(0, 100, static_cast<int>(item.getProperty("volume", 100)));
 			outputs.push_back(output);
 		}
 	}
@@ -2855,21 +2856,13 @@ std::vector<AdditionalOutputConfig> FxController::getAdditionalOutputs()
 	return outputs;
 }
 
-void FxController::setAdditionalOutput(const String& device_id, bool enabled, int delay_ms)
+void FxController::setAdditionalOutput(const String& device_id, bool enabled, int delay_ms, int volume_percent, OutputChannelMode channel_mode)
 {
 	if (device_id.isEmpty())
 		return;
 
 	auto outputs = getAdditionalOutputs();
 	auto id = std::wstring(device_id.toWideCharPointer());
-
-	// Keep the channel mode the output already had.
-	auto channel_mode = OutputChannelMode::Both;
-	for (const auto& output : outputs)
-	{
-		if (output.device_id == id)
-			channel_mode = output.channel_mode;
-	}
 
 	outputs.erase(std::remove_if(outputs.begin(), outputs.end(),
 		[&id](const AdditionalOutputConfig& output) { return output.device_id == id; }), outputs.end());
@@ -2879,6 +2872,7 @@ void FxController::setAdditionalOutput(const String& device_id, bool enabled, in
 		AdditionalOutputConfig output;
 		output.device_id = id;
 		output.delay_ms = jlimit(0, 500, delay_ms);
+		output.volume_percent = jlimit(0, 100, volume_percent);
 		output.channel_mode = channel_mode;
 		outputs.push_back(output);
 	}
@@ -2889,6 +2883,7 @@ void FxController::setAdditionalOutput(const String& device_id, bool enabled, in
 		auto* object = new DynamicObject();
 		object->setProperty("id", String(output.device_id.c_str()));
 		object->setProperty("delay_ms", output.delay_ms);
+		object->setProperty("volume", output.volume_percent);
 		object->setProperty("channel_mode", static_cast<int>(output.channel_mode));
 		array.add(var(object));
 	}
@@ -2897,11 +2892,23 @@ void FxController::setAdditionalOutput(const String& device_id, bool enabled, in
 	applyAdditionalOutputs();
 }
 
+OutputChannelMode FxController::getMainOutputChannelMode()
+{
+	return static_cast<OutputChannelMode>(jlimit(0, 3, settings_.getInt("main_output_channel_mode", 0)));
+}
+
+void FxController::setMainOutputChannelMode(OutputChannelMode channel_mode)
+{
+	settings_.setInt("main_output_channel_mode", static_cast<int>(channel_mode));
+	applyAdditionalOutputs();
+}
+
 void FxController::applyAdditionalOutputs()
 {
 	if (audio_passthru_ != nullptr)
 	{
 		audio_passthru_->setAdditionalOutputs(getAdditionalOutputs());
+		audio_passthru_->setMainOutputChannelMode(getMainOutputChannelMode());
 	}
 }
 

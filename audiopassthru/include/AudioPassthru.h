@@ -67,6 +67,7 @@ struct AdditionalOutputConfig {
 	std::wstring device_id;	// Endpoint ID string, same as SoundDevice::pwszID
 	int delay_ms = 0;		// Extra delay for this output, 0 to 500 ms, used to line it up with the others
 	OutputChannelMode channel_mode = OutputChannelMode::Both;
+	int volume_percent = 100;	// Volume of this output, 0 to 100
 };
 
 class AudioPassthruCallback
@@ -95,6 +96,8 @@ public:
 	// BetterFxSound: sets the additional output devices. The main output and the FxSound
 	// virtual device are ignored if they appear in the list.
 	void setAdditionalOutputs(const std::vector<AdditionalOutputConfig>& outputs);
+	// BetterFxSound: channel mode of the main output (Both keeps the original behaviour).
+	void setMainOutputChannelMode(OutputChannelMode mode);
 
 private:
 	AudioPassthruPrivate *data_;

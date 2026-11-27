@@ -137,26 +137,35 @@ private:
 	private:
 		static constexpr int DESCRIPTION_Y = 40;
 		static constexpr int DESCRIPTION_HEIGHT = 100;
-		static constexpr int ROW_HEIGHT = 64;
+		static constexpr int ROW_SPACING = 4;
 
 		class OutputRow : public Component
 		{
 		public:
-			OutputRow(const SoundDevice& device, bool is_main_output, bool enabled, int delay_ms);
+			OutputRow(const SoundDevice& device, bool is_main_output, const AdditionalOutputConfig* config, OutputChannelMode main_channel_mode);
 			~OutputRow() = default;
 
 			void resized() override;
 			void paint(Graphics& g) override;
+			int getPreferredHeight() const;
+
+			std::function<void()> onLayoutChanged;
 
 		private:
-			void updateDelayState();
+			static constexpr int LINE_HEIGHT = 28;
+
+			void updateControlsState();
 			void save();
+			static void setupSlider(Slider& slider, double max_value, const String& suffix, Colour text_colour);
 
 			String device_id_;
 			bool is_main_output_;
 			ToggleButton toggle_;
+			ComboBox channel_list_;
 			Label delay_label_;
 			Slider delay_slider_;
+			Label volume_label_;
+			Slider volume_slider_;
 		};
 
 		void visibilityChanged() override;

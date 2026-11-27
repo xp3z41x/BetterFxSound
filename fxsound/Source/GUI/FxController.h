@@ -146,7 +146,9 @@ public:
 
 	// BetterFxSound: additional outputs that play the processed sound together with the main output.
 	std::vector<AdditionalOutputConfig> getAdditionalOutputs();
-	void setAdditionalOutput(const String& device_id, bool enabled, int delay_ms);
+	void setAdditionalOutput(const String& device_id, bool enabled, int delay_ms, int volume_percent, OutputChannelMode channel_mode);
+	OutputChannelMode getMainOutputChannelMode();
+	void setMainOutputChannelMode(OutputChannelMode channel_mode);
 	void applyAdditionalOutputs();
 
 	FxThemeMode getThemeMode();

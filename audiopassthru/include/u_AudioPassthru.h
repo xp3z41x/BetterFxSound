@@ -26,6 +26,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include <Mmdeviceapi.h>
 #include <vector> 
 #include <map>
+#include <atomic>
 
 class DspProcessingModule
 {
@@ -54,6 +55,7 @@ public:
 	bool checkDeviceChanges();
 	void restoreDefaultPlaybackDevice();
 	void setAdditionalOutputs(const std::vector<AdditionalOutputConfig>& outputs);
+	void setMainOutputChannelMode(OutputChannelMode mode);
 
 private:
 	void applyAdditionalOutputs();
@@ -79,5 +81,6 @@ private:
 	// BetterFxSound: additional outputs, as requested by the UI and as currently applied.
 	std::vector<AdditionalOutputConfig> additional_outputs_;
 	MultiOutputRouter multi_output_;
+	std::atomic<int> main_channel_mode_{ 0 };	// OutputChannelMode of the main output
 };
 
