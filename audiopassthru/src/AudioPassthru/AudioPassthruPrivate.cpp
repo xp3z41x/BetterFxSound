@@ -964,17 +964,41 @@ void AudioPassthruPrivate::applyAdditionalOutputs()
 		}
 		else
 		{
+			// The carrier can still be one of the router's outputs here: a carrier switch during a measurement is
+			// left out of the router only now, after the reinit took the device over as the carrier. Removing that
+			// output hands the device's own level back, so the carrier takes it over again below, after the router
+			// change (the COM calls run after this block).
+			bool carrier_was_routed = false;
+			for (const auto& output : effective_outputs_)
+			{
+				if (!carrier_id.empty() && output.device_id == carrier_id)
+					carrier_was_routed = true;
+			}
+
 			apply_pending_ = false;
 			effective_outputs_ = effective;
 			multi_output_.configure(effective);
+
+			if (carrier_was_routed && carrier_plays && processing && !handed_back_ && carrier_setting_saved)
+			{
+				carrier_full_volume_id_ = carrier_id;
+				set_full_volume_id = carrier_id;
+				carrier_own_level = s_sndDevices_.savedPlaybackLevel;
+				carrier_own_mute = s_sndDevices_.savedPlaybackMute;
+			}
 		}
 
-		/* The carrier while it plays (its device is FxSound's), and every output the router has: each of those
-		   takes its device over and hands it back itself. */
+		/* The carrier while it plays (its device is FxSound's), and the router's outputs while the router drives
+		   them: each of those takes its device over and hands it back itself. While FxSound is off the router's
+		   outputs don't (their streams only open when audio is written), so what is owed to their devices is put
+		   back here, for example to Bluetooth headphones that left while in use and came back while FxSound is off. */
 		if (carrier_plays && processing && !handed_back_)
 			in_use.push_back(carrier_id);
-		for (const auto& output : effective_outputs_)
-			in_use.push_back(output.device_id);
+		if (multi_output_.isDriven())
+		{
+			for (const auto& output : effective_outputs_)
+				in_use.push_back(output.device_id);
+		}
 	}
 
 	/*

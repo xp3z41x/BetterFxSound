@@ -87,6 +87,9 @@ public:
 	// UI/timer thread.
 	void setDriven(bool driven);
 
+	// Whether the engine drives the outputs (see setDriven()). Only then do they take their devices over.
+	bool isDriven() const;
+
 	// Audio thread: queues one block of processed, interleaved 32 bit float audio.
 	// solo_index >= 0: only that output gets the audio, the others get silence.
 	// solo_index == -1: every output here gets silence (the carrier output is being measured).

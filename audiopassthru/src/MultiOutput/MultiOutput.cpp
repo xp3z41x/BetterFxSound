@@ -1071,6 +1071,11 @@ void MultiOutputRouter::setDriven(bool driven)
 	}
 }
 
+bool MultiOutputRouter::isDriven() const
+{
+	return driven_->load();
+}
+
 void MultiOutputRouter::write(const float* data, UINT32 frames, UINT32 channels, UINT32 sample_rate, int solo_index)
 {
 	// Never wait on the audio thread: if the list is being changed right now, skip this block.
