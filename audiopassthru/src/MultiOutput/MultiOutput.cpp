@@ -626,6 +626,7 @@ private:
 		ratio_ = 1.0;
 		error_avg_ = 0.0;
 		hold_frames_ = 0;
+		fill_avg_valid_ = false;
 	}
 
 	bool pullFrame()
@@ -724,6 +725,17 @@ private:
 		// 10% of the (smoothed) error per second keeps the pitch change far below audibility.
 		const double error_secs = (static_cast<double>(fill) - static_cast<double>(target)) / rate;
 		error_avg_ += (error_secs - error_avg_) * 0.02;
+		// Short average of the queue level (a few device periods). The writes come in bursts, so the level at one
+		// moment is not the level the output plays from; the lasting-offset realign below moves by this average.
+		if (!fill_avg_valid_)
+		{
+			fill_avg_ = static_cast<double>(fill);
+			fill_avg_valid_ = true;
+		}
+		else
+		{
+			fill_avg_ += (static_cast<double>(fill) - fill_avg_) * 0.25;
+		}
 		// A lasting offset is lined up at once too: typically a Bluetooth stream that was idle and took ~0.1 s
 		// to start consuming after Start() while the queue kept filling. Left to the drift correction, the
 		// output stayed that much late, out of sync with the others, for about a minute after every pause in
@@ -805,13 +817,13 @@ private:
 		{
 			// Faded out: move the output. For a delay change, by exactly the change, so the queue keeps its
 			// level relative to the target (the writes are bursty, the instantaneous level is not the mean). For
-			// a lasting offset, by the offset. Later: skip that much queued audio. Earlier: play that much silence
-			// first. Either way the output fades back in from silence.
+			// a lasting offset, by the offset of the averaged level. Later: skip that much queued audio. Earlier:
+			// play that much silence first. Either way the output fades back in from silence.
 			const UINT32 r = read_pos_.load(std::memory_order_relaxed);
 			const UINT32 queued = write_pos_.load(std::memory_order_acquire) - r;
 			const INT64 shift = (target != aligned_target_)
 				? static_cast<INT64>(aligned_target_) - static_cast<INT64>(target)
-				: static_cast<INT64>(queued) + static_cast<INT64>(hold_frames_) - static_cast<INT64>(target);
+				: static_cast<INT64>(fill_avg_ + 0.5) - static_cast<INT64>(target);
 			if (shift > 0)
 			{
 				// Silence not played yet goes first, then queued audio.
@@ -828,6 +840,7 @@ private:
 			{
 				hold_frames_ += static_cast<UINT32>(-shift);
 			}
+			fill_avg_ -= static_cast<double>(shift);	// Re-seeded instead if resetResampler() ran
 			error_avg_ = 0.0;
 			current_gain_ = 0.0f;
 			aligned_target_ = target;
@@ -893,6 +906,8 @@ private:
 	float current_gain_ = 0.0f;
 	UINT32 aligned_target_ = 0;		// Queue target (frames) the output was last lined up with
 	UINT32 hold_frames_ = 0;		// Silence to play before pulling from the queue again (a raised delay)
+	double fill_avg_ = 0.0;			// Short average of the queue level, silence to play included (frames)
+	bool fill_avg_valid_ = false;
 	bool realign_pending_ = false;	// The delay changed: fading out before lining up with the new target
 };
 
