@@ -1,0 +1,66 @@
+name: Windows build
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [x64]
+    steps:
+      - uses: actions/checkout@v4
+
+      # The Visual Studio projects expect JUCE at C:\JUCE (see FxSound_App.vcxproj).
+      # JUCE_PROJUCER_VERSION in fxsound/JuceLibraryCode/AppConfig.h is 0x90005.
+      - name: Fetch JUCE 9.0.5
+        shell: pwsh
+        run: git clone --depth 1 --branch 9.0.5 https://github.com/juce-framework/JUCE.git C:\JUCE
+
+      - uses: microsoft/setup-msbuild@v2
+
+      # The projects target the VS 2026 toolset (v145). Fall back to the
+      # newest installed toolset if the runner image does not have it yet.
+      - name: Pick platform toolset
+        id: toolset
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
+          Write-Host "Visual Studio: $vs"
+          $toolsets = Get-ChildItem "$vs\MSBuild\Microsoft\VC\*\Platforms\x64\PlatformToolsets" -Directory -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name | Sort-Object -Unique
+          Write-Host "Toolsets: $($toolsets -join ', ')"
+          $pick = @('v145','v143') | Where-Object { $toolsets -contains $_ } | Select-Object -First 1
+          if (-not $pick) { $pick = ($toolsets | Where-Object { $_ -match '^v\d+$' } | Sort-Object | Select-Object -Last 1) }
+          Write-Host "Using $pick"
+          "toolset=$pick" >> $env:GITHUB_OUTPUT
+
+      - name: Build
+        shell: pwsh
+        run: >
+          msbuild fxsound\Project\FxSound.sln
+          /m /nologo /v:minimal
+          /p:Configuration=Release
+          /p:Platform=${{ matrix.platform }}
+          /p:PlatformToolset=${{ steps.toolset.outputs.toolset }}
+
+      - name: Collect binaries
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force out | Out-Null
+          Get-ChildItem -Recurse fxsound\Project -Filter *.exe | Where-Object { $_.FullName -match '\\Release\\' } | ForEach-Object { Write-Host $_.FullName; Copy-Item $_.FullName out\ }
+          Copy-Item LICENSE out\
+          if (-not (Get-ChildItem out -Filter *.exe)) { throw "No executable was produced" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BetterFxSound-${{ matrix.platform }}-${{ github.sha }}
+          path: out\
