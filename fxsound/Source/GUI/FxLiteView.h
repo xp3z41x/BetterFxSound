@@ -20,6 +20,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 #include <JuceHeader.h>
 #include "FxView.h"
+#include "FxOutputsGrid.h"
 
 //==============================================================================
 /*
@@ -34,6 +35,10 @@ public:
 	void paint(Graphics& g) override;
 
 private:
+	void outputsChanged() override;
+	void mouseEnter(const MouseEvent& mouse_event) override;
+	void mouseExit(const MouseEvent& mouse_event) override;
+
 	static constexpr int PRESET_LIST_X = 40;
 	static constexpr int OUTPUT_LIST_X = 285;
 	static constexpr int LIST_Y = 42;
@@ -41,5 +46,10 @@ private:
     static constexpr int BACKGROUND_HEIGHT = LIST_HEIGHT + 40;
     static constexpr int WIDTH = BACKGROUND_WIDTH + 40;
     static constexpr int HEIGHT = BACKGROUND_HEIGHT + 22;
+
+	// BetterFxSound outputs rework: "Outputs (N)" opens the outputs grid in a popup.
+	FxOutputsButton outputs_button_;
+	TooltipWindow tool_tip_;
+
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (FxLiteView)
 };

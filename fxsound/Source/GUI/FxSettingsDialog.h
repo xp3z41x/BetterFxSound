@@ -124,67 +124,6 @@ private:
 		juce::Rectangle<float> output_preference_bounds_;
 	};
 
-	// BetterFxSound: choose additional outputs that play together with the main output.
-	class OutputsSettingsPane : public SettingsPane, private Timer
-	{
-	public:
-		OutputsSettingsPane();
-		~OutputsSettingsPane();
-
-		void resized() override;
-		void paint(Graphics& g) override;
-
-	private:
-		static constexpr int DESCRIPTION_Y = 36;
-		static constexpr int DESCRIPTION_HEIGHT = 72;
-		static constexpr int SYNC_BUTTON_HEIGHT = 26;
-		static constexpr int SYNC_STATUS_HEIGHT = 48;
-		static constexpr int ROW_SPACING = 4;
-
-		class OutputRow : public Component
-		{
-		public:
-			OutputRow(const SoundDevice& device, bool is_main_output, const AdditionalOutputConfig* config, OutputChannelMode main_channel_mode);
-			~OutputRow() = default;
-
-			void resized() override;
-			void paint(Graphics& g) override;
-			int getPreferredHeight() const;
-
-			std::function<void()> onLayoutChanged;
-
-		private:
-			static constexpr int LINE_HEIGHT = 28;
-
-			void updateControlsState();
-			void save();
-			static void setupSlider(Slider& slider, double max_value, const String& suffix, Colour text_colour);
-
-			String device_id_;
-			bool is_main_output_;
-			ToggleButton toggle_;
-			ComboBox channel_list_;
-			Label delay_label_;
-			Slider delay_slider_;
-			Label volume_label_;
-			Slider volume_slider_;
-		};
-
-		void visibilityChanged() override;
-		void timerCallback() override;
-		void rebuild();
-		void setText();
-		void onSyncClicked();
-
-		Label description_;
-		TextButton sync_button_;
-		Label sync_status_;
-		Label empty_label_;
-		Viewport viewport_;
-		Component rows_container_;
-		std::vector<std::unique_ptr<OutputRow>> rows_;
-	};
-
 	class GeneralSettingsPane : public SettingsPane
 	{
 	public:
@@ -270,12 +209,10 @@ private:
 		void showPane(Button* button);
 
 		std::unique_ptr<SettingsButton> audio_button_;
-		std::unique_ptr<SettingsButton> outputs_button_;
 		std::unique_ptr<SettingsButton> general_button_;
 		std::unique_ptr<SettingsButton> help_button_;
 
 		AudioSettingsPane audio_settings_pane_;
-		OutputsSettingsPane outputs_settings_pane_;
 		GeneralSettingsPane general_settings_pane_;
 		HelpSettingsPane help_settings_pane_;
 	};

@@ -71,6 +71,12 @@ void FxSystemTrayView::modelChanged(FxModel::Event model_event)
     {
         showNotification();
     }
+
+    // BetterFxSound outputs rework: the tooltip lists the enabled outputs, keep it current.
+    if (model_event == FxModel::Event::OutputListUpdated)
+    {
+        setStatus(FxModel::getModel().getPowerState(), FxController::getInstance().isAudioProcessing());
+    }
 }
 
 void FxSystemTrayView::setStatus(bool power, bool processing)
@@ -79,13 +85,25 @@ void FxSystemTrayView::setStatus(bool power, bool processing)
 
     String param = power ? TRANS(L"on") : TRANS(L"off");
 
-    wchar_t tool_tip[1024];
-    swprintf_s(tool_tip, String(TRANS("FxSound is %s.")).toWideCharPointer(), param.toWideCharPointer());
-	wcscat_s(tool_tip, 1024, L"\n\n");
-    wcscat_s(tool_tip, 1024, String(TRANS("Output: ")).toWideCharPointer());
-    auto& model = FxModel::getModel();
-	String output_device_name = model.getSelectedOutput().deviceFriendlyName.c_str();
-	wcscat_s(tool_tip, 1024, output_device_name.toWideCharPointer());
+    // BetterFxSound outputs rework: list every enabled output, there is no main output anymore.
+    StringArray enabled_outputs;
+    for (auto& output : FxController::getInstance().getOutputs())
+    {
+        if (output.enabled)
+        {
+            enabled_outputs.add(output.name);
+        }
+    }
+
+    String tool_tip = String(TRANS("FxSound is %s.")).replace("%s", param) + "\n\n";
+    if (enabled_outputs.isEmpty())
+    {
+        tool_tip += FxOutputsGrid::getMutedNotice();
+    }
+    else
+    {
+        tool_tip += String(TRANS("Outputs: ")) + enabled_outputs.joinIntoString(", ");
+    }
 
     NOTIFYICONDATA nid = { sizeof(nid) };
 
@@ -119,7 +137,13 @@ void FxSystemTrayView::setStatus(bool power, bool processing)
         return;
     }
 
-    lstrcpy(nid.szTip, tool_tip);
+    // szTip holds 128 characters including the terminator, shorten long output lists.
+    constexpr int max_tip_length = static_cast<int>(sizeof(nid.szTip) / sizeof(nid.szTip[0])) - 1;
+    if (tool_tip.length() > max_tip_length)
+    {
+        tool_tip = tool_tip.substring(0, max_tip_length - 3) + "...";
+    }
+    lstrcpyn(nid.szTip, tool_tip.toWideCharPointer(), max_tip_length + 1);
 
     Shell_NotifyIcon(NIM_MODIFY, &nid);
 }
@@ -343,8 +367,9 @@ void FxSystemTrayView::addOutputDeviceMenu(PopupMenu* context_menu)
     PopupMenu output_menu;
     PopupMenu* menu;
 
-    auto output_devices = FxModel::getModel().getOutputDevices();
-    auto num_outputs = output_devices.size();
+    // BetterFxSound outputs rework: every output is a checkable item, several can be ticked.
+    auto outputs = FxController::getInstance().getOutputs();
+    auto num_outputs = outputs.size();
     if (num_outputs > 5)
     {
         menu = &output_menu;
@@ -353,26 +378,28 @@ void FxSystemTrayView::addOutputDeviceMenu(PopupMenu* context_menu)
     {
         menu = context_menu;
         menu->addSeparator();
-        menu->addSectionHeader(TRANS("Playback Device Select"));
+        menu->addSectionHeader(TRANS("Outputs"));
+    }
+
+    if (outputs.empty())
+    {
+        menu->addItem(TRANS("No playback devices were found."), false, false, nullptr);
+    }
+    else if (FxController::getInstance().getEnabledOutputCount() == 0)
+    {
+        menu->addItem(FxOutputsGrid::getMutedNotice(), false, false, nullptr);
     }
 
     auto id = OUTPUT_MENU_ID_START;
-    for (auto device : output_devices)
+    for (auto& output : outputs)
     {
-        PopupMenu::Item menu_item(getTruncatedText(device.deviceFriendlyName.c_str(), 30));
+        auto name = output.present ? output.name : output.name + " (" + TRANS("Not connected") + ")";
+        PopupMenu::Item menu_item(getTruncatedText(name, 40));
         menu_item.setID(id);
-        if (device.deviceNumChannel < 2)
-        {
-            menu_item.setEnabled(false);
-        }
+        menu_item.setTicked(output.enabled);
 
-        if (id - OUTPUT_MENU_ID_START == FxModel::getModel().getSelectedOutputIndex())
-        {
-            menu_item.setTicked(true);
-        }
-
-        auto handler = [output = id]() {
-            FxController::getInstance().setOutput(output - OUTPUT_MENU_ID_START);
+        auto handler = [output_id = output.id, enable = !output.enabled]() {
+            FxController::getInstance().setOutputEnabled(output_id, enable);
             };
         menu_item.setAction(handler);
 

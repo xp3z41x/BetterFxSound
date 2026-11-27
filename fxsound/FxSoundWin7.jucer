@@ -137,6 +137,10 @@
                 file="Source/GUI/FxOutputPreference.cpp"/>
           <FILE id="FllKLy" name="FxOutputPreference.h" compile="0" resource="0"
                 file="Source/GUI/FxOutputPreference.h"/>
+          <FILE id="xO7tGr" name="FxOutputsGrid.cpp" compile="1" resource="0"
+                file="Source/GUI/FxOutputsGrid.cpp"/>
+          <FILE id="pW3kQd" name="FxOutputsGrid.h" compile="0" resource="0"
+                file="Source/GUI/FxOutputsGrid.h"/>
           <FILE id="m61HtG" name="FxAudioSlider.cpp" compile="1" resource="0"
                 file="Source/GUI/FxAudioSlider.cpp"/>
           <FILE id="QluxCZ" name="FxAudioSlider.h" compile="0" resource="0" file="Source/GUI/FxAudioSlider.h"/>
