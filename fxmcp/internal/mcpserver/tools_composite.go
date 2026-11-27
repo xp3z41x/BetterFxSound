@@ -41,7 +41,7 @@ type applySettingsInput struct {
 	UndoPreset      bool                 `json:"undo_preset,omitempty" jsonschema:"revert the selected preset's unsaved changes"`
 	RenamePreset    string               `json:"rename_preset,omitempty" jsonschema:"rename the selected user preset to this name"`
 	DeletePreset    bool                 `json:"delete_preset,omitempty" jsonschema:"delete the selected user preset"`
-	OutputDevice    string               `json:"output_device,omitempty" jsonschema:"select this output device by exact Windows friendly name"`
+	OutputDevice    string               `json:"output_device,omitempty" jsonschema:"enable only this output device, by exact Windows friendly name"`
 	View            string               `json:"view,omitempty" jsonschema:"\"lite\" or \"full\""`
 	Language        string               `json:"language,omitempty" jsonschema:"display language code as a BCP 47 tag, e.g. en, fr, fi"`
 	NumEqBands      int                  `json:"num_eq_bands,omitempty" jsonschema:"one of 5, 10, 15, 20, 31"`

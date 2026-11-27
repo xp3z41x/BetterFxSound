@@ -44,11 +44,44 @@ func (a *App) registerWriteTools(s *mcp.Server) {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name: "fxsound_set_output_device",
-		Description: "Selects the audio output device by its exact Windows friendly name (see " +
-			"fxsound://status's output_devices or fxsound://diagnostics's device list for valid names). " +
-			"Works whether or not FxSound is currently running.",
+		Description: "Enables only this output and disables every other one, by the output's exact Windows " +
+			"friendly name (see the outputs list in fxsound://status, or fxsound://diagnostics's device list, " +
+			"for valid names). The device must be connected. To change one output without touching the " +
+			"others use fxsound_enable_output / fxsound_disable_output. Works whether or not FxSound is " +
+			"currently running.",
 		Annotations: &mcp.ToolAnnotations{DestructiveHint: boolPtr(false)},
 	}, a.toolSetOutputDevice)
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name: "fxsound_enable_output",
+		Description: "Enables one output (by exact Windows friendly name) so FxSound also plays on it, " +
+			"leaving the other outputs as they are. The device must be connected. Requires FxSound to be " +
+			"running.",
+		Annotations: &mcp.ToolAnnotations{DestructiveHint: boolPtr(false)},
+	}, a.toolEnableOutput)
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name: "fxsound_disable_output",
+		Description: "Disables one output (by exact Windows friendly name), leaving the other outputs as " +
+			"they are. With every output disabled FxSound plays silence. Requires FxSound to be running.",
+		Annotations: &mcp.ToolAnnotations{DestructiveHint: boolPtr(false)},
+	}, a.toolDisableOutput)
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name: "fxsound_set_output_volume",
+		Description: "Sets one output's volume trim, 0-100 percent, on top of the Windows master volume " +
+			"(which applies to every output). Output is chosen by exact Windows friendly name. Requires " +
+			"FxSound to be running.",
+		Annotations: &mcp.ToolAnnotations{DestructiveHint: boolPtr(false)},
+	}, a.toolSetOutputVolume)
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name: "fxsound_set_output_delay",
+		Description: "Sets one output's delay, 0-500 milliseconds, e.g. to line up speakers with " +
+			"Bluetooth headphones. Output is chosen by exact Windows friendly name. Requires FxSound to be " +
+			"running.",
+		Annotations: &mcp.ToolAnnotations{DestructiveHint: boolPtr(false)},
+	}, a.toolSetOutputDelay)
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name: "fxsound_save_preset",
@@ -120,13 +153,75 @@ type setOutputDeviceInput struct {
 }
 
 func (a *App) toolSetOutputDevice(ctx context.Context, _ *mcp.CallToolRequest, in setOutputDeviceInput) (*mcp.CallToolResult, applyResult, error) {
-	if in.DeviceName == "" {
-		return nil, applyResult{}, fmt.Errorf("device_name must not be empty")
+	if err := fxsound.ValidateOutputName(in.DeviceName); err != nil {
+		return nil, applyResult{}, err
 	}
 	if err := fxsound.Apply(ctx, a.Paths, map[string]string{"output": in.DeviceName}, false); err != nil {
 		return nil, applyResult{}, err
 	}
-	return nil, applyResult{Applied: true, Detail: fmt.Sprintf("output device set to: %s", in.DeviceName)}, nil
+	return nil, applyResult{Applied: true, Detail: fmt.Sprintf("only output enabled: %s", in.DeviceName)}, nil
+}
+
+type outputNameInput struct {
+	DeviceName string `json:"device_name" jsonschema:"the output's exact Windows friendly name"`
+}
+
+func (a *App) toolEnableOutput(ctx context.Context, _ *mcp.CallToolRequest, in outputNameInput) (*mcp.CallToolResult, applyResult, error) {
+	if err := fxsound.ValidateOutputName(in.DeviceName); err != nil {
+		return nil, applyResult{}, err
+	}
+	if err := fxsound.Apply(ctx, a.Paths, map[string]string{"enable-output": in.DeviceName}, true); err != nil {
+		return nil, applyResult{}, err
+	}
+	return nil, applyResult{Applied: true, Detail: fmt.Sprintf("output enabled: %s", in.DeviceName)}, nil
+}
+
+func (a *App) toolDisableOutput(ctx context.Context, _ *mcp.CallToolRequest, in outputNameInput) (*mcp.CallToolResult, applyResult, error) {
+	if err := fxsound.ValidateOutputName(in.DeviceName); err != nil {
+		return nil, applyResult{}, err
+	}
+	if err := fxsound.Apply(ctx, a.Paths, map[string]string{"disable-output": in.DeviceName}, true); err != nil {
+		return nil, applyResult{}, err
+	}
+	return nil, applyResult{Applied: true, Detail: fmt.Sprintf("output disabled: %s", in.DeviceName)}, nil
+}
+
+type setOutputVolumeInput struct {
+	DeviceName string `json:"device_name" jsonschema:"the output's exact Windows friendly name"`
+	Volume     int    `json:"volume" jsonschema:"volume trim in percent, 0 to 100"`
+}
+
+func (a *App) toolSetOutputVolume(ctx context.Context, _ *mcp.CallToolRequest, in setOutputVolumeInput) (*mcp.CallToolResult, applyResult, error) {
+	if err := fxsound.ValidateOutputName(in.DeviceName); err != nil {
+		return nil, applyResult{}, err
+	}
+	if err := fxsound.ValidateOutputVolume(in.Volume); err != nil {
+		return nil, applyResult{}, err
+	}
+	flags := map[string]string{"output-volume": fxsound.FormatOutputValue(in.DeviceName, in.Volume)}
+	if err := fxsound.Apply(ctx, a.Paths, flags, true); err != nil {
+		return nil, applyResult{}, err
+	}
+	return nil, applyResult{Applied: true, Detail: fmt.Sprintf("output %s volume set to %d%%", in.DeviceName, in.Volume)}, nil
+}
+
+type setOutputDelayInput struct {
+	DeviceName string `json:"device_name" jsonschema:"the output's exact Windows friendly name"`
+	DelayMs    int    `json:"delay_ms" jsonschema:"delay in milliseconds, 0 to 500"`
+}
+
+func (a *App) toolSetOutputDelay(ctx context.Context, _ *mcp.CallToolRequest, in setOutputDelayInput) (*mcp.CallToolResult, applyResult, error) {
+	if err := fxsound.ValidateOutputName(in.DeviceName); err != nil {
+		return nil, applyResult{}, err
+	}
+	if err := fxsound.ValidateOutputDelay(in.DelayMs); err != nil {
+		return nil, applyResult{}, err
+	}
+	flags := map[string]string{"output-delay": fxsound.FormatOutputValue(in.DeviceName, in.DelayMs)}
+	if err := fxsound.Apply(ctx, a.Paths, flags, true); err != nil {
+		return nil, applyResult{}, err
+	}
+	return nil, applyResult{Applied: true, Detail: fmt.Sprintf("output %s delay set to %d ms", in.DeviceName, in.DelayMs)}, nil
 }
 
 type presetNameInput struct {

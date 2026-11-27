@@ -112,7 +112,7 @@ common cause.
 | URI | Contents |
 |---|---|
 | `fxsound://diagnostics` | Windows playback device + audio session snapshot (from `fxdiag.exe --json`) |
-| `fxsound://status` | Full live FxSound state: power, presets, output, equalizer, effects |
+| `fxsound://status` | Full live FxSound state: power, presets, outputs (each with enabled/volume/delay/channel mode), equalizer, effects |
 | `fxsound://presets` | Selected preset + built-in/user-defined preset lists |
 | `fxsound://equalizer` | Band count, per-band frequency/gain, master gain, volume leveling, filter Q, balance |
 | `fxsound://effects` | Clarity/ambience/surround/dynamicboost/bass levels (0-10 scale) |
@@ -120,7 +120,8 @@ common cause.
 
 ### Tools
 - `fxsound_is_running`, `fxsound_get_status` — read-only
-- `fxsound_set_power`, `fxsound_select_preset`, `fxsound_set_output_device` — single-setting, work whether or not FxSound is already running
+- `fxsound_set_power`, `fxsound_select_preset`, `fxsound_set_output_device` (enable only this output) — single-setting, work whether or not FxSound is already running
+- `fxsound_enable_output`, `fxsound_disable_output`, `fxsound_set_output_volume` (0–100), `fxsound_set_output_delay` (0–500 ms) — per-output control, require a running instance
 - `fxsound_save_preset`, `fxsound_overwrite_preset`, `fxsound_undo_preset`, `fxsound_rename_preset`, `fxsound_delete_preset` — preset management, require a running instance
 - `fxsound_set_eq_bands`, `fxsound_set_eq_band_gains`, `fxsound_set_effects` — batch EQ/effects changes, require a running instance
 - `fxsound_apply_settings` — composite tool covering the full flag surface in one atomic call

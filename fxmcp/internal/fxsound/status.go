@@ -56,14 +56,33 @@ type Effects struct {
 	Bass         float64 `json:"bass"`
 }
 
+// OutputInfo is one audio output, as reported by --status. Every output can
+// be enabled or disabled independently; with none enabled FxSound plays
+// silence. Present is false for an enabled output whose device is not
+// connected right now. Volume is a 0-100 trim on top of the Windows master
+// volume, DelayMs is 0-500, ChannelMode is one of "both", "left", "right",
+// "mono".
+type OutputInfo struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Enabled     bool   `json:"enabled"`
+	Present     bool   `json:"present"`
+	Volume      int    `json:"volume"`
+	DelayMs     int    `json:"delay_ms"`
+	ChannelMode string `json:"channel_mode"`
+}
+
 // Status is the shape of %APPDATA%\FxSound\status.json, written by
 // FxController::printStatus (the --status command-line option).
 type Status struct {
-	Version        string    `json:"version"`
-	Power          bool      `json:"power"`
-	Presets        Presets   `json:"presets"`
-	SelectedPreset string    `json:"selected_preset"`
-	OutputDevices  []string  `json:"output_devices"`
+	Version        string       `json:"version"`
+	Power          bool         `json:"power"`
+	Presets        Presets      `json:"presets"`
+	SelectedPreset string       `json:"selected_preset"`
+	OutputDevices  []string     `json:"output_devices"`
+	Outputs        []OutputInfo `json:"outputs"`
+	// SelectedOutput is the first enabled output, empty if none is enabled.
+	// Kept for compatibility; use Outputs.
 	SelectedOutput string    `json:"selected_output"`
 	Equalizer      Equalizer `json:"equalizer"`
 	Effects        Effects   `json:"effects"`
