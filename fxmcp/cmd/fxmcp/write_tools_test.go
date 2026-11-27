@@ -140,15 +140,15 @@ func testSelectPreset(t *testing.T, session *mcp.ClientSession, ctx context.Cont
 }
 
 func testSetOutputDevice(t *testing.T, session *mcp.ClientSession, ctx context.Context, paths *fxsound.Paths, baseline *fxsound.Status) {
-	if baseline.SelectedOutput == "" {
-		t.Skip("no output device currently selected")
+	// set_output_device means "enable only this output": it disables every other one, so it is
+	// only safe when the baseline already has exactly this one output enabled.
+	only := soleEnabledOutput(baseline)
+	if only == "" {
+		t.Skip("needs exactly one enabled, connected output (set_output_device disables the others)")
 	}
-	// Only one device is available on this machine in practice, so this
-	// round-trips to the same device -- it still exercises the full tool
-	// call path (build args, spawn, forward, status reflects the value).
-	callToolOK(t, session, ctx, "fxsound_set_output_device", map[string]any{"device_name": baseline.SelectedOutput})
-	if got := freshStatus(t, ctx, paths).SelectedOutput; got != baseline.SelectedOutput {
-		t.Errorf("after set_output_device(%q): status.selected_output = %q", baseline.SelectedOutput, got)
+	callToolOK(t, session, ctx, "fxsound_set_output_device", map[string]any{"device_name": only})
+	if got := freshStatus(t, ctx, paths).SelectedOutput; got != only {
+		t.Errorf("after set_output_device(%q): status.selected_output = %q", only, got)
 	}
 }
 
@@ -320,15 +320,19 @@ func testCompositeMultiField(t *testing.T, session *mcp.ClientSession, ctx conte
 			break
 		}
 	}
-	if altPreset == "" || baseline.SelectedOutput == "" {
-		t.Skip("need an alternate preset and a selected output device")
+	if altPreset == "" {
+		t.Skip("need an alternate preset")
 	}
 
-	callToolOK(t, session, ctx, "fxsound_apply_settings", map[string]any{
-		"preset":        altPreset,
-		"output_device": baseline.SelectedOutput,
-		"view":          "full",
-	})
+	args := map[string]any{
+		"preset": altPreset,
+		"view":   "full",
+	}
+	// output_device means "enable only this output"; only send it when that changes nothing.
+	if only := soleEnabledOutput(baseline); only != "" {
+		args["output_device"] = only
+	}
+	callToolOK(t, session, ctx, "fxsound_apply_settings", args)
 	status := freshStatus(t, ctx, paths)
 	if status.SelectedPreset != altPreset {
 		t.Errorf("composite call: selected_preset = %q, want %q", status.SelectedPreset, altPreset)
@@ -362,7 +366,7 @@ func testCompositeNumBandsCycle(t *testing.T, session *mcp.ClientSession, ctx co
 // their pre-test values, best-effort (logs rather than fails on error,
 // since this runs during cleanup after the real assertions already ran).
 func restoreBaseline(t *testing.T, paths *fxsound.Paths, baseline *fxsound.Status) {
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
 	flags := map[string]string{
@@ -370,11 +374,53 @@ func restoreBaseline(t *testing.T, paths *fxsound.Paths, baseline *fxsound.Statu
 		"preset":    baseline.SelectedPreset,
 		"num_bands": fmt.Sprintf("%d", baseline.Equalizer.NumBands),
 	}
-	if baseline.SelectedOutput != "" {
-		flags["output"] = baseline.SelectedOutput
-	}
 	if err := fxsound.Apply(ctx, paths, flags, false); err != nil {
 		t.Logf("restoreBaseline: %v", err)
+	}
+	restoreOutputs(t, ctx, paths, baseline)
+}
+
+// soleEnabledOutput returns the name of the only enabled output if it is connected and no other
+// output is enabled, else "".
+func soleEnabledOutput(s *fxsound.Status) string {
+	name := ""
+	for _, o := range s.Outputs {
+		if !o.Enabled {
+			continue
+		}
+		if name != "" || !o.Present {
+			return ""
+		}
+		name = o.Name
+	}
+	return name
+}
+
+// restoreOutputs puts every connected output back to its baseline enabled state, volume and delay.
+// It never uses --output, which would disable the others. One invocation per option, as FxSound
+// reads only one value of each option per command line. Outputs are enabled before any is disabled,
+// so there is never a moment of silence.
+func restoreOutputs(t *testing.T, ctx context.Context, paths *fxsound.Paths, baseline *fxsound.Status) {
+	apply := func(flag, value string) {
+		if err := fxsound.Apply(ctx, paths, map[string]string{flag: value}, true); err != nil {
+			t.Logf("restoreOutputs --%s: %v", flag, err)
+		}
+	}
+	for _, o := range baseline.Outputs {
+		if o.Present && o.Enabled {
+			apply("enable-output", o.Name)
+		}
+	}
+	for _, o := range baseline.Outputs {
+		if o.Present && !o.Enabled {
+			apply("disable-output", o.Name)
+		}
+	}
+	for _, o := range baseline.Outputs {
+		if o.Present {
+			apply("output-volume", fxsound.FormatOutputValue(o.Name, o.Volume))
+			apply("output-delay", fxsound.FormatOutputValue(o.Name, o.DelayMs))
+		}
 	}
 }
 

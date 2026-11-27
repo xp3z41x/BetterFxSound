@@ -3,6 +3,7 @@ package fxsound
 import (
 	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -79,5 +80,26 @@ func TestStatusOutputsParse(t *testing.T) {
 	var old Status
 	if err := json.Unmarshal([]byte(`{"selected_output":"X"}`), &old); err != nil || len(old.Outputs) != 0 {
 		t.Fatalf("old status: %v %+v", err, old)
+	}
+}
+
+func TestResolveOutput(t *testing.T) {
+	s := &Status{Outputs: []OutputInfo{
+		{Name: "Speakers", Present: true},
+		{Name: "TV", Enabled: true, Present: false},
+	}}
+	if o, err := s.ResolveOutput("Speakers", true); err != nil || o.Name != "Speakers" {
+		t.Fatalf("Speakers: %v", err)
+	}
+	if _, err := s.ResolveOutput("TV", false); err != nil {
+		t.Fatalf("TV without present requirement: %v", err)
+	}
+	_, err := s.ResolveOutput("TV", true)
+	if err == nil || !strings.Contains(err.Error(), "not connected") || !strings.Contains(err.Error(), `"Speakers"`) {
+		t.Fatalf("TV needPresent: %v", err)
+	}
+	_, err = s.ResolveOutput("Nope", false)
+	if err == nil || !strings.Contains(err.Error(), `"Speakers"`) || !strings.Contains(err.Error(), `"TV"`) {
+		t.Fatalf("Nope: %v", err)
 	}
 }
