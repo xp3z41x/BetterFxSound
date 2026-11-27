@@ -97,6 +97,12 @@ public:
     {
         if (main_window_.get() != nullptr)
         {
+            // Popups still open (the Lite window's outputs list, an output's settings) are
+            // desktop windows owned by the modal manager, which deletes them only after
+            // shutdown(): too late for COM, and an output's settings panel saves its delay
+            // through the engine when it closes. Close them while everything is still up.
+            closeOpenCallOuts();
+
             FxController::getInstance().autoSaveModifiedPreset();
             FxController::getInstance().stopTimer();
 
@@ -353,6 +359,17 @@ private:
 
         auto result = disconnect_all_providers();
         controller.logMessage("UiaDisconnectAllProviders (" + when + "): 0x" + String::toHexString((int)result));
+    }
+
+    static void closeOpenCallOuts()
+    {
+        auto& desktop = Desktop::getInstance();
+
+        for (int i = desktop.getNumComponents(); --i >= 0;)
+        {
+            if (auto* callout = dynamic_cast<CallOutBox*>(desktop.getComponent(i)))
+                delete callout;
+        }
     }
 
     // Logs nothing when the teardown is clean. Anything listed here outlives
