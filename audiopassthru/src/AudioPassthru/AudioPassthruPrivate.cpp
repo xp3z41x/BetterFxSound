@@ -872,6 +872,11 @@ void AudioPassthruPrivate::applyAdditionalOutputs()
 
 		const bool carrier_plays = carrier_enabled && !carrier_id.empty();
 
+		// The device's own level and mute are saved by the reinit (sndDevicesInitialSetupPlaybackDevice()) and
+		// put back on power off, exit or a switch to another carrier. Without them the device is left alone.
+		const bool carrier_setting_saved = s_sndDevices_.playbackSettingsAreSaved && s_sndDevices_.savedPlaybackLevelIsSaved &&
+			carrier_id == s_sndDevices_.savedPlaybackDeviceID;
+
 		main_delay_ms_.store(carrier_delay_ms, std::memory_order_relaxed);
 		main_channel_mode_.store(static_cast<int>(carrier_channel_mode), std::memory_order_relaxed);
 		carrier_trim_.store(outputTrimGain(carrier_volume_percent), std::memory_order_relaxed);
@@ -881,14 +886,14 @@ void AudioPassthruPrivate::applyAdditionalOutputs()
 		* The real device of an enabled carrier is set to 100% and unmuted when the engine starts using it: after
 		* every reinit (start, power on, carrier switch) and when the carrier output gets enabled. Once only, no
 		* callback keeps forcing it. Only while processing: when FxSound is off, the real device is the Windows
-		* default and plays the apps' sound directly at its own level. carrier_plays already excludes the FxSound
-		* virtual device.
+		* default and plays the apps' sound directly at its own level. Only once its own setting is saved, so it
+		* can be handed back. carrier_plays already excludes the FxSound virtual device.
 		*/
 		if (!carrier_plays)
 		{
 			carrier_full_volume_id_.clear();
 		}
-		else if (processing && !handed_back_ && carrier_full_volume_id_ != carrier_id)
+		else if (processing && !handed_back_ && carrier_setting_saved && carrier_full_volume_id_ != carrier_id)
 		{
 			carrier_full_volume_id_ = carrier_id;
 			set_full_volume_id = carrier_id;

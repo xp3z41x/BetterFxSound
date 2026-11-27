@@ -36,9 +36,8 @@ class SecondaryOutput;
 // only attenuation is the app's software gain (Windows master volume x the output's trim). Called
 // when the engine starts using the device, never from an audio processing or render loop.
 // event_context tags the change in the device's volume notifications (NULL is allowed).
-// Returns false if the device or its volume control is not available. The caller makes sure it is
-// never used on the FxSound virtual device.
-bool setDeviceFullVolume(IMMDevice* device, const GUID* event_context);
+// Returns false if the device or its volume control is not available. The caller saves the device's
+// own setting first, and makes sure it is never used on the FxSound virtual device.
 bool setDeviceFullVolumeById(const std::wstring& device_id, const GUID* event_context);
 
 // Rewrites an interleaved block in place for the given channel mode (no-op for Both).
@@ -72,9 +71,10 @@ public:
 	void stopAll();
 
 	// Whether the engine drives the outputs: FxSound is on and processing, with the FxSound virtual
-	// device as the Windows default. While it is not, an output whose stream opens leaves its device's
-	// volume alone (the device may be the Windows default, playing the apps' sound directly); its
-	// device is set to 100% and unmuted here, on the calling thread, once driving starts again.
+	// device as the Windows default. Each output saves its device's own level and mute and sets it to
+	// 100% and unmuted while driven (at stream open, or here when driving starts), and puts the saved
+	// setting back when driving stops (here, on power off), when it is removed, and at exit.
+	// The device volume calls are made on the calling thread, without holding the router's lock.
 	// UI/timer thread.
 	void setDriven(bool driven);
 
@@ -90,5 +90,7 @@ private:
 
 	SRWLOCK lock_;
 	std::atomic<bool> driven_{ false };	// Read by the outputs' render threads
-	std::vector<std::unique_ptr<SecondaryOutput>> outputs_;
+	// shared_ptr so that setDriven() can keep the outputs alive while it works on them without the lock.
+	// Only the UI thread holds extra references, so an output is never destroyed on the audio thread.
+	std::vector<std::shared_ptr<SecondaryOutput>> outputs_;
 };

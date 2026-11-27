@@ -428,12 +428,15 @@ struct sndDevicesHdlType {
 	// the setting the device had before FxSound applied its own to it, plus any the user has since made
 	// on the device itself. It is put back on that device when FxSound stops driving it, so a device we
 	// stop using is not left muted when the user never muted it.
-	// There is deliberately no saved volume: the FxSound volume control and the device's volume follow
-	// each other, so a change made through either one is the user's own, and putting an older value
-	// back would undo it.
+	// BetterFxSound: the device's own volume level is saved and put back the same way. While FxSound uses
+	// the device as an enabled output, the engine sets it to 100% and unmuted (the Windows volume is then
+	// applied inside the app), so what the device gets back is the level the user had, or has since set on
+	// the device itself.
 	wchar_t savedPlaybackDeviceID[PT_MAX_GENERIC_STRLEN];	// ID of the device this setting belongs to.
 	BOOL savedPlaybackMute;			// Its mute setting.
-	BOOL playbackSettingsAreSaved;	// TRUE when the two values above hold a valid setting.
+	float savedPlaybackLevel;		// Its volume level, 0..1 as IAudioEndpointVolume reports it.
+	BOOL savedPlaybackLevelIsSaved;	// FALSE if the level could not be read; then only mute is put back.
+	BOOL playbackSettingsAreSaved;	// TRUE when the values above hold a valid setting.
 
 	int noBufferCount;			// This is a count of how many times no buffers were available in a DoRecording call.
 	int WindowsSilentBufferCount;				// This is a buffer specified by the Windows flag to be all zeros.

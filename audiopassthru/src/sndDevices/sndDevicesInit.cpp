@@ -109,6 +109,8 @@ int PT_DECLSPEC sndDevicesInit(PT_HANDLE *hp_sndDevices, CSlout *hp_slout, int i
 	// Note these must survive a re-init, they are only reset here in the one time init call.
 	wcscpy(cast_handle->savedPlaybackDeviceID, L"");
 	cast_handle->savedPlaybackMute = FALSE;
+	cast_handle->savedPlaybackLevel = 1.0f;
+	cast_handle->savedPlaybackLevelIsSaved = FALSE;
 	cast_handle->playbackSettingsAreSaved = FALSE;
 
 	for(i=0; i<SND_DEVICES_MAX_NUM_DEVICES; i++)

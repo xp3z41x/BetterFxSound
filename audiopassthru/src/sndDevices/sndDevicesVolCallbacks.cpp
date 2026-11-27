@@ -203,9 +203,9 @@ HRESULT STDMETHODCALLTYPE CsndDevicesAudioEndpointVolumeCallbackPlayback::QueryI
 
 // PTNOTE - this is the callback hit when the playback volume control is moved.
 // BetterFxSound: the real playback device's volume and mute are no longer copied to the FxSound virtual
-// device. Only the saved mute setting is kept up to date, so that what gets put back on the device when
-// FxSound stops driving it is what the user set last. The engine's own change (100% and unmuted when it
-// starts using the device) carries guidThisApplication and is ignored here.
+// device. Only the saved mute setting and level are kept up to date, so that what gets put back on the
+// device when FxSound stops driving it is what the user set last. The engine's own changes (100% and
+// unmuted when it starts using the device, the setting put back) carry guidThisApplication and are ignored.
 HRESULT STDMETHODCALLTYPE CsndDevicesAudioEndpointVolumeCallbackPlayback::OnNotify(PAUDIO_VOLUME_NOTIFICATION_DATA pNotify)
 {
 	struct sndDevicesHdlType *cast_handle;
@@ -231,6 +231,8 @@ HRESULT STDMETHODCALLTYPE CsndDevicesAudioEndpointVolumeCallbackPlayback::OnNoti
 			 (wcscmp(cast_handle->savedPlaybackDeviceID, cast_handle->pwszID[cast_handle->playbackDeviceNum]) == 0))
 		{
 			cast_handle->savedPlaybackMute = pNotify->bMuted;
+			cast_handle->savedPlaybackLevel = pNotify->fMasterVolume;
+			cast_handle->savedPlaybackLevelIsSaved = TRUE;
 		}
 	}
 	return S_OK;

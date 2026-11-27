@@ -118,8 +118,10 @@ public:
 	// is present plays through the additional outputs. The FxSound virtual device is always
 	// ignored. Zero enabled outputs means silence; processing keeps running.
 	// When the engine starts using an enabled output's device (stream opened, reinit, power on,
-	// output enabled), it sets that device's own volume to 100% and unmutes it, once, so it does
-	// not stack on the app's gain. The FxSound virtual device's volume is never changed.
+	// output enabled), it saves that device's own level and mute, then sets it to 100% and unmuted,
+	// once, so it does not stack on the app's gain. When it stops using the device (output removed,
+	// carrier switch, power off, exit), it puts the saved level and mute back. Nothing is kept
+	// across a crash. The FxSound virtual device's volume is never changed.
 	void setOutputs(const std::vector<OutputConfig>& outputs);
 
 	// BetterFxSound: measures the delay of every enabled output that is present (the carrier

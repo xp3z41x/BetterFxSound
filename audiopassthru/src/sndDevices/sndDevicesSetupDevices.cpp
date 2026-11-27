@@ -221,12 +221,12 @@ int PT_DECLSPEC sndDevicesFinalSetupCaptureDevice(PT_HANDLE *hp_sndDevices, int 
 
 /*
  * FUNCTION: sndDevices_RestoreSavedPlaybackDeviceSettings()
- * Puts the saved mute setting back on the real playback device it was saved from.
+ * Puts the saved mute setting, and (BetterFxSound) the saved volume level, back on the real playback device
+ * they were saved from.
  * Called whenever FxSound stops driving that device, either because it is switching to a different
  * playback device, or because it is handing control back to the real device on exit or power off.
- * Only mute is restored. The device's volume is not put back. BetterFxSound: if the device was an enabled
- * output, the engine set it to 100% when it started using it (the Windows volume is applied inside the app
- * as a software gain), so it is handed back at 100%.
+ * BetterFxSound: while the device is an enabled output the engine keeps it at 100% and unmuted (the Windows
+ * volume is applied inside the app as a software gain), so this is what gives the user their own level back.
  * The device is looked up by its ID in the current device list rather than held as an object pointer,
  * since all device objects are released and re-created on every re-init. If the device is no longer
  * present there is nothing to restore, its setting went away with it.
@@ -254,6 +254,10 @@ static void sndDevices_RestoreSavedPlaybackDeviceSettings(struct sndDevicesHdlTy
 	hr = pDevice->Activate(cast_handle->IID_IAudioEndpointVolume, CLSCTX_ALL, NULL, (void**)&pEndptVol);
 	if( FAILED(hr) || (pEndptVol == NULL) )
 		return;
+
+	// BetterFxSound: the level first, then mute: some drivers clear the mute flag as a side effect of a level change.
+	if( cast_handle->savedPlaybackLevelIsSaved )
+		pEndptVol->SetMasterVolumeLevelScalar(cast_handle->savedPlaybackLevel, &(cast_handle->guidThisApplication));
 
 	pEndptVol->SetMute(cast_handle->savedPlaybackMute, &(cast_handle->guidThisApplication));
 
@@ -320,7 +324,7 @@ int PT_DECLSPEC sndDevicesInitialSetupPlaybackDevice(PT_HANDLE *hp_sndDevices, i
 		}
 
 		// If we are moving onto a different playback device, hand the device we are leaving its own
-		// mute setting back, then take a copy of the new device's mute setting before this app changes it.
+		// mute setting and level back, then take a copy of the new device's before this app changes them.
 		// Note this must happen before AudioPassthruPrivate::applyAdditionalOutputs() runs after the reinit:
 		// for an enabled carrier output it sets the device to 100% and unmutes it.
 		if( (cast_handle->playbackDeviceNum >= 0) && (cast_handle->playbackDeviceNum < SND_DEVICES_MAX_NUM_DEVICES) )
@@ -330,7 +334,7 @@ int PT_DECLSPEC sndDevicesInitialSetupPlaybackDevice(PT_HANDLE *hp_sndDevices, i
 
 			if( cast_handle->playbackSettingsAreSaved && (wcscmp(cast_handle->savedPlaybackDeviceID, playbackDeviceID) != 0) )
 			{
-				// Switching away, so put the device's own mute setting back.
+				// Switching away, so put the device's own mute setting and level back.
 				sndDevices_RestoreSavedPlaybackDeviceSettings(cast_handle);
 				cast_handle->playbackSettingsAreSaved = FALSE;
 			}
@@ -341,6 +345,8 @@ int PT_DECLSPEC sndDevicesInitialSetupPlaybackDevice(PT_HANDLE *hp_sndDevices, i
 				{
 					wcscpy(cast_handle->savedPlaybackDeviceID, playbackDeviceID);
 					cast_handle->savedPlaybackMute = playbackMuteSetting;
+					// BetterFxSound: its level too, saved before the engine sets it to 100%.
+					cast_handle->savedPlaybackLevelIsSaved = SUCCEEDED(cast_handle->pEndptVolPlayback->GetMasterVolumeLevelScalar(&(cast_handle->savedPlaybackLevel))) ? TRUE : FALSE;
 					cast_handle->playbackSettingsAreSaved = TRUE;
 				}
 			}
@@ -548,13 +554,13 @@ int PT_DECLSPEC sndDevicesRestoreDefaultDevice(PT_HANDLE *hp_sndDevices, int *ip
 	// treats picking a different output device, so that device's own mute setting applies from here
 	// on - not FxSound's. Done before the default device is changed below, so the device already
 	// carries its own mute setting by the time the user is listening through it.
-	// BetterFxSound: the device's volume is not restored. If it was an enabled output, the engine set it to
-	// 100% when it started using it (the Windows volume is applied inside the app as a software gain), and it
-	// is handed back at that level.
+	// BetterFxSound: its own volume level goes back on it the same way. The engine kept it at 100% while
+	// using it, so without this the apps would play at full level as soon as FxSound is off.
 	// Note the FxSound mute setting is not lost by this: it stays on the DFX device, which Windows
 	// remembers, so muting FxSound and restarting it comes back muted.
 	// Note also that playbackSettingsAreSaved is deliberately left set. On a power off the process
-	// carries on running, and the saved mute setting is still the device's true own setting.
+	// carries on running, and the saved mute setting and level are still the device's true own setting
+	// (the playback volume callback keeps them up to date while FxSound is off).
 	sndDevices_RestoreSavedPlaybackDeviceSettings(cast_handle);
 
 	//Check to see if the user has selected the playback device.

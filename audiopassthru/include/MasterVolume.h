@@ -29,8 +29,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
  * before the endpoint volume, so the captured audio is always full scale. The level and mute of
  * the virtual device are therefore read here and applied by the app itself to each output. So that
  * a real device's own level does not stack on this gain, the engine sets the real device of every
- * enabled output to 100% and unmutes it when it starts using it. The virtual device's own volume is
- * never changed.
+ * enabled output to 100% and unmutes it when it starts using it, and puts the device's own level and
+ * mute back when it stops using it. The virtual device's own volume is never changed.
  *
  * Threading: masterVolumePublish() is called from the COM thread that delivers the endpoint
  * volume callback and from the thread doing the device reinit. It only uses the values passed in.
