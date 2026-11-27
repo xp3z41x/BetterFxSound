@@ -9,8 +9,10 @@ needs to change the contract, it asks the orchestrator first.
 1. **Windows master volume applies to every output.** The level and mute of the FxSound
    virtual device become a software gain applied by the app to every output:
    `gain = master_scalar * (mute ? 0 : 1) * trim(volume_percent)`. The app no longer copies
-   the master volume to a real device's endpoint volume, in either direction. The app no
-   longer changes the volume of real devices.
+   the master volume to a real device's endpoint volume, in either direction. To avoid
+   stacking two volumes, the real device of every enabled output is set to 100% and unmuted
+   when the engine starts using it; its own level and mute are saved and restored when
+   FxSound hands it back (power off, exit). Owner's decision after review.
 2. **No "main output" in the UI or in the model.** Every output has a checkbox and can be
    disabled. Internally the engine still has a **carrier**: one enabled output on the original
    low-latency path (`SND_DEVICES_TARGETED_REAL_PLAYBACK`). The other enabled outputs go
