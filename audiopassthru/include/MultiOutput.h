@@ -152,8 +152,11 @@ public:
 	* largest of them: the outputs here by themselves, the carrier by the value returned (ms, 0 when there is no output
 	* here, so the carrier alone keeps its own latency). They differed by up to tens of ms, so delays synchronized with
 	* one carrier were wrong once another device became the carrier.
+	* BetterFxSound: an output not opened yet counts at the nominal latency of an output (the least one opens with), and the
+	* common latency is lowered only while carrier_silent (the carrier's delay line holds no sound): the carrier's offset
+	* jumped whenever the set of opened outputs changed, a fade and a gap of tens of ms on the carrier in mid-audio.
 	*/
-	int alignPaths(int carrier_latency_ms);
+	int alignPaths(int carrier_latency_ms, bool carrier_silent);
 
 	// Audio thread: queues one block of processed, interleaved 32 bit float audio.
 	// solo_index >= 0: only that output gets the audio, the others get silence.
@@ -181,6 +184,7 @@ private:
 	UINT32 skipped_rate_ = 0;
 	DWORD skipped_tick_ = 0;
 	int carrier_path_offset_ms_ = 0;	// BetterFxSound, audio thread only: the last alignPaths() result
+	int path_reference_ms_ = 0;			// BetterFxSound, audio thread only: the common latency alignPaths() last used
 	// Read by the outputs' render threads, which may outlive the router (see above), hence shared.
 	std::shared_ptr<std::atomic<bool>> driven_;
 	// BetterFxSound: set by an output freed late on its render thread (takeLateExits()). Shared for the same reason.

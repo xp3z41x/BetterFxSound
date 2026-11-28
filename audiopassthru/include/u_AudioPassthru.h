@@ -164,6 +164,7 @@ private:
 	static constexpr DWORD kCalibrationExitWaitMs = 5000;	// BetterFxSound: ~AudioPassthruPrivate() waits this long for a delay measurement
 	bool shut_down_ = false;					// BetterFxSound: shutdown() ran
 	bool shutdown_safe_ = true;					// BetterFxSound: and the processing thread is known to have ended
+	std::atomic<bool> dsp_released_{ false };	// BetterFxSound: shutdown() gave up on the processing thread: it must no longer use p_dfx_dsp_
 	bool handed_back_ = false;					// restoreDefaultPlaybackDevice() called, until processing starts again
 	bool parked_ = false;						// The last reinit failed, until one succeeds or power off
 	std::wstring failed_carrier_id_;			// Carrier reported as failed (getFailedCarrierId()), until a reinit succeeds
@@ -187,6 +188,7 @@ private:
 	UINT32 main_delay_write_ = 0;
 	UINT32 main_delay_format_ = 0;
 	UINT32 main_delay_applied_frames_ = 0;		// Delay the line reads with (frames), follows main_delay_ms_ through a fade
+	UINT32 main_delay_silent_frames_ = 0;		// BetterFxSound: frames written last in a row that are silent (at most kMainDelayFrames)
 	float main_delay_fade_ = 1.0f;				// Gain of the line's output during that fade
 	bool main_delay_switching_ = false;			// Fading out to move to a new delay
 

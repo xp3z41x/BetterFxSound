@@ -141,6 +141,9 @@ bool AudioPassthruPrivate::shutdown()
 	   stopped, or it did not end in time): it may still run, so this object is left allocated (see above). */
 	if (killProcessingThread(&i_timed_out) != OKAY)
 	{
+		// BetterFxSound: the DSP belongs to the controller, which is destroyed after this returns (this object is not):
+		// the thread stops at its next block instead of using it (threadWorker()).
+		dsp_released_.store(true);
 		shutdown_safe_ = false;
 		return false;
 	}
@@ -148,6 +151,7 @@ bool AudioPassthruPrivate::shutdown()
 	/* If the killing of processing attempt timed out, then we can't do anything else */
 	if (i_timed_out)
 	{
+		dsp_released_.store(true);
 		shutdown_safe_ = false;
 		return false;
 	}
@@ -156,9 +160,22 @@ bool AudioPassthruPrivate::shutdown()
 	   volume state reset from propagating to the real speakers during shutdown. */
 	s_sndDevices_.ignoreVolumeCallbacks = TRUE;
 
-	/* Change the default soundcard to not be the DFX virtual one but instead the proper real one */
-	if (sndDevicesRestoreDefaultDevice(hp_sndDevices_, &i_result_flag) != OKAY)
-		return true;
+	/*
+	* Change the default soundcard to not be the DFX virtual one but instead the proper real one.
+	* BetterFxSound: when the devices were already handed back (FxSound off), only if the virtual device is the Windows
+	* default again: the user may have picked another default since, which must not be replaced by the old carrier
+	* at exit (the rule FxController::powerOn(false) follows). A failure no longer skips the hand-back below.
+	*/
+	bool handed_back;
+	{
+		std::lock_guard<std::mutex> lock(config_mutex_);
+		handed_back = handed_back_;
+	}
+	BOOL virtual_is_default = TRUE;
+	if (handed_back && sndDevicesGetVirtualDeviceIsDefault(hp_sndDevices_, &virtual_is_default) != OKAY)
+		virtual_is_default = FALSE;
+	if (!handed_back || virtual_is_default)
+		(void)sndDevicesRestoreDefaultDevice(hp_sndDevices_, &i_result_flag);
 
 	/* BetterFxSound: anything still owed to a present device goes back on it at exit */
 	handBackUnusedDevices(std::vector<std::wstring>());
@@ -877,8 +894,9 @@ DWORD AudioPassthruPrivate::threadWorker(HANDLE h_wait_timer)
 		if (resultFlag != SND_DEVICES_CAPTURE_PLAYBACK_SUCCESS)
 			goto KillProcessingThread;
 
-		/* Check if thread has been signaled to end */
-		if (i_kill_processing_thread_)
+		/* Check if thread has been signaled to end. BetterFxSound: or shutdown() gave up waiting for it, and the DSP it
+		   uses may already be destroyed. */
+		if (i_kill_processing_thread_ || dsp_released_.load())
 			goto KillProcessingThread;
 
 		if (numSampleSets > 0)
@@ -933,7 +951,9 @@ DWORD AudioPassthruPrivate::threadWorker(HANDLE h_wait_timer)
 				int carrier_latency_ms = 0;
 				if (s_sndDevices_.wfxCapture.nSamplesPerSec > 0)
 					carrier_latency_ms = (int)((UINT64)(s_sndDevices_.bufferFrameSizeCapture / 2) * 1000 / s_sndDevices_.wfxCapture.nSamplesPerSec);
-				carrier_path_offset_ms_ = multi_output_.alignPaths(carrier_latency_ms);
+				// BetterFxSound: a lower offset waits until what the carrier's delay line holds is silent (alignPaths()).
+				const bool carrier_silent = (main_delay_silent_frames_ > main_delay_applied_frames_);
+				carrier_path_offset_ms_ = multi_output_.alignPaths(carrier_latency_ms, carrier_silent);
 			}
 
 			if (!mute_ && !silence_fill)
@@ -1827,6 +1847,7 @@ void AudioPassthruPrivate::applyMainDelay(float* buffer, UINT32 frames, UINT32 c
 		main_delay_write_ = 0;
 		main_delay_format_ = format;
 		main_delay_applied_frames_ = delay_frames;
+		main_delay_silent_frames_ = kMainDelayFrames;
 		main_delay_fade_ = 1.0f;
 		main_delay_switching_ = false;
 		s_sndDevices_.carrierDelayTailFrames = 0;
@@ -1866,6 +1887,19 @@ void AudioPassthruPrivate::applyMainDelay(float* buffer, UINT32 frames, UINT32 c
 			main_delay_fade_ = (main_delay_fade_ + fade_step < 1.0f) ? main_delay_fade_ + fade_step : 1.0f;
 
 		float* frame = buffer + (size_t)i * channels;
+
+		// BetterFxSound: how long the line has been fed silence (about -100 dB or less), see alignPaths()
+		bool frame_silent = true;
+		for (UINT32 c = 0; c < channels; c++)
+		{
+			if (frame[c] > 1.0e-5f || frame[c] < -1.0e-5f)
+				frame_silent = false;
+		}
+		if (!frame_silent)
+			main_delay_silent_frames_ = 0;
+		else if (main_delay_silent_frames_ < kMainDelayFrames)
+			main_delay_silent_frames_++;
+
 		float* slot_in = &main_delay_buffer_[(size_t)(main_delay_write_ & mask) * kMainDelayChannels];
 		memcpy(slot_in, frame, sizeof(float) * channels);
 		const float* slot_out = &main_delay_buffer_[(size_t)((main_delay_write_ - main_delay_applied_frames_) & mask) * kMainDelayChannels];
@@ -1928,6 +1962,9 @@ bool AudioPassthruPrivate::startDelayCalibration()
 
 	std::vector<DelayCalibration::Target> targets;
 	std::wstring no_targets_error;
+	// BetterFxSound: built here and stored only once this request has really started a measurement, so a second
+	// request while one runs (refused by calibration_->start()) cannot replace the running one's list.
+	std::vector<std::wstring> unavailable;
 	{
 		// BetterFxSound: router_mutex_ too, so the router's list is the one effective_outputs_ holds (applyAdditionalOutputs()).
 		std::lock_guard<std::mutex> router_lock(router_mutex_);
@@ -1944,18 +1981,17 @@ bool AudioPassthruPrivate::startDelayCalibration()
 		// not measured: its sweeps could not be heard, and it was reported as not heard. It gets an entry that says so
 		// (getDelayCalibrationResults()). Its index stays its own.
 		const std::vector<AdditionalOutputStatus> router_status = multi_output_.getStatus();
-		calibration_unavailable_.clear();
 		for (size_t i = 0; i < effective_outputs_.size(); i++)
 		{
-			bool unavailable = false;
+			bool failed = false;
 			for (const auto& status : router_status)
 			{
 				if (status.device_id == effective_outputs_[i].device_id && status.failed)
-					unavailable = true;
+					failed = true;
 			}
-			if (unavailable)
+			if (failed)
 			{
-				calibration_unavailable_.push_back(effective_outputs_[i].device_id);
+				unavailable.push_back(effective_outputs_[i].device_id);
 				continue;
 			}
 			DelayCalibration::Target target = { effective_outputs_[i].device_id, (int)i, effective_outputs_[i].delay_ms };
@@ -1998,7 +2034,7 @@ bool AudioPassthruPrivate::startDelayCalibration()
 
 			if (!any_enabled)
 				no_targets_error = L"No output is turned on. Turn on at least one output, then synchronize again.";
-			else if (!calibration_unavailable_.empty())
+			else if (!unavailable.empty())
 				no_targets_error = L"The outputs that are turned on could not be opened. Another app may be using them exclusively. Close it, then synchronize again.";
 			else if (!any_connected)
 				no_targets_error = L"None of the outputs that are turned on is connected. Connect one of them, then synchronize again.";
@@ -2015,9 +2051,16 @@ bool AudioPassthruPrivate::startDelayCalibration()
 	// solo_ and multi_output_ are declared before calibration_, which ~AudioPassthruPrivate() shuts down first.
 	std::atomic<int>* solo = &solo_;
 	MultiOutputRouter* router = &multi_output_;
-	return calibration_->start(std::wstring(wcp_dfx_guid), targets, [solo](int index) { solo->store(index, std::memory_order_relaxed); },
+	if (!calibration_->start(std::wstring(wcp_dfx_guid), targets, [solo](int index) { solo->store(index, std::memory_order_relaxed); },
 		[router]() { router->requestExactAlignment(); }, [router]() { return router->exactAlignmentPending(); },
-		no_targets_error, &stream_generation_, stream_generation);
+		no_targets_error, &stream_generation_, stream_generation))
+		return false;
+
+	{
+		std::lock_guard<std::mutex> lock(config_mutex_);
+		calibration_unavailable_.swap(unavailable);
+	}
+	return true;
 }
 
 void AudioPassthruPrivate::cancelDelayCalibration()

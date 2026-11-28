@@ -475,6 +475,13 @@ namespace
 		return true;
 	}
 
+	// BetterFxSound: the device's take-over generation now (restoreOwedVolume() reads it before it waits its turn).
+	unsigned owedVolumeGeneration(const std::wstring& device_id)
+	{
+		std::lock_guard<std::mutex> lock(owedVolumeMutex());
+		return volumeGenerationLocked(device_id);
+	}
+
 	// BetterFxSound: the mutex held through each hand-back of the device (restoreOwedVolume()), so two hand-backs of it
 	// never overlap.
 	std::shared_ptr<std::mutex> owedVolumeHandBackMutex(const std::wstring& device_id)
@@ -595,12 +602,17 @@ namespace
 	// stuck in a driver call for seconds on a Bluetooth device going away) is not waited for. Nothing is done, the device
 	// stays owed (false) and *busy is set: the caller tries again later. The UI and the timer froze for as long as that
 	// driver call hung.
+	// BetterFxSound: the generation is read when the hand-back is asked for, before it waits its turn. A hand-back queued
+	// behind another one of the same device read it only once it ran: a take-over that completed while it waited (the
+	// device made the carrier) then counted as older, and the queued hand-back put the device's own level back and erased
+	// the record the new owner relied on. A take-over since the request wins: nothing is put back, the device stays owed.
 	bool restoreOwedVolume(const std::wstring& device_id, IMMDevice* device, bool wait, bool* busy)
 	{
 		if (busy != nullptr)
 			*busy = false;
 		if (device_id.empty())
 			return true;
+		const unsigned requested_generation = owedVolumeGeneration(device_id);
 		const std::shared_ptr<std::mutex> serial = owedVolumeHandBackMutex(device_id);
 		std::unique_lock<std::mutex> serial_lock(*serial, std::defer_lock);
 		if (wait)
@@ -619,6 +631,8 @@ namespace
 		BOOL mute = FALSE;
 		if (!owedVolumeSnapshot(device_id, &generation, &level, &mute))
 			return true;
+		if (generation != requested_generation)
+			return false;
 
 		auto hand_back = [level, mute](IAudioEndpointVolume* volume) -> bool
 		{
@@ -2660,15 +2674,17 @@ bool MultiOutputRouter::exactAlignmentPending()
 	return pending;
 }
 
-int MultiOutputRouter::alignPaths(int carrier_latency_ms)
+int MultiOutputRouter::alignPaths(int carrier_latency_ms, bool carrier_silent)
 {
 	// Never wait on the audio thread: while the list is being changed, the last offsets stay.
 	if (!TryAcquireSRWLockShared(&lock_))
 		return carrier_path_offset_ms_;
 
 	// The common latency: the largest of the carrier's and the outputs' (those not opened yet are lined up once they are).
+	// BetterFxSound: an output not opened yet counts at the nominal latency, the least an output opens with
+	// (SecondaryOutput::pathLatencyMs()), so the carrier's offset does not jump when the first output opens.
+	const int nominal_latency = SecondaryOutput::kBaseLatencyMs + SecondaryOutput::kDeviceAllowanceMs + SecondaryOutput::kWritePhaseMs;
 	int reference = carrier_latency_ms > 0 ? carrier_latency_ms : 0;
-	bool any_output = false;
 	// BetterFxSound: and the shortest. No path is delayed by more than SecondaryOutput::kMaxPathOffsetMs, the carrier's
 	// included: the reference is capped at the shortest plus that, so every path up to it still gets the same latency
 	// (a path even slower keeps its own), whichever device is the carrier. Only the outputs here were capped.
@@ -2678,8 +2694,9 @@ int MultiOutputRouter::alignPaths(int carrier_latency_ms)
 	{
 		if (output == nullptr)
 			continue;
-		any_output = true;
-		const int latency = output->pathLatencyMs();
+		int latency = output->pathLatencyMs();
+		if (latency < 0)
+			latency = nominal_latency;
 		if (latency > reference)
 			reference = latency;
 		if (latency >= 0 && (!any_latency || latency < shortest))
@@ -2690,6 +2707,17 @@ int MultiOutputRouter::alignPaths(int carrier_latency_ms)
 	}
 	if (any_latency && reference > shortest + SecondaryOutput::kMaxPathOffsetMs)
 		reference = shortest + SecondaryOutput::kMaxPathOffsetMs;
+	// BetterFxSound: a lower common latency (an output removed, the last one included) waits until the carrier is silent:
+	// the carrier's offset changes through a fade and a gap (AudioPassthruPrivate::applyMainDelay()), heard in mid-audio.
+	// Until then every path keeps the previous one, so they stay lined up. A higher one applies at once (an output that
+	// is slower than the others is lined up with them).
+	if (!carrier_silent && reference < path_reference_ms_)
+	{
+		reference = path_reference_ms_;
+		if (any_latency && reference > shortest + SecondaryOutput::kMaxPathOffsetMs)
+			reference = shortest + SecondaryOutput::kMaxPathOffsetMs;
+	}
+	path_reference_ms_ = reference;
 	for (const auto& output : outputs_)
 	{
 		if (output == nullptr)
@@ -2697,7 +2725,7 @@ int MultiOutputRouter::alignPaths(int carrier_latency_ms)
 		const int latency = output->pathLatencyMs();
 		output->setPathOffsetMs(latency >= 0 ? reference - latency : 0);
 	}
-	carrier_path_offset_ms_ = (any_output && carrier_latency_ms > 0 && reference > carrier_latency_ms) ? reference - carrier_latency_ms : 0;
+	carrier_path_offset_ms_ = (carrier_latency_ms > 0 && reference > carrier_latency_ms) ? reference - carrier_latency_ms : 0;
 
 	ReleaseSRWLockShared(&lock_);
 	return carrier_path_offset_ms_;
