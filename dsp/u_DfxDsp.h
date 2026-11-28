@@ -96,6 +96,7 @@ public:
 	~DfxDspPrivate();
 	int processAudio(short int *si_input_samples, short int *si_output_samples, int i_num_sample_sets, int i_check_for_duplicate_buffers);
 	int setSignalFormat(int i_bps, int i_nch, int i_srate, int i_valid_bits);
+	int prepareSignalFormat(int i_bps, int i_nch, int i_srate, int i_valid_bits);
 	int loadPreset(std::wstring preset_file_full_path);
 	int savePreset(std::wstring preset_name, std::wstring preset_file_full_path);
 	int exportPreset(std::wstring preset_source_file_full_path, std::wstring preset_name, std::wstring preset_export_path);
@@ -132,6 +133,7 @@ public:
 private:
 	int eqUpdateFromRegistry(int *ip_eq_changed);
 	int eqSyncFromRegistry();
+	int applySignalFormatLocked(int i_bps, int i_nch, int i_srate, int i_valid_bits);
 	int getStateInfoFromVals(PT_HANDLE *hp_vals, bool b_include_eq = true);
 	int getGraphicEqInfoFromVals(PT_HANDLE *hp_vals);
 	int createValsFromStateInfo(wchar_t *preset_name, PT_HANDLE **hpp_vals);
@@ -172,8 +174,9 @@ private:
 	// preset load holding it never stalls the audio.
 	CRITICAL_SECTION param_lock_;
 
-	// BetterFxSound: last format handed to setSignalFormat() (processing thread only), so the
-	// per-buffer call can skip the lock when nothing changed.
+	// BetterFxSound: last format handed to setSignalFormat() (processing thread only, or
+	// prepareSignalFormat() while no processing thread runs), so the per-buffer call can skip
+	// the lock when nothing changed.
 	int last_signal_bps_ = -1;
 	int last_signal_nch_ = -1;
 	int last_signal_srate_ = -1;

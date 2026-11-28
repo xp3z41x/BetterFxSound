@@ -871,7 +871,6 @@ int dfxp_CommunicateVocalReduction(PT_HANDLE *hp_dfxp)
 int dfxp_CommunicateBassBoost(PT_HANDLE *hp_dfxp)
 {
 	struct dfxpHdlType *cast_handle;
-	PT_HANDLE *com_hdl;
 
 	cast_handle = (struct dfxpHdlType *)(hp_dfxp);
 
@@ -900,23 +899,70 @@ int dfxp_CommunicateBassBoost(PT_HANDLE *hp_dfxp)
 											  &filt) != OKAY)
 		return(NOT_OKAY);
 
+	/* BetterFxSound: stage the coefficients as one set; the processing thread writes them to
+	 * the DSP memory at the start of its next buffer (see bass_boost_coeffs in u_dfxp.h). */
+	InterlockedIncrement(&(cast_handle->bass_boost_coeffs_seq));
+	cast_handle->bass_boost_coeffs[0] = filt.b0;
+	cast_handle->bass_boost_coeffs[1] = filt.b1;
+	cast_handle->bass_boost_coeffs[2] = filt.b2;
+	cast_handle->bass_boost_coeffs[3] = filt.a1;
+	cast_handle->bass_boost_coeffs[4] = filt.a2;
+	InterlockedIncrement(&(cast_handle->bass_boost_coeffs_seq));
+
+	return(OKAY);
+}
+
+/*
+ * FUNCTION: dfxp_ApplyBassBoostCoeffs()
+ * DESCRIPTION:
+ *   BetterFxSound: called by the processing thread at the start of each buffer. If
+ *   dfxp_CommunicateBassBoost() staged a new, complete coefficient set, writes it to the Play
+ *   DSP memory, so the filter never runs a half-updated biquad. Lock-free: a set that is being
+ *   written (odd sequence) or changes while it is copied is picked up on the next buffer.
+ */
+int dfxp_ApplyBassBoostCoeffs(PT_HANDLE *hp_dfxp)
+{
+	struct dfxpHdlType *cast_handle;
+	PT_HANDLE *com_hdl;
+	realtype coeffs[5];
+	long seq_start, seq_end;
+	int i;
+
+	cast_handle = (struct dfxpHdlType *)(hp_dfxp);
+
+	if (cast_handle == NULL)
+		return(OKAY);
+
+	seq_start = InterlockedCompareExchange(&(cast_handle->bass_boost_coeffs_seq), 0, 0);
+	if ((seq_start == cast_handle->bass_boost_coeffs_applied_seq) || (seq_start & 1))
+		return(OKAY);
+
+	for (i = 0; i < 5; i++)
+		coeffs[i] = cast_handle->bass_boost_coeffs[i];
+
+	seq_end = InterlockedCompareExchange(&(cast_handle->bass_boost_coeffs_seq), 0, 0);
+	if (seq_end != seq_start)
+		return(OKAY);
+
+	cast_handle->bass_boost_coeffs_applied_seq = seq_start;
+
 	/* Write filter coeffs to front channels. */
 	com_hdl = cast_handle->com_hdl_front;
 
 	if (comRealWrite(com_hdl, DSP_PLAY_B0, 
-		              filt.b0) != OKAY)
+		              coeffs[0]) != OKAY)
 		return(NOT_OKAY);
 	if (comRealWrite(com_hdl, DSP_PLAY_B1, 
-		              filt.b1) != OKAY)
+		              coeffs[1]) != OKAY)
 		return(NOT_OKAY);
 	if (comRealWrite(com_hdl, DSP_PLAY_B2, 
-		              filt.b2) != OKAY)
+		              coeffs[2]) != OKAY)
 		return(NOT_OKAY);
 	if (comRealWrite(com_hdl, DSP_PLAY_A1, 
-		              filt.a1) != OKAY)
+		              coeffs[3]) != OKAY)
 		return(NOT_OKAY);
 	if (comRealWrite(com_hdl, DSP_PLAY_A2, 
-		              filt.a2) != OKAY)
+		              coeffs[4]) != OKAY)
 		return(NOT_OKAY);
 
 	/* Write filter coeffs to subwoofer also if in surround sound mode */
@@ -924,19 +970,19 @@ int dfxp_CommunicateBassBoost(PT_HANDLE *hp_dfxp)
 		com_hdl = cast_handle->com_hdl_subwoofer;
 
 	if (comRealWrite(com_hdl, DSP_PLAY_B0, 
-		              filt.b0) != OKAY)
+		              coeffs[0]) != OKAY)
 		return(NOT_OKAY);
 	if (comRealWrite(com_hdl, DSP_PLAY_B1, 
-		              filt.b1) != OKAY)
+		              coeffs[1]) != OKAY)
 		return(NOT_OKAY);
 	if (comRealWrite(com_hdl, DSP_PLAY_B2, 
-		              filt.b2) != OKAY)
+		              coeffs[2]) != OKAY)
 		return(NOT_OKAY);
 	if (comRealWrite(com_hdl, DSP_PLAY_A1, 
-		              filt.a1) != OKAY)
+		              coeffs[3]) != OKAY)
 		return(NOT_OKAY);
 	if (comRealWrite(com_hdl, DSP_PLAY_A2, 
-		              filt.a2) != OKAY)
+		              coeffs[4]) != OKAY)
 		return(NOT_OKAY);
 
 	return(OKAY);

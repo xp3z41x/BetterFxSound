@@ -31,6 +31,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "spectrum.h"
 #include "com.h"
 #include "DfxSdk.h"
+#include "GraphicEq.h"
 
 extern "C" {
 #include "comSftwr.h"
@@ -116,6 +117,12 @@ int dfxpBeginProcess(PT_HANDLE *hp_dfxp, int i_bits_per_sample, int i_num_channe
 			cast_handle->internal_rate_ratio = 4;
 		}
 	}
+
+	/* BetterFxSound: redesign the EQ bands for the new rate here, where the format change is
+	 * serialized with the EQ setters, instead of letting GraphicEqProcess() find the mismatch
+	 * on the processing thread and recalculate every band while a setter may be writing them. */
+	if (cast_handle->eq.graphicEq_hdl != NULL)
+		GraphicEqSetSamplingFreq(cast_handle->eq.graphicEq_hdl, cast_handle->sampling_freq);
 
 	/* Check to see if this format is supported */
 	if( (r_sample_rate  > (realtype)DFXP_MAX_SAMPLING_FREQ) ||

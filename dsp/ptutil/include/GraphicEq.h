@@ -60,6 +60,7 @@ void PT_DECLSPEC GraphicEqSetVolumeLeveling(PT_HANDLE* hp_GraphicEq, float gain_
 /* GraphicEqSet.cpp */
 int PT_DECLSPEC GraphicEqSetBandBoostCut(PT_HANDLE *hp_GraphicEq, int i_band_num, realtype r_boost_cut);
 int PT_DECLSPEC GraphicEqReCalcAllBandCoeffs(PT_HANDLE *hp_GraphicEq);
+int PT_DECLSPEC GraphicEqSetSamplingFreq(PT_HANDLE *hp_GraphicEq, realtype r_samp_freq);
 int PT_DECLSPEC GraphicEqReSetAllBandFreqs(PT_HANDLE *hp_GraphicEq, realtype r_min_band_freq, realtype r_max_band_freq);
 int PT_DECLSPEC GraphicEqSetBandFreq(PT_HANDLE *hp_GraphicEq, int i_band_num, realtype r_band_freq);
 int PT_DECLSPEC GraphicEqGetDefaultBandFreq(PT_HANDLE *hp_GraphicEq, int i_band_num, realtype *rp_band_freq);

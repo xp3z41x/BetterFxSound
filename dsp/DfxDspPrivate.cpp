@@ -213,6 +213,36 @@ int DfxDspPrivate::setSignalFormat(int i_bps, int i_nch, int i_srate, int i_vali
 	}
 	DfxDspParamLock lock(&param_lock_, true);
 
+	return applySignalFormatLocked(i_bps, i_nch, i_srate, i_valid_bits);
+}
+
+/*
+* BetterFxSound: applies a signal format ahead of processing, waiting for the parameter lock.
+* A format change (dfxpBeginProcess) frees and reallocates the effect quantization tables and
+* re-initializes the DSP memory; done by setSignalFormat() it runs on the time-critical
+* processing thread. A caller that knows the format before it starts the processing thread
+* (e.g. a reinit after a device switch) can apply it here instead, so the processing thread's
+* first setSignalFormat() call finds it unchanged and does nothing. Only call this while no
+* processing thread is running for this instance (last_signal_* belong to that thread
+* otherwise), and never from the processing thread itself.
+*/
+int DfxDspPrivate::prepareSignalFormat(int i_bps, int i_nch, int i_srate, int i_valid_bits)
+{
+	DfxDspParamLock lock(&param_lock_);
+
+	if ((i_bps == last_signal_bps_) && (i_nch == last_signal_nch_) &&
+		(i_srate == last_signal_srate_) && (i_valid_bits == last_signal_valid_bits_))
+	{
+		format_pending_ = false;
+		return OKAY;
+	}
+
+	return applySignalFormatLocked(i_bps, i_nch, i_srate, i_valid_bits);
+}
+
+// BetterFxSound: shared tail of setSignalFormat()/prepareSignalFormat(); param_lock_ is held.
+int DfxDspPrivate::applySignalFormatLocked(int i_bps, int i_nch, int i_srate, int i_valid_bits)
+{
 	format_pending_ = false;
 
 	last_signal_bps_ = i_bps;

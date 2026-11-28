@@ -39,8 +39,14 @@ int GraphicEq_InitSections(PT_HANDLE *hp_GraphicEq)
 	if (cast_handle == NULL)
 		return(NOT_OKAY);
 
-	/* Set default sampling frequency, can be changed by buffer processing calls */
-	cast_handle->sampling_freq = (realtype)GRAPHIC_EQ_DEFAULT_SAMPLING_FREQ;
+	/* Set default sampling frequency, can be changed by buffer processing calls.
+	 * BetterFxSound: only when none is set yet (a new handle). This also runs from
+	 * GraphicEqSetFilterQ() and GraphicEqSetNumBands() on a live EQ, and forcing 44.1 kHz there
+	 * rebuilt every band at the wrong rate; at any other stream rate the processing thread then
+	 * saw the mismatch and recalculated all bands itself, concurrently with the setter. Keeping
+	 * the current rate rebuilds the bands once, at the right rate, on the setter's thread. */
+	if (cast_handle->sampling_freq <= (realtype)0.0)
+		cast_handle->sampling_freq = (realtype)GRAPHIC_EQ_DEFAULT_SAMPLING_FREQ;
 
 	/* Set default first band and last band freqs., can be changed if desired by
 	 * calling function below with different frequencies.

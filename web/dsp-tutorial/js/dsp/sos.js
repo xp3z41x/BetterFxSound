@@ -293,6 +293,7 @@ In FxSound all of these run inside ONE stage (GraphicEqProcess), before the effe
     else v.powerCount++;
     v.powerHistory[v.powerIndex] = currentPower;
     v.powerSum = f(v.powerSum + currentPower);
+    if (v.powerSum < 0) v.powerSum = 0;   // SosProcess.cpp: float drift must not reach sqrtf()
     v.powerIndex = (v.powerIndex + 1) % K.HistorySize;
 
     var averaged = currentRms;

@@ -45,7 +45,9 @@ int PT_DECLSPEC GraphicEqProcess(PT_HANDLE *hp_GraphicEq,
 	if (cast_handle == NULL)
 		return(NOT_OKAY);
 
-	/* If the sampling frequency has changed recalc all filter coeffs */
+	/* If the sampling frequency has changed recalc all filter coeffs.
+	 * BetterFxSound: only a fallback now; dfxpBeginProcess() already applies a new rate through
+	 * GraphicEqSetSamplingFreq() when the format changes (serialized with the EQ setters). */
 	if( r_samp_freq != cast_handle->sampling_freq )
 	{
 		cast_handle->sampling_freq = r_samp_freq;

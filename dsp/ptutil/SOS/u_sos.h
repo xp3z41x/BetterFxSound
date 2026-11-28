@@ -61,6 +61,16 @@ struct sosSectionType {
 	realtype state_2[8];
 };   
 
+/* BetterFxSound: coefficients of one section as used by the processing thread (see run_coeffs).
+ * The processing kernels assume b1 == a1 (parametric form), so a1 is not needed here. */
+struct sosRunCoeffType {
+   realtype b0;
+   realtype b1;
+   realtype b2;
+   realtype a2;
+   int on;
+};
+
 /* Sos handle definition */
 struct sosHdlType {
    /* Initialization info */
@@ -106,6 +116,24 @@ struct sosHdlType {
    int sos_type[SOS_MAX_NUM_SOS_SECTIONS]; /* SOS_PARA for parametric, SOS_SHELF for shelf type */
    struct sosSectionType *sections; 
    int section_on_flag[SOS_MAX_NUM_SOS_SECTIONS]; /* If IS_TRUE, then displayed gain is not 0 */
+
+	/* BetterFxSound: the coefficients above are written by the parameter setters (UI, CLI and
+	 * preset threads, serialized by DfxDspPrivate::param_lock_) while the processing thread runs
+	 * the filters. Reading them directly could run a section with a mix of old and new b0..a2
+	 * (a torn set can even be unstable) whenever a setter was preempted mid-update. So the
+	 * processing code only uses run_coeffs, a copy the processing thread itself refreshes once
+	 * per buffer through a sequence lock: sosSetSection() makes coeff_seq odd while it writes
+	 * and even again when the section is complete, and the processing thread copies only an
+	 * even, unchanged sequence (otherwise it keeps the previous set for one more buffer).
+	 * Neither side ever waits. run_coeff_seq is the sequence the copy was taken at. */
+	struct sosRunCoeffType run_coeffs[SOS_MAX_NUM_SOS_SECTIONS];
+	volatile long coeff_seq;
+	long run_coeff_seq;
+
+	/* BetterFxSound: set by sosSetVolumeLeveling() when leveling is turned off; the processing
+	 * thread clears the leveling history itself at the start of its next buffer instead of the
+	 * setter zeroing it while the processing thread is updating it. */
+	volatile long volume_leveling_reset_request;
 
 	realtype in1_old, in2_old, outDC1_old, outDC2_old;	// Added for DC blocking filter.
 	realtype in1_oldSS[8];

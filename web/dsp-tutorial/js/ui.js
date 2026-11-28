@@ -7,7 +7,7 @@ under a strict Content-Security-Policy (script-src 'self') and inside an <iframe
 */
 (function () {
   "use strict";
-  var VERSION = "1.2.2";
+  var VERSION = "1.2.3";
   var STORAGE_KEY = "fxsound-dsp-tutorial:v1";
   var Pcm = window.FxPcm, Dsp = window.FxDsp, Explain = window.FxExplain;
   var FS = Pcm.SAMPLE_RATE;
