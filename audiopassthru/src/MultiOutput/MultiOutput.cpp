@@ -384,6 +384,10 @@ public:
 	static constexpr int kRealignMs = 3;                      // Delay changes from this size on are applied at once
 	static constexpr double kRealignErrorSecs = 0.020;        // A lasting offset from the target this big is too
 	static constexpr DWORD kFlushMs = 30;                     // Less than the target queued and nothing more for this long: play it
+	static constexpr double kWriteGapSecs = 0.050;            // Writes further apart than this are a pause, not the write spacing
+	static constexpr double kPhaseCapSecs = 0.100;            // Time since the last write counted in the queue level at most
+	static constexpr int kDeviceAllowanceMs = 10;             // Device queue counted in the target (a 20 ms buffer less a period)
+	static constexpr int kDeviceHeadroomUseMs = 20;           // A larger device queue may take this much of the ring's headroom
 
 	// Creates the output and starts its render thread. The thread holds its own reference to the output, so the
 	// output is freed only once the thread no longer uses it (see requestStop()).
@@ -539,13 +543,31 @@ public:
 				}
 			}
 		}
-		// BetterFxSound: the write time is stored before the block is published, so render() never sees the new block
-		// with the time of an older one (and flushes it at once as if nothing had come for a while).
+		// BetterFxSound: the write time and the mean spacing of the writes are published with the block, under write_seq_
+		// (odd while they change), so render() reads a block's position and its time together (readWriteStamp()). It
+		// measures the queue level against the time since the write, not at its own wake-up phase.
 		LARGE_INTEGER qpc_now;
 		QueryPerformanceCounter(&qpc_now);
+		const LONGLONG previous_qpc = last_write_qpc_.load(std::memory_order_relaxed);	// Written by this thread only
+		const LONGLONG interval = qpc_now.QuadPart - previous_qpc;
+		if (previous_qpc != 0 && interval > 0 && static_cast<double>(interval) < qpc_freq_ * kWriteGapSecs)
+		{
+			const double spacing = static_cast<double>(interval);
+			write_period_avg_ = (write_period_avg_ > 0.0) ? write_period_avg_ + (spacing - write_period_avg_) * 0.05 : spacing;
+		}
+		const UINT32 seq = write_seq_.load(std::memory_order_relaxed);
+		write_seq_.store(seq + 1, std::memory_order_relaxed);
+		std::atomic_thread_fence(std::memory_order_release);
 		last_write_qpc_.store(qpc_now.QuadPart, std::memory_order_relaxed);
+		write_period_qpc_.store(static_cast<LONGLONG>(write_period_avg_), std::memory_order_relaxed);
 		write_pos_.store(w + n, std::memory_order_release);
+		write_seq_.store(seq + 2, std::memory_order_release);
 		writing_.store(false, std::memory_order_release);
+
+		// BetterFxSound: an output waiting to prime is woken at once, so it does not start late by its poll interval
+		// (and with that much more queued than its target).
+		if (awaiting_prime_.load(std::memory_order_relaxed) && awaiting_prime_.exchange(false))
+			SetEvent(audio_event_);
 	}
 
 private:
@@ -587,8 +609,14 @@ private:
 
 		for (;;)
 		{
-			// While the stream is running WASAPI signals audio_event_ every period. Otherwise poll.
-			const DWORD timeout = (client_ != nullptr && running_) ? 200 : 20;
+			// While the stream is running WASAPI signals audio_event_ every period. Otherwise poll. BetterFxSound: write()
+			// wakes an output that waits to prime; a stopped one with a fragment queued polls every 5 ms, so a sound
+			// shorter than the target is flushed on time (render()).
+			DWORD timeout = 20;
+			if (client_ != nullptr && running_)
+				timeout = 200;
+			else if (client_ != nullptr && !primed_ && write_pos_.load(std::memory_order_relaxed) != read_pos_.load(std::memory_order_relaxed))
+				timeout = 5;
 			if (WaitForMultipleObjects(2, handles, FALSE, timeout) == WAIT_OBJECT_0)
 				break;
 
@@ -769,6 +797,19 @@ private:
 		if (FAILED(client_->GetBufferSize(&buffer_frames_)) || buffer_frames_ == 0)
 			return false;
 
+		// BetterFxSound: the device queue counted in the latency target (render()). A fixed allowance, so the output's
+		// latency does not move with the buffer size and engine period of each open; only a device that keeps a much
+		// larger queue (its buffer less a period) gets a larger one, so the ring keeps its headroom for the bursty writes.
+		REFERENCE_TIME default_period = 0;
+		REFERENCE_TIME minimum_period = 0;
+		if (FAILED(client_->GetDevicePeriod(&default_period, &minimum_period)) || default_period < 0)
+			default_period = 0;
+		const UINT32 period_frames = static_cast<UINT32>(static_cast<double>(default_period) * sample_rate / 10000000.0);
+		const UINT32 device_queue = buffer_frames_ > period_frames ? buffer_frames_ - period_frames : 0;
+		const UINT32 headroom_use = static_cast<UINT32>(static_cast<double>(kDeviceHeadroomUseMs) * sample_rate / 1000.0);
+		const UINT32 allowance = static_cast<UINT32>(static_cast<double>(kDeviceAllowanceMs) * sample_rate / 1000.0);
+		device_allowance_frames_ = (device_queue > allowance + headroom_use) ? device_queue - headroom_use : allowance;
+
 		hr = client_->GetService(__uuidof(IAudioRenderClient), (void**)&render_);
 		if (FAILED(hr) || render_ == nullptr)
 			return false;
@@ -864,6 +905,7 @@ private:
 		buffer_frames_ = 0;
 	}
 
+	// The audio starts again after a discontinuity (priming, a skip): from silence, faded in by the gain ramp.
 	void resetResampler()
 	{
 		std::memset(history_, 0, sizeof(history_));
@@ -872,6 +914,23 @@ private:
 		error_avg_ = 0.0;
 		hold_frames_ = 0;
 		fill_avg_valid_ = false;
+		current_gain_ = 0.0f;	// BetterFxSound: it resumed at full gain, a click
+	}
+
+	// BetterFxSound: the write position with the time of that write and the mean spacing of the writes, read together
+	// (write() publishes them under write_seq_). Render thread.
+	void readWriteStamp(UINT32* pos, LONGLONG* qpc, LONGLONG* period)
+	{
+		for (int attempt = 0; attempt < 4; attempt++)
+		{
+			const UINT32 seq = write_seq_.load(std::memory_order_acquire);
+			*pos = write_pos_.load(std::memory_order_acquire);
+			*qpc = last_write_qpc_.load(std::memory_order_relaxed);
+			*period = write_period_qpc_.load(std::memory_order_relaxed);
+			std::atomic_thread_fence(std::memory_order_acquire);
+			if ((seq & 1u) == 0 && write_seq_.load(std::memory_order_relaxed) == seq)
+				return;
+		}
 	}
 
 	bool pullFrame()
@@ -910,8 +969,35 @@ private:
 		auto holdQueued = [this, nominal]() -> UINT32 { return static_cast<UINT32>(hold_frames_ * nominal + 0.5); };
 		const UINT32 target = static_cast<UINT32>((kBaseLatencyMs + delay_ms_.load(std::memory_order_relaxed)) * rate / 1000.0);
 		const UINT32 slack = static_cast<UINT32>(rate * 0.15); // 150 ms
+
+		// BetterFxSound: the level held at the target is the latency of the newest queued frame, in ring frames: the queue
+		// (silence still to be played included), the device's own queue (padding) and the time since that frame was
+		// written. It was the queue alone, sampled at this output's wake-ups: the writes come in blocks, so it depended on
+		// the phase between the two clocks (0 to one write period, new at every start, creeping with the clock drift),
+		// and the device queue (its buffer size and engine period, per open) was left out. Half the mean write spacing
+		// is taken off, so the level averages what the queue did. level_target adds the device allowance (openClient()).
+		// The stall and starvation checks still use the queue itself (fill).
+		UINT32 write_pos = 0;
+		LONGLONG write_qpc = 0;
+		LONGLONG write_period_qpc = 0;
+		readWriteStamp(&write_pos, &write_qpc, &write_period_qpc);
+		LARGE_INTEGER qpc_now;
+		QueryPerformanceCounter(&qpc_now);
+		const LONGLONG since_write_qpc = (write_qpc != 0) ? qpc_now.QuadPart - write_qpc : 0;
+		const double since_write = since_write_qpc > 0 ? static_cast<double>(since_write_qpc) / qpc_freq_ : 0.0; // seconds
+		const double write_period = write_period_qpc > 0 ? static_cast<double>(write_period_qpc) / qpc_freq_ : 0.0;
+		const double phase_frames = ((since_write < kPhaseCapSecs ? since_write : kPhaseCapSecs) - 0.5 * write_period) * rate;
+		const double device_frames = static_cast<double>(padding) * nominal;
+		const double level_target = static_cast<double>(target) + static_cast<double>(device_allowance_frames_) * nominal;
+		auto levelOf = [phase_frames, device_frames](UINT32 queue_frames) -> double
+		{
+			return static_cast<double>(queue_frames) + device_frames + phase_frames;
+		};
+
+		UINT32 ring_queued = write_pos - read_pos_.load(std::memory_order_relaxed);
 		// Silence still to be played before the queued audio (a raised delay) counts as queued.
-		UINT32 fill = write_pos_.load(std::memory_order_acquire) - read_pos_.load(std::memory_order_relaxed) + holdQueued();
+		UINT32 fill = ring_queued + holdQueued();
+		double level = levelOf(fill);
 
 		if (primed_)
 		{
@@ -921,56 +1007,66 @@ private:
 			// is cut by the change or that much silence is played first, then it fades back in.
 			const UINT32 moved = target > aligned_target_ ? target - aligned_target_ : aligned_target_ - target;
 			if (!realign_pending_ && moved >= static_cast<UINT32>(rate * kRealignMs / 1000.0))
+			{
 				realign_pending_ = true;
+				realign_reason_ = kRealignDelay;
+			}
 
+			// BetterFxSound: a stall and a starved queue fade out first too (realign_pending_); they cut at full gain.
 			if (realign_pending_)
 			{
 				// Handled after this block's fade out.
 			}
 			else if (fill > target + slack)
 			{
-				// Far too much audio queued (the device stalled): jump ahead.
-				read_pos_.store(read_pos_.load(std::memory_order_relaxed) + (fill - target), std::memory_order_release);
-				resetResampler();
-				fill = target;
+				// Far too much audio queued (the device stalled): jump ahead, by the level's offset.
+				realign_pending_ = true;
+				realign_reason_ = kRealignJump;
 			}
 			else if (fill + slack < target)
 			{
 				// Far too little: build the buffer up again before playing.
-				primed_ = false;
-				idle_since_ = now;
+				realign_pending_ = true;
+				realign_reason_ = kRealignReprime;
 			}
 		}
 
 		if (!primed_)
 		{
+			// BetterFxSound: write() wakes this thread when it queues more (awaiting_prime_).
+			awaiting_prime_.store(true, std::memory_order_relaxed);
+
 			// BetterFxSound: a sound shorter than the target after silence (nothing more came for kFlushMs) is played
 			// too, at the moment more audio would have filled the queue to the target, as the carrier does
 			// (sndDevicesDoCapture()). It used to wait for the next sound to fill the rest, and then play late.
 			// The time since the last write is measured with QPC, as the carrier does: GetTickCount() is ~15.6 ms coarse.
-			// The write time is read after fill (write_pos_ acquire above), so it is the time of that block or newer.
-			LARGE_INTEGER qpc_now;
-			QueryPerformanceCounter(&qpc_now);
-			const LONGLONG since_write_qpc = qpc_now.QuadPart - last_write_qpc_.load(std::memory_order_relaxed);
-			const double since_write = since_write_qpc > 0 ? static_cast<double>(since_write_qpc) / qpc_freq_ : 0.0; // seconds
-			const bool flush = fill > 0 && fill < target && since_write * 1000.0 >= static_cast<double>(kFlushMs);
-			if ((fill >= target && fill > 0) || flush)
+			// Priming looks at the queued audio alone: silence left over from before (hold_frames_) is not audio.
+			const double prime_level = levelOf(ring_queued);
+			const bool flush = ring_queued > 0 && prime_level < level_target && since_write * 1000.0 >= static_cast<double>(kFlushMs);
+			if ((ring_queued > 0 && prime_level >= level_target) || flush)
 			{
 				primed_ = true;
+				awaiting_prime_.store(false, std::memory_order_relaxed);
 				resetResampler();
 				aligned_target_ = target;
 				realign_pending_ = false;
 
-				// BetterFxSound: a flush plays silence first, for what is missing to the target less the time already
-				// waited since the last write.
-				const UINT32 queued = write_pos_.load(std::memory_order_acquire) - read_pos_.load(std::memory_order_relaxed);
-				if (queued < target)
+				// BetterFxSound: the output starts at the target level. Audio queued beyond it (the capture's burst after a
+				// pause, a late wake-up) is skipped: it played that much late, until the drift correction (about 10 s) or
+				// a realignment with a dropout took it back. A flush plays silence first, for what is missing.
+				const double excess = prime_level - level_target;
+				if (excess >= 1.0)
 				{
-					const double waited = since_write * rate;
-					const double missing = static_cast<double>(target - queued) - waited;
-					hold_frames_ = missing > 0.0 ? static_cast<UINT32>(missing / nominal) : 0;
+					const UINT32 skip = (excess < static_cast<double>(ring_queued)) ? static_cast<UINT32>(excess) : ring_queued;
+					read_pos_.store(read_pos_.load(std::memory_order_relaxed) + skip, std::memory_order_release);
+					ring_queued -= skip;
 				}
-				fill = queued + holdQueued();
+				else if (excess <= -1.0)
+				{
+					hold_frames_ = static_cast<UINT32>(-excess / nominal);
+				}
+				fill = ring_queued + holdQueued();
+				level = levelOf(fill);
 
 				if (!running_)
 				{
@@ -1002,25 +1098,27 @@ private:
 
 		// Steer the resampling ratio so the queued audio stays at the target. Correcting
 		// 10% of the (smoothed) error per second keeps the pitch change far below audibility.
-		const double error_secs = (static_cast<double>(fill) - static_cast<double>(target)) / rate;
+		const double error_secs = (level - level_target) / rate;
 		error_avg_ += (error_secs - error_avg_) * 0.02;
-		// Short average of the queue level (a few device periods). The writes come in bursts, so the level at one
-		// moment is not the level the output plays from; the lasting-offset realign below moves by this average.
+		// Short average of the level (a few device periods); the lasting-offset realign below moves by this average.
 		if (!fill_avg_valid_)
 		{
-			fill_avg_ = static_cast<double>(fill);
+			fill_avg_ = level;
 			fill_avg_valid_ = true;
 		}
 		else
 		{
-			fill_avg_ += (static_cast<double>(fill) - fill_avg_) * 0.25;
+			fill_avg_ += (level - fill_avg_) * 0.25;
 		}
 		// A lasting offset is lined up at once too: typically a Bluetooth stream that was idle and took ~0.1 s
 		// to start consuming after Start() while the queue kept filling. Left to the drift correction, the
 		// output stayed that much late, out of sync with the others, for about a minute after every pause in
 		// the audio. Clock drift alone keeps the smoothed error near 1 ms.
 		if (!realign_pending_ && (error_avg_ > kRealignErrorSecs || error_avg_ < -kRealignErrorSecs))
+		{
 			realign_pending_ = true;
+			realign_reason_ = kRealignOffset;
+		}
 		double adjust = error_avg_ * 0.1;
 		if (adjust > 0.005) adjust = 0.005;
 		if (adjust < -0.005) adjust = -0.005;
@@ -1092,10 +1190,32 @@ private:
 		if (underflow)
 		{
 			// Ran dry (the carrier stopped, or audio was paused). Pad with silence and
-			// wait for the buffer to fill to the target again.
+			// wait for the buffer to fill to the target again. BetterFxSound: the audio produced fades out over its
+			// last ~2 ms instead of stopping mid-waveform, and the next start fades in (current_gain_).
+			const UINT32 fade_max = static_cast<UINT32>(0.002 * device_rate);
+			const UINT32 fade = produced < fade_max ? produced : fade_max;
+			for (UINT32 i = 0; i < fade; i++)
+			{
+				const float scale = static_cast<float>(fade - i) / static_cast<float>(fade + 1);
+				float* frame = out + static_cast<size_t>(produced - fade + i) * channels_;
+				for (UINT32 c = 0; c < channels_; c++)
+					frame[c] *= scale;
+			}
 			std::memset(out + static_cast<size_t>(produced) * channels_, 0, static_cast<size_t>(space - produced) * channels_ * sizeof(float));
 			primed_ = false;
 			idle_since_ = now;
+			hold_frames_ = 0;
+			current_gain_ = 0.0f;
+		}
+		else if (realign_pending_ && (current_gain_ < 0.01f || hold_frames_ > 0) && realign_reason_ == kRealignReprime)
+		{
+			// BetterFxSound: faded out, the starved queue builds up again before playing. Silence still to be played
+			// is dropped (it used to count as queued audio when priming); the queued audio stays and is counted.
+			primed_ = false;
+			idle_since_ = now;
+			hold_frames_ = 0;
+			current_gain_ = 0.0f;
+			realign_pending_ = false;
 		}
 		else if (realign_pending_ && (current_gain_ < 0.01f || hold_frames_ > 0))
 		{
@@ -1103,11 +1223,22 @@ private:
 			// level relative to the target (the writes are bursty, the instantaneous level is not the mean). For
 			// a lasting offset, by the offset of the averaged level. Later: skip that much queued audio. Earlier:
 			// play that much silence first. Either way the output fades back in from silence.
+			// BetterFxSound: the shift follows why the realignment was asked for. It used to be the delay change
+			// whenever the target had moved at all since the last alignment (a 1-2 ms delay tweak), so a lasting
+			// offset was not corrected, and realigned again (a second dropout) a few hundred ms later. The level is
+			// measured against the current target, so a pending delay change is part of an offset or a stall's shift.
+			// A stall jumps by the level now, silence still to be played first; it skipped the queue by the level
+			// with that silence counted, then dropped the silence too.
 			const UINT32 r = read_pos_.load(std::memory_order_relaxed);
 			const UINT32 queued = write_pos_.load(std::memory_order_acquire) - r;
-			const INT64 shift = (target != aligned_target_)
-				? static_cast<INT64>(aligned_target_) - static_cast<INT64>(target)
-				: static_cast<INT64>(fill_avg_ + 0.5) - static_cast<INT64>(target);
+			const INT64 level_target_frames = static_cast<INT64>(level_target + 0.5);
+			INT64 shift = 0;
+			if (realign_reason_ == kRealignDelay)
+				shift = static_cast<INT64>(aligned_target_) - static_cast<INT64>(target);
+			else if (realign_reason_ == kRealignJump)
+				shift = static_cast<INT64>(level + 0.5) - level_target_frames;
+			else
+				shift = static_cast<INT64>(fill_avg_ + 0.5) - level_target_frames;
 			if (shift > 0)
 			{
 				// Silence not played yet goes first, then queued audio.
@@ -1149,6 +1280,15 @@ private:
 	SecondaryOutput(const SecondaryOutput&) = delete;
 	SecondaryOutput& operator=(const SecondaryOutput&) = delete;
 
+	// BetterFxSound: why a realignment is pending (render()).
+	enum RealignReason
+	{
+		kRealignDelay,		// The delay moved: by the change
+		kRealignOffset,		// A lasting offset: by the averaged level's offset
+		kRealignJump,		// The device stalled, far too much queued: by the level's offset now
+		kRealignReprime		// Far too little queued: build the queue up again
+	};
+
 	const std::wstring device_id_;
 	const std::shared_ptr<std::atomic<bool>> driven_;	// The router's flag
 	std::atomic<bool> stream_open_{ false };	// Written by the render thread
@@ -1171,6 +1311,10 @@ private:
 	std::atomic<bool> writing_{ false };      // write() is copying into the ring (see tryResetRing())
 	std::atomic<UINT32> pending_rate_{ 0 };   // Rate the audio thread is producing
 	std::atomic<LONGLONG> last_write_qpc_{ 0 }; // QPC of the last block queued by the audio thread, stored before write_pos_
+	std::atomic<LONGLONG> write_period_qpc_{ 0 }; // Mean spacing of the writes (QPC ticks), 0 = not known yet
+	std::atomic<UINT32> write_seq_{ 0 };        // Odd while write() publishes a block and its time (readWriteStamp())
+	std::atomic<bool> awaiting_prime_{ false }; // The render thread waits to prime: write() wakes it
+	double write_period_avg_ = 0.0;             // Audio thread only: write_period_qpc_ before it is published
 	double qpc_freq_ = 1.0;                     // QueryPerformanceFrequency(), set once in the constructor
 
 	HANDLE stop_event_ = NULL;
@@ -1203,9 +1347,11 @@ private:
 	float current_gain_ = 0.0f;
 	UINT32 aligned_target_ = 0;		// Queue target (frames) the output was last lined up with
 	UINT32 hold_frames_ = 0;		// Silence to play before pulling from the queue again (a raised delay)
-	double fill_avg_ = 0.0;			// Short average of the queue level, silence to play included (frames)
+	double fill_avg_ = 0.0;			// Short average of the level (render()), silence to play included (ring frames)
 	bool fill_avg_valid_ = false;
-	bool realign_pending_ = false;	// The delay changed: fading out before lining up with the new target
+	bool realign_pending_ = false;	// Fading out before the output is moved (realign_reason_)
+	RealignReason realign_reason_ = kRealignDelay;	// Why realign_pending_ was set: what the output moves by
+	UINT32 device_allowance_frames_ = 0;	// Device queue counted in the latency target (device frames, openClient())
 };
 
 bool setDeviceFullVolumeById(const std::wstring& device_id, const GUID* event_context)
