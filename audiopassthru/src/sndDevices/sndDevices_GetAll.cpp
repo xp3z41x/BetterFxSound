@@ -248,6 +248,10 @@ static int sndDevices_GetAllDevices(PT_HANDLE* hp_sndDevices, int* ip_num_device
 		hr = pProps->GetValue(PKEY_Device_DeviceDesc, &DeviceDesc);
 		if (FAILED(hr))
 		{
+			// BetterFxSound: the state is read on every path, so the entry never keeps another device's state (which
+			// sndCheckDeviceChanges() would then report as a change on every comparison).
+			if (FAILED(cast_handle->pAllDevices[i]->GetState(&cast_handle->deviceState[i])))
+				cast_handle->deviceState[i] = 0;
 			PropVariantClear(&FriendlyName);
 			PropVariantClear(&DeviceDesc);
 			continue;
@@ -331,6 +335,9 @@ static int sndDevices_GetAllDevices(PT_HANDLE* hp_sndDevices, int* ip_num_device
 			wcscpy(cast_handle->deviceFriendlyName[i], L"Unknown");
 			wcscpy(cast_handle->deviceDescription[i], L"Unknown");
 			cast_handle->deviceNumChannel[i] = 1;
+			// BetterFxSound: see the DeviceDesc failure above.
+			if (FAILED(cast_handle->pAllDevices[i]->GetState(&cast_handle->deviceState[i])))
+				cast_handle->deviceState[i] = 0;
 		}
 
 		PropVariantClear(&FriendlyName);

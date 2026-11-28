@@ -346,6 +346,7 @@ int PT_DECLSPEC sndCheckDeviceChanges(PT_HANDLE* hp_sndDevices, BOOL* bp_deviceC
 	BOOL deviceFound;
 	BOOL stop_processing;
 	BOOL read_all;
+	BOOL list_differs;
 	BOOL listed_seen[SND_DEVICES_MAX_NUM_DEVICES];
 	wchar_t carrier_ID[PT_MAX_GENERIC_STRLEN];
 	LPWSTR pID = NULL;
@@ -371,6 +372,7 @@ int PT_DECLSPEC sndCheckDeviceChanges(PT_HANDLE* hp_sndDevices, BOOL* bp_deviceC
 
 	stop_processing = FALSE;
 	read_all = TRUE;
+	list_differs = FALSE;
 
 	hr = CoCreateInstance(cast_handle->CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL, cast_handle->IID_IMMDeviceEnumerator, (void**)&pEnumerator);
 	if (FAILED(hr)) SND_DEVICES_SET_STATUS_AND_RETURN_OK(SND_DEVICES_INSTANCE_CREATE_FAILED)
@@ -385,7 +387,10 @@ int PT_DECLSPEC sndCheckDeviceChanges(PT_HANDLE* hp_sndDevices, BOOL* bp_deviceC
 
 	// A different count means a device was added or removed (which one is found below).
 	if (deviceCount != (UINT)listed_count)
+	{
         *bp_deviceChanged = TRUE;
+		list_differs = TRUE;
+	}
 
 	// Compare device IDs and states
 	for (i = 0; i < deviceCount; i++)
@@ -424,6 +429,7 @@ int PT_DECLSPEC sndCheckDeviceChanges(PT_HANDLE* hp_sndDevices, BOOL* bp_deviceC
 				if (SUCCEEDED(hr) && currentState != cast_handle->deviceState[j])
 				{
 					*bp_deviceChanged = TRUE;
+					list_differs = TRUE;
 					if (((currentState == DEVICE_STATE_ACTIVE) || (cast_handle->deviceState[j] == DEVICE_STATE_ACTIVE)) &&
 						sndCheckDeviceChangeStopsProcessing(cast_handle, pID, carrier_ID, (currentState == DEVICE_STATE_ACTIVE)))
 						stop_processing = TRUE;
@@ -436,6 +442,7 @@ int PT_DECLSPEC sndCheckDeviceChanges(PT_HANDLE* hp_sndDevices, BOOL* bp_deviceC
 		if (!deviceFound)
 		{
             *bp_deviceChanged = TRUE;
+			list_differs = TRUE;
 			if (sndCheckDeviceChangeStopsProcessing(cast_handle, pID, carrier_ID, (currentState == DEVICE_STATE_ACTIVE)))
 				stop_processing = TRUE;
 		}
@@ -445,20 +452,26 @@ int PT_DECLSPEC sndCheckDeviceChanges(PT_HANDLE* hp_sndDevices, BOOL* bp_deviceC
 	}
 
 	// Listed devices that are gone from the system (removed, or no longer active nor unplugged). When some device could
-	// not be read, one of them may be the unread one, so it is only reported, not taken for gone.
+	// not be read, one of them may be the unread one, so it is only reported (the caller reads the list again), not
+	// taken for gone: nor does it mark the list stale, as a device that keeps failing to be read would otherwise have
+	// the timer refresh the outputs on every tick.
 	for (j = 0; j < listed_count; j++)
 	{
 		if (!listed_seen[j])
 		{
 			*bp_deviceChanged = TRUE;
-			if (read_all && sndCheckDeviceChangeStopsProcessing(cast_handle, cast_handle->pwszID[j], carrier_ID, FALSE))
-				stop_processing = TRUE;
+			if (read_all)
+			{
+				list_differs = TRUE;
+				if (sndCheckDeviceChangeStopsProcessing(cast_handle, cast_handle->pwszID[j], carrier_ID, FALSE))
+					stop_processing = TRUE;
+			}
 		}
 	}
 
 	if (stop_processing)
 		InterlockedExchange(&(cast_handle->stopAudioCaptureAndPlaybackLoop), 1);
-	else if (*bp_deviceChanged)
+	else if (list_differs)
 		InterlockedExchange(&(cast_handle->deviceListIsStale), 1);
 
 	return(OKAY);

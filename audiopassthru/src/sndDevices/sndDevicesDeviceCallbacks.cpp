@@ -156,7 +156,12 @@ static BOOL sndDevicesCallbackFindDevice(struct sndDevicesHdlType *cast_handle, 
 // additional output: the endpoint is the virtual device or the carrier, or there is no carrier and the endpoint becomes
 // usable (b_becomes_active). Any other endpoint (an unused HDMI monitor going to sleep, a spare DAC, another app's
 // virtual device, an additional output) is left to the timer, which reads the device list again and refreshes the
-// outputs without stopping (deviceListIsStale). When the list cannot be relied on, the processing is stopped.
+// outputs without stopping (deviceListIsStale). When the list cannot be relied on (an enumeration is rewriting it), only
+// the virtual device stops the processing: any other endpoint marks the list stale, and the timer then compares the
+// list with the system (sndCheckDeviceChanges(), same rule), which stops the processing if the change concerns the
+// carrier. Stopping on an unreliable list let the rest of a notification burst (a device connect raises about ten
+// state changes) land in the enumeration started by its first one and stop the processing anyway. A stale flag set
+// during a reinit's enumeration is kept, the reinit clears it before enumerating.
 static BOOL sndDevicesCallbackChangeStopsProcessing(struct sndDevicesHdlType *cast_handle, LPCWSTR pwstrDeviceId, BOOL b_becomes_active)
 {
 	LONG seq_before;
@@ -174,7 +179,7 @@ static BOOL sndDevicesCallbackChangeStopsProcessing(struct sndDevicesHdlType *ca
 
 	seq_before = InterlockedCompareExchange(&(cast_handle->enumerationSequence), 0, 0);
 	if ((seq_before & 1) != 0)
-		return(TRUE);
+		return(FALSE);
 
 	total = *(volatile int *)&(cast_handle->totalNumDevices);
 	if (total > SND_DEVICES_MAX_NUM_DEVICES)
@@ -187,7 +192,7 @@ static BOOL sndDevicesCallbackChangeStopsProcessing(struct sndDevicesHdlType *ca
 
 	seq_after = InterlockedCompareExchange(&(cast_handle->enumerationSequence), 0, 0);
 	if (seq_after != seq_before)
-		return(TRUE);
+		return(FALSE);
 
 	if ((carrier_num < 0) || (carrier_num >= total))
 		return(b_becomes_active);
@@ -429,11 +434,14 @@ HRESULT STDMETHODCALLTYPE CsndDevicesMMNotificationClient::OnDeviceStateChanged(
   * endpoint becomes active (sndDevicesCallbackChangeStopsProcessing()). A state the last enumeration already read is
   * ignored. Any other change (an unused HDMI monitor going to sleep, a spare DAC, a new or vanished additional output)
   * only marks the device list stale: the timer reads it again and refreshes the outputs, without a stop. When the
-  * list cannot be relied on (a reinit is under way), the processing is stopped as before.
+  * list cannot be relied on (an enumeration is under way), the change is treated as one, and
+  * sndDevicesCallbackChangeStopsProcessing() leaves it to the timer unless the endpoint is the virtual device.
   */
   state_changed = TRUE;
   stop_processing = TRUE;
-  if (sndDevicesCallbackFindDevice(cast_handle, pwstrDeviceId, &device_num, &device_state))
+  if (!sndDevicesCallbackFindDevice(cast_handle, pwstrDeviceId, &device_num, &device_state))
+	  stop_processing = sndDevicesCallbackChangeStopsProcessing(cast_handle, pwstrDeviceId, (dwNewState == DEVICE_STATE_ACTIVE));
+  else
   {
 	  if (device_num != SND_DEVICES_DEVICE_NOT_PRESENT)
 	  {
