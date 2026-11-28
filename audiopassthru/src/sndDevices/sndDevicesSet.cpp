@@ -73,7 +73,8 @@ int PT_DECLSPEC sndDevicesRequestTargetedPlaybackDevice(PT_HANDLE *hp_sndDevices
 
 	*ip_resultFlag = SND_DEVICES_DEVICE_OPERATION_COMPLETED;
 
-	if( sndDevices_UtilsGetIndexFromID(hp_sndDevices, wcp_ID, &device_index_num) != OKAY )
+	// BetterFxSound: only an active device; an unplugged one cannot be opened, the reinit would fail.
+	if( sndDevices_UtilsGetActiveIndexFromID(hp_sndDevices, wcp_ID, &device_index_num) != OKAY )
 		return(NOT_OKAY);
 
 	if( device_index_num == SND_DEVICES_DEVICE_NOT_PRESENT )
@@ -84,6 +85,9 @@ int PT_DECLSPEC sndDevicesRequestTargetedPlaybackDevice(PT_HANDLE *hp_sndDevices
 
 	if( sndDevicesWriteToRegistry(hp_sndDevices, REG_CURRENT_USER, SND_DEVICES_REGISTRY_MOST_RECENT_PLAYBACK_WIDE, cast_handle->pwszID[device_index_num]) != OKAY )
 		return(NOT_OKAY);
+
+	// BetterFxSound: the device rules take this request before any other rule (a device added meanwhile included).
+	wcscpy_s(cast_handle->requestedPlaybackID, PT_MAX_GENERIC_STRLEN, cast_handle->pwszID[device_index_num]);
 
 	cast_handle->playbackDeviceIsUnavailable = FALSE;
 	InterlockedExchange(&(cast_handle->stopAudioCaptureAndPlaybackLoop), 1);

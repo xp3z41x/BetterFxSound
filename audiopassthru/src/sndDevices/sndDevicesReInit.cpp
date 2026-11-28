@@ -469,10 +469,50 @@ int PT_DECLSPEC sndCheckDeviceChanges(PT_HANDLE* hp_sndDevices, BOOL* bp_deviceC
 		}
 	}
 
+	// BetterFxSound: an active device whose channel count the last enumeration could not read is read again (the list
+	// differs from what the system would give now), a few times; see sndDevicesGetChannelProbeIsDue().
+	if (!list_differs)
+	{
+		BOOL probe_is_due = FALSE;
+		if ((sndDevicesGetChannelProbeIsDue(hp_sndDevices, &probe_is_due) == OKAY) && probe_is_due)
+		{
+			*bp_deviceChanged = TRUE;
+			list_differs = TRUE;
+		}
+	}
+
 	if (stop_processing)
 		InterlockedExchange(&(cast_handle->stopAudioCaptureAndPlaybackLoop), 1);
 	else if (list_differs)
 		InterlockedExchange(&(cast_handle->deviceListIsStale), 1);
 
+	return(OKAY);
+}
+
+/*
+* FUNCTION: sndDevicesGetChannelProbeIsDue()
+* DESCRIPTION: BetterFxSound. TRUE when the last enumeration found an active device whose channel count it could not
+* read (and had not read before), at least SND_DEVICES_CHANNEL_PROBE_INTERVAL_MS ago, and fewer than
+* SND_DEVICES_MAX_CHANNEL_PROBE_RETRIES enumerations in a row did so. Its count is then read again: such a device
+* (being reconfigured as it arrives) is left out of the outputs while its count is unknown, and no notification
+* follows once its format can be read. A device that keeps failing is no longer retried, until another change.
+*/
+int PT_DECLSPEC sndDevicesGetChannelProbeIsDue(PT_HANDLE* hp_sndDevices, BOOL* bp_isDue)
+{
+	struct sndDevicesHdlType* cast_handle;
+
+	*bp_isDue = FALSE;
+
+	cast_handle = (struct sndDevicesHdlType*)hp_sndDevices;
+	if (cast_handle == NULL)
+		return(NOT_OKAY);
+
+	if (!cast_handle->activeDeviceIsUnprobed || (cast_handle->channelProbeRetries >= SND_DEVICES_MAX_CHANNEL_PROBE_RETRIES))
+		return(OKAY);
+
+	if ((GetTickCount() - cast_handle->lastEnumerationTick) < (DWORD)SND_DEVICES_CHANNEL_PROBE_INTERVAL_MS)
+		return(OKAY);
+
+	*bp_isDue = TRUE;
 	return(OKAY);
 }

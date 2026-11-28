@@ -610,35 +610,35 @@ int PT_DECLSPEC sndDevicesRestoreDefaultDevice(PT_HANDLE *hp_sndDevices, int *ip
 	if( sndDeviceReadFromRegistry(hp_sndDevices, REG_CURRENT_USER, SND_DEVICES_REGISTRY_USER_SELECTED_PLAYBACK_WIDE, userSelectedPlaybackID) != OKAY )
 		return(NOT_OKAY);
 	// Get this devices internal index if the device is active.
-	if( sndDevices_UtilsGetIndexFromID(hp_sndDevices, userSelectedPlaybackID, &userSelectedPlaybackNum) != OKAY )
+	if( sndDevices_UtilsGetActiveIndexFromID(hp_sndDevices, userSelectedPlaybackID, &userSelectedPlaybackNum) != OKAY )
 		return(NOT_OKAY);
 
 	//Get the ID for the most recent playback device.
 	if( sndDeviceReadFromRegistry(hp_sndDevices, REG_CURRENT_USER, SND_DEVICES_REGISTRY_MOST_RECENT_PLAYBACK_WIDE, mostRecentPlaybackID) != OKAY )
 		return(NOT_OKAY);
 	// Get this devices internal index if the device is active.
-	if( sndDevices_UtilsGetIndexFromID(hp_sndDevices, mostRecentPlaybackID, &mostRecentPlaybackNum) != OKAY )
+	if( sndDevices_UtilsGetActiveIndexFromID(hp_sndDevices, mostRecentPlaybackID, &mostRecentPlaybackNum) != OKAY )
 		return(NOT_OKAY);
 
 	//Get the ID and device num for the most recent default device.
 	if( sndDeviceReadFromRegistry(hp_sndDevices, REG_CURRENT_USER, SND_DEVICES_REGISTRY_MOST_RECENT_DEFAULT_WIDE, mostRecentDefaultID) != OKAY )
 		return(NOT_OKAY);
 	// Get this devices internal index if the device is active.
-	if( sndDevices_UtilsGetIndexFromID(hp_sndDevices, mostRecentDefaultID, &mostRecentDefaultNum) != OKAY )
+	if( sndDevices_UtilsGetActiveIndexFromID(hp_sndDevices, mostRecentDefaultID, &mostRecentDefaultNum) != OKAY )
 		return(NOT_OKAY);
 
 	//Get the ID and device num for the prior default device.
 	if( sndDeviceReadFromRegistry(hp_sndDevices, REG_CURRENT_USER, SND_DEVICES_REGISTRY_PRIOR_DEFAULT_WIDE, priorDefaultID) != OKAY )
 		return(NOT_OKAY);
 	// Get this devices internal index if the device is active.
-	if( sndDevices_UtilsGetIndexFromID(hp_sndDevices, priorDefaultID, &priorDefaultNum) != OKAY )
+	if( sndDevices_UtilsGetActiveIndexFromID(hp_sndDevices, priorDefaultID, &priorDefaultNum) != OKAY )
 		return(NOT_OKAY);
 
 	//Get the ID for the original default device.
 	if( sndDeviceReadFromRegistry(hp_sndDevices, REG_CURRENT_USER, SND_DEVICES_REGISTRY_ORIGINAL_DEFAULT_WIDE, originalDefaultID) != OKAY )
 		return(NOT_OKAY);
 	// Get this devices internal index if the device is active.
-	if( sndDevices_UtilsGetIndexFromID(hp_sndDevices, originalDefaultID, &originalDefaultNum) != OKAY )
+	if( sndDevices_UtilsGetActiveIndexFromID(hp_sndDevices, originalDefaultID, &originalDefaultNum) != OKAY )
 		return(NOT_OKAY);
 
 	if( userSelectedPlaybackNum != SND_DEVICES_DEVICE_NOT_PRESENT )

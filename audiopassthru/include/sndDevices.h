@@ -48,6 +48,10 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 /* Limit settings */
 #define SND_DEVICES_MAX_NUM_DEVICES 64
 
+/* BetterFxSound: reading again an active device's channel count that could not be read (sndDevicesGetChannelProbeIsDue()) */
+#define SND_DEVICES_MAX_CHANNEL_PROBE_RETRIES		10
+#define SND_DEVICES_CHANNEL_PROBE_INTERVAL_MS		500
+
 /* Device "friendly name" string, used to identify DFX device. */
 #define SND_DEVICES_DFX_DEVICE_STRING L"FxSound Audio Enhancer"
 #define SND_DEVICES_DFX_PREVIOUS_DEVICE_STRING L"DFX Audio Enhancer"
@@ -426,6 +430,23 @@ struct sndDevicesHdlType {
 	// notification callbacks, sndCheckDeviceChanges()). Such a change no longer stops the processing; the timer reads
 	// the device list again and refreshes the outputs instead (AudioPassthruPrivate::processTimer()).
 	volatile LONG deviceListIsStale;
+	// BetterFxSound: the channel count of each device as last read by sndDevices_GetAll() (0 when unknown), by ID. A
+	// device whose format cannot be read for a moment (being reconfigured) keeps the count it had, instead of 0, which
+	// made it look absent to the controller.
+	WCHAR channelCacheID[SND_DEVICES_MAX_NUM_DEVICES][PT_MAX_GENERIC_STRLEN];
+	int channelCacheNumChannel[SND_DEVICES_MAX_NUM_DEVICES];
+	int channelCacheCount;
+	// BetterFxSound: TRUE when the last enumeration found an active device whose channel count it could not read. The
+	// list is then read again (sndDevicesGetChannelProbeIsDue()); channelProbeRetries counts such enumerations in a row.
+	BOOL activeDeviceIsUnprobed;
+	int channelProbeRetries;
+	DWORD lastEnumerationTick;	// GetTickCount() at the end of the last sndDevices_GetAll()
+	// BetterFxSound: the carrier the controller asked for (sndDevicesRequestTargetedPlaybackDevice()). The next run of the
+	// device rules takes it first, and consumes it.
+	wchar_t requestedPlaybackID[PT_MAX_GENERIC_STRLEN];
+	// BetterFxSound: TRUE once the controller manages the outputs (AudioPassthruPrivate::setOutputs()). It elects the
+	// carrier itself, so the device rules no longer make a newly added device the carrier.
+	BOOL outputsAreManaged;
 	int playbackDeviceNum;
 	int captureDeviceNum;
 	int priorDefaultDeviceNum;
@@ -512,6 +533,7 @@ int PT_DECLSPEC sndDevicesGetPlayBackStatus(PT_HANDLE *, int *);
 int PT_DECLSPEC sndDevicesGetNumMonoDevices(PT_HANDLE *, int *);
 int PT_DECLSPEC sndDevicesGetPlaybackDeviceAvialblility(PT_HANDLE*, BOOL*);
 int PT_DECLSPEC sndDevicesGetVirtualDeviceIsDefault(PT_HANDLE*, BOOL*);
+int PT_DECLSPEC sndDevicesGetChannelProbeIsDue(PT_HANDLE*, BOOL*);
 
 /* sndDevicesSet.cpp */
 int PT_DECLSPEC sndDevicesSetDeviceType(PT_HANDLE *, int, wchar_t *, int *);

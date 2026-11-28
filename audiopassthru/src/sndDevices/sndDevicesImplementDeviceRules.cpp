@@ -78,6 +78,9 @@ int PT_DECLSPEC sndDevicesImplementDeviceRules(PT_HANDLE *hp_sndDevices, int *ip
 	int priorDefaultNum = SND_DEVICES_DEVICE_NOT_PRESENT;			// Prior to coming into this function, the device that was default before the mostRecentDefaultNum one.
 	int originalDefaultNum = SND_DEVICES_DEVICE_NOT_PRESENT;		// The device that was default on the first startup of DFX after installation.
 	int mostRecentPlaybackNum = SND_DEVICES_DEVICE_NOT_PRESENT;	// The device that was used for playback prior do coming into this function.
+	wchar_t requestedPlaybackID[PT_MAX_GENERIC_STRLEN];			// BetterFxSound: the carrier the controller asked for
+	int requestedPlaybackNum = SND_DEVICES_DEVICE_NOT_PRESENT;
+	int newDeviceNum = SND_DEVICES_DEVICE_NOT_PRESENT;			// BetterFxSound: a device added since the last run of the rules
 	int defaultSelectionAutoMode = SND_DEVICES_AUTO_SELECT_DEFAULT_DEVICE_ON; // In current implementation this is always on.
     
 	cast_handle = (struct sndDevicesHdlType *)hp_sndDevices;
@@ -116,36 +119,101 @@ int PT_DECLSPEC sndDevicesImplementDeviceRules(PT_HANDLE *hp_sndDevices, int *ip
 	if( sndDeviceReadFromRegistry(hp_sndDevices, REG_CURRENT_USER, SND_DEVICES_REGISTRY_USER_SELECTED_PLAYBACK_WIDE, userSelectedPlaybackID) != OKAY )
 		return(NOT_OKAY);
 	// Get this devices internal index if the device is active.
-	if( sndDevices_UtilsGetIndexFromID(hp_sndDevices, userSelectedPlaybackID, &userSelectedPlaybackNum) != OKAY )
+	if( sndDevices_UtilsGetActiveIndexFromID(hp_sndDevices, userSelectedPlaybackID, &userSelectedPlaybackNum) != OKAY )
 		return(NOT_OKAY);
 
 	//Get the ID and device num for the most recent default device.
 	if( sndDeviceReadFromRegistry(hp_sndDevices, REG_CURRENT_USER, SND_DEVICES_REGISTRY_MOST_RECENT_DEFAULT_WIDE, mostRecentDefaultID) != OKAY )
 		return(NOT_OKAY);
 	// Get this devices internal index if the device is active.
-	if( sndDevices_UtilsGetIndexFromID(hp_sndDevices, mostRecentDefaultID, &mostRecentDefaultNum) != OKAY )
+	if( sndDevices_UtilsGetActiveIndexFromID(hp_sndDevices, mostRecentDefaultID, &mostRecentDefaultNum) != OKAY )
 		return(NOT_OKAY);
 
 	//Get the ID and device num for the prior default device.
 	if( sndDeviceReadFromRegistry(hp_sndDevices, REG_CURRENT_USER, SND_DEVICES_REGISTRY_PRIOR_DEFAULT_WIDE, priorDefaultID) != OKAY )
 		return(NOT_OKAY);
 	// Get this devices internal index if the device is active.
-	if( sndDevices_UtilsGetIndexFromID(hp_sndDevices, priorDefaultID, &priorDefaultNum) != OKAY )
+	if( sndDevices_UtilsGetActiveIndexFromID(hp_sndDevices, priorDefaultID, &priorDefaultNum) != OKAY )
 		return(NOT_OKAY);
 
 	//Get the ID for the original default device.
 	if( sndDeviceReadFromRegistry(hp_sndDevices, REG_CURRENT_USER, SND_DEVICES_REGISTRY_ORIGINAL_DEFAULT_WIDE, originalDefaultID) != OKAY )
 		return(NOT_OKAY);
 	// Get this devices internal index if the device is active.
-	if( sndDevices_UtilsGetIndexFromID(hp_sndDevices, originalDefaultID, &originalDefaultNum) != OKAY )
+	if( sndDevices_UtilsGetActiveIndexFromID(hp_sndDevices, originalDefaultID, &originalDefaultNum) != OKAY )
 		return(NOT_OKAY);
 
 	//Get the ID for the most recent playback device.
 	if( sndDeviceReadFromRegistry(hp_sndDevices, REG_CURRENT_USER, SND_DEVICES_REGISTRY_MOST_RECENT_PLAYBACK_WIDE, mostRecentPlaybackID) != OKAY )
 		return(NOT_OKAY);
 	// Get this devices internal index if the device is active.
-	if( sndDevices_UtilsGetIndexFromID(hp_sndDevices, mostRecentPlaybackID, &mostRecentPlaybackNum) != OKAY )
+	if( sndDevices_UtilsGetActiveIndexFromID(hp_sndDevices, mostRecentPlaybackID, &mostRecentPlaybackNum) != OKAY )
 		return(NOT_OKAY);
+
+	// BetterFxSound: the carrier the controller asked for, if it is active (not the virtual device). This run of the
+	// rules consumes the request, so it cannot override a later choice (e.g. a new Windows default) after a failed reinit.
+	wcscpy_s(requestedPlaybackID, PT_MAX_GENERIC_STRLEN, cast_handle->requestedPlaybackID);
+	cast_handle->requestedPlaybackID[0] = L'\0';
+	if( sndDevices_UtilsGetActiveIndexFromID(hp_sndDevices, requestedPlaybackID, &requestedPlaybackNum) != OKAY )
+		return(NOT_OKAY);
+	if( requestedPlaybackNum == dfxNum )
+		requestedPlaybackNum = SND_DEVICES_DEVICE_NOT_PRESENT;
+
+	// BetterFxSound: a device added since the last run of the rules, found before the list of previous devices is updated
+	// below. Only an active device with at least two channels that is not the virtual device: the search used to end
+	// past the list when the only new device was mono or unplugged, and pick whatever a stale entry named. Not while the
+	// controller manages the outputs: it elects the carrier itself (whether a new output takes over is its setting), and
+	// this rule made a new device the carrier against that choice, the controller then switching back (two reinits).
+	if( !cast_handle->outputsAreManaged &&
+		(cast_handle->numRealDevices > cast_handle->numPreviousRealDevices) && (cast_handle->numPreviousRealDevices > 0) )
+	{
+		// Now we need to find the new device GUID that was not in the previous list.
+		for(i=0; i<cast_handle->numRealDevices; i++)
+		{
+			if( cast_handle->pwszIDRealDevices[i] == NULL )
+				continue;
+
+			if (SND_DEVICES_MONO_BUG_SKIP_MONO_DEVICES)
+			{
+				if (sndDevicesGetNumberOfChannelsFromID(hp_sndDevices, cast_handle->pwszIDRealDevices[i], &i_numChannels, &i_resultFlag) != OKAY)
+					return(NOT_OKAY);
+
+				if ((i_resultFlag != SND_DEVICES_DEVICE_OPERATION_COMPLETED) || (i_numChannels < 2))
+				{
+					continue;
+				}
+			}
+
+			if( sndDevices_UtilsGetActiveIndexFromID(hp_sndDevices, cast_handle->pwszIDRealDevices[i], &deviceIndex) != OKAY )
+				return(NOT_OKAY);
+			if( (deviceIndex == SND_DEVICES_DEVICE_NOT_PRESENT) || (deviceIndex == dfxNum) )
+				continue;
+
+			NoMatchFlag = 1;
+			for(j=0; j<cast_handle->numPreviousRealDevices; j++)
+			{
+				if( wcscmp(cast_handle->pwszIDRealDevices[i], cast_handle->pwszIDPreviousRealDevices[j]) == 0 )
+					NoMatchFlag = 0;
+			}
+			if(NoMatchFlag)
+			{
+				newDeviceNum = deviceIndex; // This new device didn't match any of the previous devices.
+				break;
+			}
+		}
+	}
+
+	// BetterFxSound: the previous devices are the ones this run of the rules saw. sndDevices_GetAll() used to copy them
+	// whenever the count had changed, so whether a device counted as new depended on how many enumerations (the GUI's, a
+	// refresh, a reinit loop pass) had run since it arrived.
+	for(j=0; (j<cast_handle->numRealDevices) && (j<SND_DEVICES_MAX_NUM_DEVICES); j++)
+	{
+		if( cast_handle->pwszIDRealDevices[j] != NULL )
+			wcscpy_s(cast_handle->pwszIDPreviousRealDevices[j], PT_MAX_GENERIC_STRLEN, cast_handle->pwszIDRealDevices[j]);
+		else
+			cast_handle->pwszIDPreviousRealDevices[j][0] = L'\0';
+	}
+	cast_handle->numPreviousRealDevices = cast_handle->numRealDevices;
 
 	// Test for first run since installation by checking for non-null most recent default device ID value.
 	if( wcscmp(mostRecentDefaultID, L"") == 0 )
@@ -178,7 +246,7 @@ int PT_DECLSPEC sndDevicesImplementDeviceRules(PT_HANDLE *hp_sndDevices, int *ip
 	if( numRealDevices == 1 )
 	{
 		// Get this playback devices internal index, wcpp_RealDeviceIDs[0] references the first device. 
-		if( sndDevices_UtilsGetIndexFromID(hp_sndDevices, wcpp_RealDeviceIDs[0], &deviceIndex) != OKAY )
+		if( sndDevices_UtilsGetActiveIndexFromID(hp_sndDevices, wcpp_RealDeviceIDs[0], &deviceIndex) != OKAY )
 			return(NOT_OKAY);
 
 		// Use the single real playback device.
@@ -198,50 +266,31 @@ int PT_DECLSPEC sndDevicesImplementDeviceRules(PT_HANDLE *hp_sndDevices, int *ip
 		goto PlaybackDeviceIsSelected;
 	}
 
+	// BetterFxSound: the carrier the controller asked for comes before the rules below. A device added at the same time
+	// used to take its place, and the controller then switched back to it with another reinit.
+	if( requestedPlaybackNum != SND_DEVICES_DEVICE_NOT_PRESENT )
+	{
+		cast_handle->playbackDeviceNum = requestedPlaybackNum;
+		goto PlaybackDeviceIsSelected;
+	}
+
 	// Check to see if a device has just been added, if so, find it and set it as the playback device.
 	// Note that if more than one device was added this will set playback to the first device found.
-	if( (cast_handle->numRealDevices > cast_handle->numPreviousRealDevices) && (cast_handle->numPreviousRealDevices > 0) )
+	// BetterFxSound: found above.
+	if( newDeviceNum != SND_DEVICES_DEVICE_NOT_PRESENT )
 	{
-		// Now we need to find the new device GUID that was not in the previous list.
-		for(i=0; i<cast_handle->numRealDevices; i++)
-		{
-			if (SND_DEVICES_MONO_BUG_SKIP_MONO_DEVICES)
-			{
-				if (sndDevicesGetNumberOfChannelsFromID(hp_sndDevices, cast_handle->pwszIDRealDevices[i], &i_numChannels, &i_resultFlag) != OKAY)
-					return(NOT_OKAY);
-
-				if (i_numChannels < 2)
-				{
-					continue;
-				}
-			}
-			
-			NoMatchFlag = 1;
-			for(j=0; j<cast_handle->numPreviousRealDevices; j++)
-			{
-				if(cast_handle->pwszIDRealDevices[i] != NULL && wcscmp(cast_handle->pwszIDRealDevices[i], cast_handle->pwszIDPreviousRealDevices[j]) == 0 )
-					NoMatchFlag = 0;
-			}
-			if(NoMatchFlag)
-				break; // This new device didn't match any of the previous devices.
-		}
-		// Get this devices internal index.
-		if( sndDevices_UtilsGetIndexFromID(hp_sndDevices, cast_handle->pwszIDRealDevices[i], &deviceIndex) != OKAY )
-			return(NOT_OKAY);
-
-		if (deviceIndex != SND_DEVICES_DEVICE_NOT_PRESENT)
-		{
-			cast_handle->playbackDeviceNum = deviceIndex;
-			WritePreviousDefault = 1;
-			goto PlaybackDeviceIsSelected;
-		}
+		cast_handle->playbackDeviceNum = newDeviceNum;
+		WritePreviousDefault = 1;
+		goto PlaybackDeviceIsSelected;
 	}
 
 	// If we got here we have more than one real playback device and either the user hasn't manually selected one or
 	// the selected device is not present. Use rules to select the playback device based on the default device setting and history.
 	// First check to see if the current default device is not one of the DFX devices.
 	// BetterFxSound: with no default playback device known, the history below picks the device.
-	if( (current_defaultNum != dfxNum) && (current_defaultNum != SND_DEVICES_DEVICE_NOT_PRESENT) )
+	// BetterFxSound: and only an active one (an unplugged endpoint cannot be opened).
+	if( (current_defaultNum != dfxNum) && (current_defaultNum != SND_DEVICES_DEVICE_NOT_PRESENT) &&
+		(cast_handle->deviceState[current_defaultNum] == DEVICE_STATE_ACTIVE) )
 	{
 		// A non-DFX device is currently the default device.
 		// Check to see if the user has manually turned off automatice default device selection mode.
@@ -279,9 +328,13 @@ int PT_DECLSPEC sndDevicesImplementDeviceRules(PT_HANDLE *hp_sndDevices, int *ip
 			// For now we will set the playback device to the first active real device.
 			if( numRealDevices >= 1 )
 			{
-				// Get this playback devices internal index, wcpp_RealDeviceIDs[0] references the first device. 
-				if( sndDevices_UtilsGetIndexFromID(hp_sndDevices, wcpp_RealDeviceIDs[0], &deviceIndex) != OKAY )
-					return(NOT_OKAY);
+				// BetterFxSound: the first real device that is active, not merely the first one listed.
+				deviceIndex = SND_DEVICES_DEVICE_NOT_PRESENT;
+				for(i=0; (i<numRealDevices) && (i<SND_DEVICES_MAX_NUM_DEVICES) && (deviceIndex == SND_DEVICES_DEVICE_NOT_PRESENT); i++)
+				{
+					if( sndDevices_UtilsGetActiveIndexFromID(hp_sndDevices, wcpp_RealDeviceIDs[i], &deviceIndex) != OKAY )
+						return(NOT_OKAY);
+				}
 
 				// Use the single real playback device.
 				cast_handle->playbackDeviceNum = deviceIndex;
@@ -340,7 +393,7 @@ PlaybackDeviceIsSelected:  // Label to jump to when the playback device num has 
 			else {
 				// Get this playback devices internal index, wcpp_RealDeviceIDs[0] references the first device.
 				// We will use the most recent playback device recorded in the registry.
-				if (sndDevices_UtilsGetIndexFromID(hp_sndDevices, mostRecentPlaybackID, &deviceIndex) != OKAY)
+				if (sndDevices_UtilsGetActiveIndexFromID(hp_sndDevices, mostRecentPlaybackID, &deviceIndex) != OKAY)
 					return(NOT_OKAY);
 				cast_handle->playbackDeviceNum = deviceIndex;
 			}
@@ -387,7 +440,7 @@ PlaybackDeviceIsSelected:  // Label to jump to when the playback device num has 
 			return(NOT_OKAY);
 
 		// Get the prior default ID number if its active
-		if( sndDevices_UtilsGetIndexFromID(hp_sndDevices, mostRecentPlaybackID, &priorDefaultNum) != OKAY )
+		if( sndDevices_UtilsGetActiveIndexFromID(hp_sndDevices, mostRecentPlaybackID, &priorDefaultNum) != OKAY )
 				return(NOT_OKAY);
 	}
 

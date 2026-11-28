@@ -414,6 +414,17 @@ int AudioPassthruPrivate::processTimer()
 	}
 
 	/*
+	* BetterFxSound: an active device whose channel count could not be read at the last enumeration (it was being
+	* reconfigured) is read again shortly, by the refresh below: no notification follows once it can be read.
+	*/
+	if (!b_need_to_start_thread && (hProcessingThread_ != NULL) && (hProcessingThread_ != INVALID_HANDLE_VALUE))
+	{
+		BOOL probe_is_due = FALSE;
+		if ((sndDevicesGetChannelProbeIsDue(hp_sndDevices_, &probe_is_due) == OKAY) && probe_is_due)
+			InterlockedExchange(&(s_sndDevices_.deviceListIsStale), 1);
+	}
+
+	/*
 	* BetterFxSound: a playback device other than the virtual device and the carrier changed (an additional output
 	* plugged in or gone, an unused HDMI monitor going to sleep). That no longer stops the processing, which interrupted
 	* every output, so the reinit no longer reads the device list again and tells the controller. It is done here: the
@@ -768,6 +779,9 @@ void AudioPassthruPrivate::restoreDefaultPlaybackDevice()
 	}
 	multi_output_.setDriven(false);
 
+	/* BetterFxSound: a carrier request not yet taken by a reinit no longer applies once the devices are handed back */
+	s_sndDevices_.requestedPlaybackID[0] = L'\0';
+
 	/* Change the default soundcard to not be the DFX virtual one but instead the proper real one */
 	if (sndDevicesRestoreDefaultDevice(hp_sndDevices_, &i_resultFlag) != OKAY)
 		return;
@@ -804,7 +818,12 @@ int AudioPassthruPrivate::setTargetedRealPlaybackDevice(const std::wstring sound
 	BOOL virtual_is_default = FALSE;
 	if (sndDevicesGetVirtualDeviceIsDefault(hp_sndDevices_, &virtual_is_default) != OKAY)
 		virtual_is_default = FALSE;
-	if (isProcessing() && !handed_back && virtual_is_default)
+	/*
+	* BetterFxSound: not only while the processing thread runs. When the last reinit failed (the carrier went away) the
+	* engine is parked, but still drives the additional outputs at 100%: making a real device the Windows default then
+	* let the apps play to it unprocessed at that level. The request also lets the parked engine retry at once.
+	*/
+	if (!handed_back && virtual_is_default)
 	{
 		if (sndDevicesRequestTargetedPlaybackDevice(hp_sndDevices_, wcp_new_targeted_real_playback_guid, &i_resultFlag) != OKAY)
 			return(NOT_OKAY);
@@ -867,6 +886,8 @@ void AudioPassthruPrivate::setOutputs(const std::vector<OutputConfig>& outputs)
 		std::lock_guard<std::mutex> lock(config_mutex_);
 		outputs_ = outputs;
 	}
+	/* BetterFxSound: the controller elects the carrier from here on, the device rules no longer pick a new device */
+	s_sndDevices_.outputsAreManaged = TRUE;
 	applyAdditionalOutputs();
 }
 

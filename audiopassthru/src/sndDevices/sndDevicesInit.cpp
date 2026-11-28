@@ -107,6 +107,12 @@ int PT_DECLSPEC sndDevicesInit(PT_HANDLE *hp_sndDevices, CSlout *hp_slout, int i
 	cast_handle->enumeratedDefaultDeviceNum = SND_DEVICES_DEVICE_NOT_PRESENT;
 	wcscpy(cast_handle->dfxDeviceID, L"");
 	InterlockedExchange(&(cast_handle->deviceListIsStale), 0);
+	cast_handle->channelCacheCount = 0;
+	cast_handle->activeDeviceIsUnprobed = FALSE;
+	cast_handle->channelProbeRetries = 0;
+	cast_handle->lastEnumerationTick = 0;
+	wcscpy(cast_handle->requestedPlaybackID, L"");
+	cast_handle->outputsAreManaged = FALSE;
 
 	// No playback device has been used yet, so there is no mute setting of one to hold onto.
 	// Note these must survive a re-init, they are only reset here in the one time init call.

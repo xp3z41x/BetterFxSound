@@ -50,6 +50,7 @@ int PT_DECLSPEC sndDevices_ReleaseAllAudioObjects(PT_HANDLE *);
 
 /* sndDevices_Utils.cpp */
 int PT_DECLSPEC sndDevices_UtilsGetIndexFromID(PT_HANDLE *, wchar_t *, int *);
+int PT_DECLSPEC sndDevices_UtilsGetActiveIndexFromID(PT_HANDLE *, wchar_t *, int *);
 int PT_DECLSPEC sndDevices_UtilsGetIndexFromType(PT_HANDLE *, int, int *);
 int PT_DECLSPEC sndDevices_UtilsTerminateEncodingThreads(PT_HANDLE *, int *);
 
