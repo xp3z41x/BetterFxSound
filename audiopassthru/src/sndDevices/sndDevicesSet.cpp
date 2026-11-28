@@ -240,6 +240,10 @@ int PT_DECLSPEC sndDevicesSetDrivenOutputs(PT_HANDLE *hp_sndDevices, const std::
 
 	{
 		std::lock_guard<std::mutex> lock(cast_handle->drivenOutputsMutex);
+		// Unchanged set (a volume, delay or channel mode change): nothing to re-evaluate, so a slider move costs no COM
+		// round-trips. Every reinit re-evaluates the communications default anyway (sndDevicesSetDeviceType(DEFAULT)).
+		if( cast_handle->drivenOutputIDs == ids )
+			return(OKAY);
 		cast_handle->drivenOutputIDs = ids;
 	}
 
