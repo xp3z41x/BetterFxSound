@@ -69,11 +69,17 @@ public:
 	// Starts a measurement on its own thread. Returns false if one is already running.
 	// With no target it fails at once (state Failed, no thread) with no_targets_error as the error,
 	// or a generic one if that is empty. Callers also use this to report why a measurement cannot run.
+	// BetterFxSound: stream_generation, if given, must outlive the measurement. It changes whenever the audio of the
+	// outputs is interrupted (a processing thread ended); if it no longer equals start_generation while the sweeps
+	// play, the measurement fails, as it recorded gaps or partial sweeps.
 	bool start(const std::wstring& virtual_device_id, const std::vector<Target>& targets, SoloFunction solo,
-		const std::wstring& no_targets_error = std::wstring());
+		const std::wstring& no_targets_error = std::wstring(),
+		const std::atomic<unsigned int>* stream_generation = nullptr, unsigned int start_generation = 0);
 	void cancel();
 	// Stops a running measurement because it can no longer be valid; it fails with this reason.
 	void abort(const std::wstring& reason);
+	// BetterFxSound: Running, but cancelled or aborted: the thread ends within a few ms and its results are discarded.
+	bool isStopping() const;
 
 	State getState(int* progress_percent) const;
 	std::vector<DelayCalibrationResult> getResults() const;
@@ -89,6 +95,8 @@ private:
 	std::wstring virtual_device_id_;
 	std::vector<Target> targets_;
 	SoloFunction solo_;
+	const std::atomic<unsigned int>* stream_generation_ = nullptr;
+	unsigned int start_generation_ = 0;
 
 	HANDLE thread_ = NULL;
 	std::atomic<int> state_{ 0 };

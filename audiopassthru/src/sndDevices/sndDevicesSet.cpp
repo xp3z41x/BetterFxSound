@@ -157,6 +157,14 @@ int PT_DECLSPEC sndDevicesSetDeviceType(PT_HANDLE *hp_sndDevices, int i_deviceTy
 			hr = pPolicyConfig->SetDefaultEndpoint(cast_handle->pwszID[device_index_num], reserved);
 			pPolicyConfig->Release();
 
+			// BetterFxSound: Windows did not change the default (for example during a resume), so the cached default
+			// stays what it is. Recording it anyway made the notification of the real default look like our own change.
+			if (FAILED(hr))
+			{
+				*ip_resultFlag = SND_DEVICES_PROPERTY_SET_FAILED;
+				SND_DEVICES_SET_STATUS_AND_RETURN_OK(SND_DEVICES_PROPERTY_SET_FAILED);
+			}
+
 			// Store the current default device number and set the new one.
 			cast_handle->priorDefaultDeviceNum = cast_handle->defaultDeviceNum;
 			cast_handle->defaultDeviceNum = device_index_num;

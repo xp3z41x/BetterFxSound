@@ -37,6 +37,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 // there is some truth to it.
 sndDevicesHdlType AudioPassthruPrivate::s_sndDevices_;
 AudioPassthruCallback* AudioPassthruPrivate::s_callback_ = nullptr;
+std::atomic<LONG> AudioPassthruPrivate::s_device_change_count_{ 0 };
 
 AudioPassthruPrivate::AudioPassthruPrivate()
 {
@@ -251,6 +252,10 @@ int AudioPassthruPrivate::sndDeviceHandleToSoundDevices(bool active_devices)
 
 void AudioPassthruPrivate::onDeviceChange()
 {
+	// BetterFxSound: counted, so a notification that arrives during a reinit still wakes the engine if that reinit
+	// parks it (the reinit sets playbackDeviceIsUnavailable again after this clears it).
+	s_device_change_count_.fetch_add(1);
+
 	// Clear the unavailability flag so processTimer() can retry after this device change.
 	s_sndDevices_.playbackDeviceIsUnavailable = FALSE;
 
@@ -387,8 +392,16 @@ int AudioPassthruPrivate::processTimer()
 	{
 		// Playback device was unavailable on the last attempt. Wait for onDeviceChange() to
 		// clear playbackDeviceIsUnavailable before retrying, to avoid hammering sndDevicesReInit.
-		if (!s_sndDevices_.playbackDeviceIsUnavailable)
-			hProcessingThread_ = NULL;  // flag cleared — allow retry on next tick
+		// BetterFxSound: also retry after a device notification that came during the failed reinit (its clear of
+		// the flag was overwritten), and, when the devices were there but could not be set up, after a growing delay:
+		// nothing notifies when an exclusive-mode app lets the device go or a device becomes ready after a resume.
+		bool retry = !s_sndDevices_.playbackDeviceIsUnavailable;
+		if (s_device_change_count_.load() != parked_change_count_)
+			retry = true;
+		if (park_retry_timed_ && (GetTickCount() - park_start_tick_) >= park_retry_delay_ms_)
+			retry = true;
+		if (retry)
+			hProcessingThread_ = NULL;  // allow retry on next tick
 	}
 	else
 	{
@@ -455,8 +468,19 @@ int AudioPassthruPrivate::processTimer()
 
 	if (b_need_to_start_thread)
 	{
+		/*
+		* BetterFxSound: the processing stopped, so the capture and every output were interrupted (and restart muted,
+		* then faded in). A delay measurement that spans it records gaps or partial sweeps, whether or not the carrier
+		* changes: it is stopped, and applyAdditionalOutputs() below then applies the outputs at once.
+		*/
+		if (calibration_.getState(NULL) == DelayCalibration::State::Running)
+			calibration_.abort(L"The audio devices changed during the measurement. Synchronize again.");
+
 		/* Initialize flag which can be set by the outside telling thread to end */
 		i_kill_processing_thread_ = IS_FALSE;
+
+		/* BetterFxSound: a device notification from here on wakes the engine if this reinit parks it */
+		const LONG change_count_before_reinit = s_device_change_count_.load();
 
 		/* Reinit the sndDevices module */
 		if (sndDevicesReInit(hp_sndDevices_, SND_DEVICES_INIT_FOR_PROCESSING, &numRealDevices, &DfxDeviceEnabledFlag, &statusFlag) != OKAY)
@@ -528,6 +552,10 @@ int AudioPassthruPrivate::processTimer()
 
 			hProcessingThread_ = CreateThread(NULL, 0, processingThread, (LPVOID)this, 0L, &ProcessingThreadID_);
 
+			/* BetterFxSound: the devices could be set up, a later failure retries quickly again */
+			park_retry_timed_ = false;
+			park_retry_delay_ms_ = 0;
+
 			/* BetterFxSound: processing runs again, the real devices are FxSound's again */
 			{
 				std::lock_guard<std::mutex> lock(config_mutex_);
@@ -554,6 +582,27 @@ int AudioPassthruPrivate::processTimer()
 			if ((numRealDevices <= 0) || (DfxDeviceEnabledFlag != IS_TRUE))
 				s_sndDevices_.playbackDeviceIsUnavailable = TRUE;
 			hProcessingThread_ = INVALID_HANDLE_VALUE;
+
+			/*
+			* BetterFxSound: parking used to wait for a notification only, which may never come: every output stayed
+			* silent. A notification since the reinit started still wakes it (see the INVALID_HANDLE_VALUE case above).
+			* When the real and the virtual devices are there but a later step failed (the device rules, opening the
+			* carrier or the capture: statusFlag says why), it is also retried after 0.5, 1, 2, 4 then every 5 s. With no
+			* real device or no virtual device (statusFlag left completed) only a notification can help, and retrying
+			* would block this thread for a second each time while the reinit waits for the virtual device.
+			*/
+			parked_change_count_ = change_count_before_reinit;
+			park_retry_timed_ = (numRealDevices > 0) && (statusFlag != SND_DEVICES_DEVICE_OPERATION_COMPLETED);
+			if (park_retry_timed_)
+			{
+				if (park_retry_delay_ms_ == 0)
+					park_retry_delay_ms_ = kParkRetryFirstMs;
+				else if (park_retry_delay_ms_ * 2 > kParkRetryMaxMs)
+					park_retry_delay_ms_ = kParkRetryMaxMs;
+				else
+					park_retry_delay_ms_ = park_retry_delay_ms_ * 2;
+				park_start_tick_ = GetTickCount();
+			}
 		}
 
 		if (s_callback_ != nullptr)
@@ -731,6 +780,9 @@ DWORD WINAPI AudioPassthruPrivate::processingThread(LPVOID lpParam)
 	AudioPassthruPrivate * callerClass = (AudioPassthruPrivate*)lpParam;
 	auto ret = callerClass->threadWorker();
 
+	/* BetterFxSound: the audio of every output was interrupted, see stream_generation_ */
+	callerClass->stream_generation_.fetch_add(1);
+
 	CoUninitialize();
 
 	return ret;
@@ -783,6 +835,18 @@ bool AudioPassthruPrivate::isCarrierSwitchPending()
 void AudioPassthruPrivate::restoreDefaultPlaybackDevice()
 {
 	int i_resultFlag;
+	int i_timed_out = IS_FALSE;
+
+	/*
+	* BetterFxSound: processing stops here. It used to rely on the notification of the new Windows default to stop
+	* the processing thread; when that did not come (setting the default failed, the default did not change, or a
+	* just-started thread missed it) the thread kept running, and power on never reinitialized: the devices stayed
+	* handed back and the Windows default stayed the real device. With no thread (or a parked engine, whose sentinel
+	* is cleared here) the next processTimer() after power on always reinitializes.
+	*/
+	killProcessingThread(&i_timed_out);
+	park_retry_timed_ = false;
+	park_retry_delay_ms_ = 0;
 
 	/*
 	* BetterFxSound: the real device becomes the Windows default again and plays the apps' sound directly at
@@ -852,8 +916,10 @@ int AudioPassthruPrivate::setTargetedRealPlaybackDevice(const std::wstring sound
 		* BetterFxSound: while processing, the switch only takes effect at a reinit. It used to rely on the notification
 		* of the new Windows default to stop the processing thread, and nothing happened when that notification did
 		* not come (the default did not change, or setting it failed), leaving the new carrier pending and silent.
+		* Whenever FxSound is on, not only while the processing thread runs: between two reinits, or parked, the request
+		* is what the next reinit takes (and it lets a parked engine retry at once).
 		*/
-		if (i_resultFlag != SND_DEVICES_DEVICE_NOT_PRESENT && isProcessing() && !handed_back)
+		if (i_resultFlag != SND_DEVICES_DEVICE_NOT_PRESENT && !handed_back)
 		{
 			if (sndDevicesRequestTargetedPlaybackDevice(hp_sndDevices_, wcp_new_targeted_real_playback_guid, &i_resultFlag) != OKAY)
 				return(NOT_OKAY);
@@ -882,6 +948,15 @@ int AudioPassthruPrivate::setTargetedRealPlaybackDevice(const std::wstring sound
 			if (!sound_device_guid.empty() && sound_device_guid != wcp_targeted_guid && sound_device_guid != pending_carrier_id_)
 			{
 				pending_carrier_id_ = sound_device_guid;
+				changed = true;
+			}
+			/*
+			* BetterFxSound: the newest request wins. A switch back to the current carrier before the reinit took the
+			* previous request left that previous device pending, kept out of the additional outputs.
+			*/
+			else if (!sound_device_guid.empty() && sound_device_guid == wcp_targeted_guid && !pending_carrier_id_.empty())
+			{
+				pending_carrier_id_.clear();
 				changed = true;
 			}
 		}
@@ -1065,17 +1140,29 @@ void AudioPassthruPrivate::applyAdditionalOutputs()
 
 		/* The measurement relies on the output order, keep it stable while it runs. processTimer() applies the
 		   change once the measurement is over. */
-		if (calibration_.getState(NULL) == DelayCalibration::State::Running)
+		const bool measuring = calibration_.getState(NULL) == DelayCalibration::State::Running;
+
+		// A carrier switch cannot wait: the carrier's sweeps (solo -1) would now play on another device and be
+		// reported for the old one, which stays silent because it cannot join the router before the end.
+		if (measuring && carrier_id != calibration_carrier_id_)
+			calibration_.abort(L"The outputs changed during the measurement. Synchronize again.");
+
+		/*
+		* BetterFxSound: a measurement that is being stopped (aborted or cancelled) stays Running until its thread
+		* notices, a few ms later. Its results are thrown away, so the order no longer matters: the change is applied
+		* now. Waiting left a new carrier that was a router output playing twice (as the carrier and through the
+		* router) and the previous carrier silent until a later timer tick.
+		*/
+		if (measuring && !calibration_.isStopping())
 		{
 			apply_pending_ = true;
-
-			// A carrier switch cannot wait: the carrier's sweeps (solo -1) would now play on another device and be
-			// reported for the old one, which stays silent because it cannot join the router before the end.
-			if (carrier_id != calibration_carrier_id_)
-				calibration_.abort(L"The outputs changed during the measurement. Synchronize again.");
 		}
 		else
 		{
+			// The outputs are renumbered: no output may stay soloed by the measurement that is being stopped.
+			if (measuring)
+				solo_.store(DelayCalibration::kSoloNone, std::memory_order_relaxed);
+
 			// The carrier can still be one of the router's outputs here: a carrier switch during a measurement is
 			// left out of the router only now, after the reinit took the device over as the carrier. Removing that
 			// output hands the device's own level back, so the carrier takes it over again below, after the router
@@ -1104,7 +1191,10 @@ void AudioPassthruPrivate::applyAdditionalOutputs()
 		   them: each of those takes its device over and hands it back itself. While FxSound is off the router's
 		   outputs don't (their streams only open when audio is written), so what is owed to their devices is put
 		   back here, for example to Bluetooth headphones that left while in use and came back while FxSound is off. */
-		if (carrier_plays && processing && !handed_back_)
+		/* BetterFxSound: the carrier stays FxSound's whenever FxSound is on, also between two reinits (the thread
+		   stopped for a carrier switch or a device change): handing it back there only to take it over again at the
+		   reinit made its own volume jump. */
+		if (carrier_plays && !handed_back_)
 			in_use.push_back(carrier_id);
 		if (multi_output_.isDriven())
 		{
@@ -1263,6 +1353,10 @@ bool AudioPassthruPrivate::startDelayCalibration()
 	wchar_t wcp_targeted_guid[PT_MAX_GENERIC_STRLEN];
 	wchar_t wcp_dfx_guid[PT_MAX_GENERIC_STRLEN];
 
+	// BetterFxSound: read before isProcessing() is checked below, so a processing thread that ends from here on
+	// (a reinit, which interrupts every output) stops the measurement.
+	const unsigned int stream_generation = stream_generation_.load();
+
 	if (sndDevicesGetID(hp_sndDevices_, SND_DEVICES_TARGETED_REAL_PLAYBACK, wcp_targeted_guid, &i_resultFlag) != OKAY)
 		wcp_targeted_guid[0] = L'\0';
 	if (sndDevicesGetID(hp_sndDevices_, SND_DEVICES_VIRTUAL_PLAYBACK_DFX, wcp_dfx_guid, &i_resultFlag) != OKAY)
@@ -1348,7 +1442,7 @@ bool AudioPassthruPrivate::startDelayCalibration()
 
 	std::atomic<int>* solo = &solo_;
 	return calibration_.start(std::wstring(wcp_dfx_guid), targets, [solo](int index) { solo->store(index, std::memory_order_relaxed); },
-		no_targets_error);
+		no_targets_error, &stream_generation_, stream_generation);
 }
 
 void AudioPassthruPrivate::cancelDelayCalibration()

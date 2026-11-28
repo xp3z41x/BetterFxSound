@@ -82,6 +82,75 @@ namespace
 		}
 	}
 
+	// BetterFxSound: property keys written out here (PKEY_Device_ContainerId, PKEY_AudioEndpoint_FormFactor), so no
+	// property key definition has to be linked in.
+	const PROPERTYKEY kContainerIdKey = { { 0x8c7ed206, 0x3f8a, 0x4827, { 0xb3, 0xab, 0xae, 0x9e, 0x1f, 0xae, 0xfc, 0x6c } }, 2 };
+	const PROPERTYKEY kFormFactorKey = { { 0x1da5d803, 0xd492, 0x4edd, { 0x8c, 0x23, 0xe0, 0xc0, 0xff, 0xee, 0x7f, 0x0e } }, 0 };
+	// Every built-in device of the computer is in this container; no container reads as all zeros.
+	const GUID kComputerContainerId = { 0x00000000, 0x0000, 0x0000, { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff } };
+	const GUID kNoContainerId = { 0x00000000, 0x0000, 0x0000, { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 } };
+
+	bool readContainerId(IMMDevice* device, GUID* container)
+	{
+		IPropertyStore* props = nullptr;
+		if (device == nullptr || FAILED(device->OpenPropertyStore(STGM_READ, &props)) || props == nullptr)
+			return false;
+
+		bool read = false;
+		PROPVARIANT value;
+		PropVariantInit(&value);
+		if (SUCCEEDED(props->GetValue(kContainerIdKey, &value)) && value.vt == VT_CLSID && value.puuid != nullptr)
+		{
+			*container = *value.puuid;
+			read = !IsEqualGUID(*container, kNoContainerId) && !IsEqualGUID(*container, kComputerContainerId);
+		}
+		PropVariantClear(&value);
+		props->Release();
+		return read;
+	}
+
+	bool isHeadsetMicrophone(IMMDevice* device)
+	{
+		IPropertyStore* props = nullptr;
+		if (device == nullptr || FAILED(device->OpenPropertyStore(STGM_READ, &props)) || props == nullptr)
+			return false;
+
+		bool headset = false;
+		PROPVARIANT value;
+		PropVariantInit(&value);
+		if (SUCCEEDED(props->GetValue(kFormFactorKey, &value)) && value.vt == VT_UI4)
+			headset = (value.ulVal == static_cast<ULONG>(Headset)) || (value.ulVal == static_cast<ULONG>(Handset));
+		PropVariantClear(&value);
+		props->Release();
+		return headset;
+	}
+
+	/*
+	 * BetterFxSound: true when the microphone is the hands-free microphone of headphones (or a headset) that are one
+	 * of the outputs being measured. Opening it switches Bluetooth headphones to their hands-free mode, which degrades
+	 * or interrupts their playback during the measurement, and with a wired headset it only hears its own earcups.
+	 */
+	bool microphoneIsPartOfOutput(IMMDeviceEnumerator* enumerator, IMMDevice* microphone, const std::vector<std::wstring>& output_ids)
+	{
+		GUID microphone_container;
+		if (enumerator == nullptr || !isHeadsetMicrophone(microphone) || !readContainerId(microphone, &microphone_container))
+			return false;
+
+		for (const auto& id : output_ids)
+		{
+			IMMDevice* output = nullptr;
+			if (id.empty() || FAILED(enumerator->GetDevice(id.c_str(), &output)) || output == nullptr)
+				continue;
+
+			GUID output_container;
+			const bool same = readContainerId(output, &output_container) && IsEqualGUID(output_container, microphone_container);
+			output->Release();
+			if (same)
+				return true;
+		}
+		return false;
+	}
+
 	std::vector<float> makeChirp()
 	{
 		const size_t length = static_cast<size_t>(kChirpSeconds * kRate);
@@ -159,7 +228,7 @@ namespace
 		}
 
 		// Returns an empty string on success, otherwise what went wrong.
-		std::wstring open(const std::wstring& virtual_device_id)
+		std::wstring open(const std::wstring& virtual_device_id, const std::vector<std::wstring>& output_ids)
 		{
 			IMMDeviceEnumerator* enumerator = nullptr;
 			if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), NULL, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), (void**)&enumerator)))
@@ -173,6 +242,8 @@ namespace
 				error = L"The FxSound audio device was not found.";
 			else if (FAILED(enumerator->GetDefaultAudioEndpoint(eCapture, eConsole, &capture_device)))
 				error = L"No microphone was found. Connect one and set it as the default recording device in Windows.";
+			else if (microphoneIsPartOfOutput(enumerator, capture_device, output_ids))
+				error = L"The default microphone is part of headphones that are being synchronized. Set another microphone as the default recording device in Windows, then synchronize again.";
 
 			safeRelease(enumerator);
 
@@ -475,7 +546,7 @@ DelayCalibration::~DelayCalibration()
 }
 
 bool DelayCalibration::start(const std::wstring& virtual_device_id, const std::vector<Target>& targets, SoloFunction solo,
-	const std::wstring& no_targets_error)
+	const std::wstring& no_targets_error, const std::atomic<unsigned int>* stream_generation, unsigned int start_generation)
 {
 	if (state_.load() == static_cast<int>(State::Running))
 		return false;
@@ -490,6 +561,8 @@ bool DelayCalibration::start(const std::wstring& virtual_device_id, const std::v
 	virtual_device_id_ = virtual_device_id;
 	targets_ = targets;
 	solo_ = solo;
+	stream_generation_ = stream_generation;
+	start_generation_ = start_generation;
 	cancel_.store(false);
 	progress_.store(0);
 	{
@@ -531,6 +604,11 @@ void DelayCalibration::abort(const std::wstring& reason)
 			abort_reason_ = reason;
 	}
 	cancel_.store(true);
+}
+
+bool DelayCalibration::isStopping() const
+{
+	return state_.load() == static_cast<int>(State::Running) && cancel_.load();
 }
 
 DelayCalibration::State DelayCalibration::getState(int* progress_percent) const
@@ -591,7 +669,11 @@ void DelayCalibration::run()
 		SoloGuard guard = { solo_ };
 		Streams streams;
 
-		std::wstring error = streams.open(virtual_device_id_);
+		std::vector<std::wstring> output_ids;
+		for (const auto& target : targets_)
+			output_ids.push_back(target.device_id);
+
+		std::wstring error = streams.open(virtual_device_id_, output_ids);
 		if (!error.empty())
 		{
 			fail(error);
@@ -608,6 +690,13 @@ void DelayCalibration::run()
 			{
 				if (cancel_.load())
 					return false;
+				// BetterFxSound: the processing stopped (a reinit), so the capture and every output were interrupted
+				// and restart muted: the sweeps around it are lost or partial, with or without a carrier change.
+				if (stream_generation_ != nullptr && stream_generation_->load() != start_generation_)
+				{
+					this->abort(L"The audio devices changed during the measurement. Synchronize again.");
+					return false;
+				}
 				if (!streams.pump())
 					return false;
 				Sleep(5);

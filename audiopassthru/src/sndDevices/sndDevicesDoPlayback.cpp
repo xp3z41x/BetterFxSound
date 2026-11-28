@@ -91,7 +91,12 @@ int PT_DECLSPEC sndDevicesDoPlayback(PT_HANDLE *hp_sndDevices, int *ip_resultFla
 
 	// This call returns the number of frames still awaiting playback in the playback buffer
 	hr = cast_handle->pAudioClientPlayback->GetCurrentPadding(&numFramesQueuedUpToPlay);
-	if (FAILED(hr)) SND_DEVICES_SET_STATUS_AND_RETURN_OK(SND_DEVICES_GET_PADDING_FAILED)
+	if (FAILED(hr))
+	{
+		// BetterFxSound: reported, so the processing thread ends and a reinit runs. It used to see success and go on.
+		*ip_resultFlag = SND_DEVICES_GET_PADDING_FAILED;
+		SND_DEVICES_SET_STATUS_AND_RETURN_OK(SND_DEVICES_GET_PADDING_FAILED)
+	}
 
 	cast_handle->numPlaybackFramesAvailableToFill = cast_handle->bufferFrameSizePlayback - numFramesQueuedUpToPlay;
 
@@ -103,7 +108,12 @@ int PT_DECLSPEC sndDevicesDoPlayback(PT_HANDLE *hp_sndDevices, int *ip_resultFla
 	if( cast_handle->playbackFrameCount > 0 )
 	{
 		hr = cast_handle->pAudioClientPlaybackRender->GetBuffer(cast_handle->playbackFrameCount, &(cast_handle->pDataPacketPlayback));
-		if (FAILED(hr)) SND_DEVICES_SET_STATUS_AND_RETURN_OK(SND_DEVICES_PLAYBACK_RENDER_FAILED)
+		if (FAILED(hr))
+		{
+			// BetterFxSound: reported, so the processing thread ends and a reinit runs. It used to see success and go on.
+			*ip_resultFlag = SND_DEVICES_PLAYBACK_RENDER_FAILED;
+			SND_DEVICES_SET_STATUS_AND_RETURN_OK(SND_DEVICES_PLAYBACK_RENDER_FAILED)
+		}
 
 		// Don't do copy if either buffer is NULL
 		if( (cast_handle->pDataPacketPlayback != NULL) && (cast_handle->fPlaybackBuf != NULL) )
@@ -116,7 +126,12 @@ int PT_DECLSPEC sndDevicesDoPlayback(PT_HANDLE *hp_sndDevices, int *ip_resultFla
 		}
 
 		hr = cast_handle->pAudioClientPlaybackRender->ReleaseBuffer(cast_handle->playbackFrameCount, flags);
-		if (FAILED(hr)) SND_DEVICES_SET_STATUS_AND_RETURN_OK(SND_DEVICES_RELEASE_BUFFER_FAILED)
+		if (FAILED(hr))
+		{
+			// BetterFxSound: reported, so the processing thread ends and a reinit runs. It used to see success and go on.
+			*ip_resultFlag = SND_DEVICES_RELEASE_BUFFER_FAILED;
+			SND_DEVICES_SET_STATUS_AND_RETURN_OK(SND_DEVICES_RELEASE_BUFFER_FAILED)
+		}
 	}
 
 	*ip_resultFlag = SND_DEVICES_CAPTURE_PLAYBACK_SUCCESS;

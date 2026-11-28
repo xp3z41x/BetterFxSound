@@ -83,6 +83,20 @@ private:
 	int sndDeviceHandleToSoundDevices(bool active_devices = true);
 	static void onDeviceChange();
 
+	// BetterFxSound: counts the device notifications (onDeviceChange()). A reinit that fails parks the engine; it is
+	// woken by a notification that came after the counter was read before that reinit, so one that arrived during the
+	// reinit is not lost.
+	static std::atomic<LONG> s_device_change_count_;
+	LONG parked_change_count_ = 0;			// Counter read before the reinit that parked the engine
+	// BetterFxSound: a reinit that failed with the real and virtual devices present (device in use by an exclusive-mode
+	// app, not ready after a connect or a resume, format being changed) is retried after a growing delay, as no
+	// notification may follow. UI/timer thread only.
+	bool park_retry_timed_ = false;
+	DWORD park_retry_delay_ms_ = 0;			// 0 until a reinit fails, then 500 ms doubling up to 5 s; reset by a success
+	DWORD park_start_tick_ = 0;
+	static constexpr DWORD kParkRetryFirstMs = 500;
+	static constexpr DWORD kParkRetryMaxMs = 5000;
+
 	PT_HANDLE *hp_sndDevices_;
 	static sndDevicesHdlType s_sndDevices_;
 
@@ -127,6 +141,9 @@ private:
 	// Delay measurement. While it runs only one output plays: -1 = carrier, k = additional output k.
 	// solo_ is declared before calibration_ so it outlives the measurement thread that sets it.
 	std::atomic<int> solo_{ DelayCalibration::kSoloNone };
+	// Incremented each time a processing thread ends, so the capture, the carrier and the additional outputs' audio
+	// were interrupted: a delay measurement that spans it is no longer valid. Declared before calibration_ too.
+	std::atomic<unsigned int> stream_generation_{ 0 };
 	std::vector<AdditionalOutputConfig> effective_outputs_;	// As passed to multi_output_ (guarded by config_mutex_)
 	std::wstring calibration_carrier_id_;	// Carrier when the measurement started, a switch aborts it (guarded by config_mutex_)
 	DelayCalibration calibration_;
