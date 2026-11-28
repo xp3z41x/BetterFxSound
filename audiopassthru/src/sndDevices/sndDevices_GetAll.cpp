@@ -40,20 +40,68 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 static int sndDevices_GetAllDevices(PT_HANDLE* hp_sndDevices, int* ip_num_devices);
 
+// BetterFxSound: copies the ID of the listed device at i_index, or an empty string when the index is not in the list.
+static void sndDevices_GetAllCopyListedID(struct sndDevicesHdlType* cast_handle, int i_index, wchar_t* wcp_ID)
+{
+	wcp_ID[0] = L'\0';
+	if ((i_index >= 0) && (i_index < cast_handle->totalNumDevices) && (i_index < SND_DEVICES_MAX_NUM_DEVICES))
+		wcscpy_s(wcp_ID, PT_MAX_GENERIC_STRLEN, cast_handle->pwszID[i_index]);
+}
+
+// BetterFxSound: the index of the device with this ID in the list just read, SND_DEVICES_DEVICE_NOT_PRESENT if none.
+static int sndDevices_GetAllFindListedID(struct sndDevicesHdlType* cast_handle, const wchar_t* wcp_ID)
+{
+	int i;
+
+	if (wcp_ID[0] == L'\0')
+		return(SND_DEVICES_DEVICE_NOT_PRESENT);
+
+	for (i = 0; (i < cast_handle->totalNumDevices) && (i < SND_DEVICES_MAX_NUM_DEVICES); i++)
+	{
+		if (wcscmp(cast_handle->pwszID[i], wcp_ID) == 0)
+			return(i);
+	}
+
+	return(SND_DEVICES_DEVICE_NOT_PRESENT);
+}
+
 // Gets an array of objects for all audio devices and stores indexes to the default device and DFX device if installed.
 // BetterFxSound: enumerationSequence is odd while the list is rewritten, see sndDevicesHdlType.
 int PT_DECLSPEC sndDevices_GetAll(PT_HANDLE* hp_sndDevices, int* ip_num_devices)
 {
 	struct sndDevicesHdlType* cast_handle;
 	int i_return;
+	LONG sequence;
+	wchar_t wcp_playback_ID[PT_MAX_GENERIC_STRLEN];
+	wchar_t wcp_capture_ID[PT_MAX_GENERIC_STRLEN];
 
 	cast_handle = (struct sndDevicesHdlType*)hp_sndDevices;
 
 	if (cast_handle == NULL)
 		return(NOT_OKAY);
 
-	InterlockedIncrement(&(cast_handle->enumerationSequence));
+	// BetterFxSound: the rewrite starts only from an even sequence, so it never overlaps a device notification callback
+	// publishing defaultDeviceNum (it holds the sequence odd for a few microseconds) or another enumeration.
+	for (;;)
+	{
+		sequence = InterlockedCompareExchange(&(cast_handle->enumerationSequence), 0, 0);
+		if (((sequence & 1) == 0) &&
+			(InterlockedCompareExchange(&(cast_handle->enumerationSequence), sequence + 1, sequence) == sequence))
+			break;
+		Sleep(1);
+	}
+
+	// BetterFxSound: the list can be read again while processing (a device change that does not stop it, the GUI's
+	// getSoundDevices()), and its order can change. The carrier and capture indexes follow their devices' IDs, so they
+	// keep naming the same devices (or none, if they are gone). A reinit has reset them, so they stay unset then.
+	sndDevices_GetAllCopyListedID(cast_handle, cast_handle->playbackDeviceNum, wcp_playback_ID);
+	sndDevices_GetAllCopyListedID(cast_handle, cast_handle->captureDeviceNum, wcp_capture_ID);
+
 	i_return = sndDevices_GetAllDevices(hp_sndDevices, ip_num_devices);
+
+	cast_handle->playbackDeviceNum = sndDevices_GetAllFindListedID(cast_handle, wcp_playback_ID);
+	cast_handle->captureDeviceNum = sndDevices_GetAllFindListedID(cast_handle, wcp_capture_ID);
+
 	InterlockedIncrement(&(cast_handle->enumerationSequence));
 
 	return(i_return);

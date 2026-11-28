@@ -419,7 +419,13 @@ struct sndDevicesHdlType {
 	wchar_t dfxDeviceID[PT_MAX_GENERIC_STRLEN];
 	// BetterFxSound: odd while sndDevices_GetAll() rewrites the device list. The device notification callbacks read
 	// the list without a lock, and only trust what they read when this was even and unchanged around the read.
+	// sndDevices_GetAll() makes it odd only from an even value (compare-exchange), and so does a device notification
+	// callback for the moment it publishes defaultDeviceNum, so the two writers never overlap.
 	volatile LONG enumerationSequence;
+	// BetterFxSound: set when a playback endpoint other than the virtual device and the carrier changed (the device
+	// notification callbacks, sndCheckDeviceChanges()). Such a change no longer stops the processing; the timer reads
+	// the device list again and refreshes the outputs instead (AudioPassthruPrivate::processTimer()).
+	volatile LONG deviceListIsStale;
 	int playbackDeviceNum;
 	int captureDeviceNum;
 	int priorDefaultDeviceNum;

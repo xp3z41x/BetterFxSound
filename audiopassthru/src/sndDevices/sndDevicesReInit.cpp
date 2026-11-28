@@ -84,6 +84,8 @@ int PT_DECLSPEC sndDevicesReInit(PT_HANDLE *hp_sndDevices, int i_initType, int *
 	// from now on (by a device notification or a carrier switch) is kept, and the processing thread started after this
 	// reinit exits at once so another reinit sees it.
 	InterlockedExchange(&(cast_handle->stopAudioCaptureAndPlaybackLoop), 0);
+	// BetterFxSound: the list read below and the outputs refresh that follows the reinit cover any earlier change.
+	InterlockedExchange(&(cast_handle->deviceListIsStale), 0);
 
 	wcscpy(cast_handle->lastDeviceAddCallbackGuid, L"");
 	cast_handle->lastDeviceAddCallbackGuidtype = 0;
@@ -307,6 +309,29 @@ int PT_DECLSPEC sndDevicesReInit(PT_HANDLE *hp_sndDevices, int i_initType, int *
 	return(OKAY);
 }
 
+// BetterFxSound: whether a difference between the device list and the system for this endpoint must stop the
+// processing. Same rule as the device notification callbacks (sndDevicesCallbackChangeStopsProcessing()): the virtual
+// device, the carrier, or any endpoint becoming active while there is no carrier.
+static BOOL sndCheckDeviceChangeStopsProcessing(struct sndDevicesHdlType* cast_handle, const wchar_t* wcp_ID,
+	const wchar_t* wcp_carrier_ID, BOOL b_becomes_active)
+{
+	if ((cast_handle->dfxDeviceID[0] != L'\0') && (wcscmp(wcp_ID, cast_handle->dfxDeviceID) == 0))
+		return(TRUE);
+
+	if (wcp_carrier_ID[0] == L'\0')
+		return(b_becomes_active);
+
+	return(wcscmp(wcp_ID, wcp_carrier_ID) == 0);
+}
+
+/*
+* BetterFxSound: reports any difference between the device list read at the last enumeration and the system (count, IDs,
+* states), so the caller reads the list again. The processing is only stopped when a difference concerns it (see
+* sndCheckDeviceChangeStopsProcessing()), as the device notification callbacks do. Stopping it for any difference
+* interrupted every output, at a moment unrelated to the change (opening the tray menu or the outputs list), for
+* changes the callbacks had deliberately let through. Other differences mark the list stale, so the timer refreshes the
+* outputs while processing.
+*/
 int PT_DECLSPEC sndCheckDeviceChanges(PT_HANDLE* hp_sndDevices, BOOL* bp_deviceChanged)
 {
 	struct sndDevicesHdlType* cast_handle;
@@ -316,7 +341,13 @@ int PT_DECLSPEC sndCheckDeviceChanges(PT_HANDLE* hp_sndDevices, BOOL* bp_deviceC
 	UINT deviceCount = 0;
 	UINT i;
 	int j;
+	int listed_count;
+	int carrier_num;
 	BOOL deviceFound;
+	BOOL stop_processing;
+	BOOL read_all;
+	BOOL listed_seen[SND_DEVICES_MAX_NUM_DEVICES];
+	wchar_t carrier_ID[PT_MAX_GENERIC_STRLEN];
 	LPWSTR pID = NULL;
 
     *bp_deviceChanged = FALSE;
@@ -324,6 +355,22 @@ int PT_DECLSPEC sndCheckDeviceChanges(PT_HANDLE* hp_sndDevices, BOOL* bp_deviceC
 	cast_handle = (struct sndDevicesHdlType*)hp_sndDevices;
 	if (cast_handle == NULL)
 		return(NOT_OKAY);
+
+	listed_count = cast_handle->totalNumDevices;
+	if (listed_count < 0)
+		listed_count = 0;
+	if (listed_count > SND_DEVICES_MAX_NUM_DEVICES)
+		listed_count = SND_DEVICES_MAX_NUM_DEVICES;
+	for (j = 0; j < SND_DEVICES_MAX_NUM_DEVICES; j++)
+		listed_seen[j] = FALSE;
+
+	carrier_ID[0] = L'\0';
+	carrier_num = cast_handle->playbackDeviceNum;
+	if ((carrier_num >= 0) && (carrier_num < listed_count))
+		wcscpy_s(carrier_ID, PT_MAX_GENERIC_STRLEN, cast_handle->pwszID[carrier_num]);
+
+	stop_processing = FALSE;
+	read_all = TRUE;
 
 	hr = CoCreateInstance(cast_handle->CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL, cast_handle->IID_IMMDeviceEnumerator, (void**)&pEnumerator);
 	if (FAILED(hr)) SND_DEVICES_SET_STATUS_AND_RETURN_OK(SND_DEVICES_INSTANCE_CREATE_FAILED)
@@ -336,63 +383,83 @@ int PT_DECLSPEC sndCheckDeviceChanges(PT_HANDLE* hp_sndDevices, BOOL* bp_deviceC
 	hr = pCollectionAllDevices->GetCount(&deviceCount);
 	if (FAILED(hr)) SND_DEVICES_SET_STATUS_AND_RETURN_OK(SND_DEVICES_GETCOUNT_FAILED)
 
-	// If count is different, trigger stop
-	if (deviceCount != (UINT)cast_handle->totalNumDevices)
-	{
+	// A different count means a device was added or removed (which one is found below).
+	if (deviceCount != (UINT)listed_count)
         *bp_deviceChanged = TRUE;
-		InterlockedExchange(&(cast_handle->stopAudioCaptureAndPlaybackLoop), 1);
-		return(OKAY);
-	}
 
-	// If count is same, compare device IDs
+	// Compare device IDs and states
 	for (i = 0; i < deviceCount; i++)
 	{
 		IMMDevice* pDevice = NULL;
 		hr = pCollectionAllDevices->Item(i, &pDevice);
 		if (FAILED(hr) || pDevice == NULL)
+		{
+			read_all = FALSE;
 			continue;
+		}
 
 		pID = NULL;
 		hr = pDevice->GetId(&pID);
 		if (FAILED(hr) || pID == NULL)
 		{
 			if (pDevice) pDevice->Release();
+			read_all = FALSE;
 			continue;
 		}
 
+		DWORD currentState = 0;
+		hr = pDevice->GetState(&currentState);
+		if (FAILED(hr))
+			currentState = 0;
+
 		deviceFound = FALSE;
-		for (j = 0; j < cast_handle->totalNumDevices; j++)
+		for (j = 0; j < listed_count; j++)
 		{
 			if (wcscmp(pID, cast_handle->pwszID[j]) == 0)
 			{
 				deviceFound = TRUE;
+				listed_seen[j] = TRUE;
 
 				// Device ID matched - now check if its state has changed
-				DWORD currentState = 0;
-				hr = pDevice->GetState(&currentState);
 				if (SUCCEEDED(hr) && currentState != cast_handle->deviceState[j])
 				{
-					CoTaskMemFree(pID);
-					pDevice->Release();
 					*bp_deviceChanged = TRUE;
-					InterlockedExchange(&(cast_handle->stopAudioCaptureAndPlaybackLoop), 1);
-					return(OKAY);
+					if (((currentState == DEVICE_STATE_ACTIVE) || (cast_handle->deviceState[j] == DEVICE_STATE_ACTIVE)) &&
+						sndCheckDeviceChangeStopsProcessing(cast_handle, pID, carrier_ID, (currentState == DEVICE_STATE_ACTIVE)))
+						stop_processing = TRUE;
 				}
 
 				break;
 			}
 		}
 
-		CoTaskMemFree(pID);
-		pDevice->Release();
-
 		if (!deviceFound)
 		{
             *bp_deviceChanged = TRUE;
-			InterlockedExchange(&(cast_handle->stopAudioCaptureAndPlaybackLoop), 1);
-			return OKAY;
+			if (sndCheckDeviceChangeStopsProcessing(cast_handle, pID, carrier_ID, (currentState == DEVICE_STATE_ACTIVE)))
+				stop_processing = TRUE;
+		}
+
+		CoTaskMemFree(pID);
+		pDevice->Release();
+	}
+
+	// Listed devices that are gone from the system (removed, or no longer active nor unplugged). When some device could
+	// not be read, one of them may be the unread one, so it is only reported, not taken for gone.
+	for (j = 0; j < listed_count; j++)
+	{
+		if (!listed_seen[j])
+		{
+			*bp_deviceChanged = TRUE;
+			if (read_all && sndCheckDeviceChangeStopsProcessing(cast_handle, cast_handle->pwszID[j], carrier_ID, FALSE))
+				stop_processing = TRUE;
 		}
 	}
+
+	if (stop_processing)
+		InterlockedExchange(&(cast_handle->stopAudioCaptureAndPlaybackLoop), 1);
+	else if (*bp_deviceChanged)
+		InterlockedExchange(&(cast_handle->deviceListIsStale), 1);
 
 	return(OKAY);
 }

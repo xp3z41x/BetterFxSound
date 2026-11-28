@@ -413,6 +413,25 @@ int AudioPassthruPrivate::processTimer()
 			applyAdditionalOutputs();
 	}
 
+	/*
+	* BetterFxSound: a playback device other than the virtual device and the carrier changed (an additional output
+	* plugged in or gone, an unused HDMI monitor going to sleep). That no longer stops the processing, which interrupted
+	* every output, so the reinit no longer reads the device list again and tells the controller. It is done here: the
+	* list is read again, the additional outputs follow it, and the controller updates its outputs (it may still switch
+	* the carrier, which requests a reinit).
+	*/
+	if (!b_need_to_start_thread && (hProcessingThread_ != NULL) && (hProcessingThread_ != INVALID_HANDLE_VALUE) &&
+		(InterlockedExchange(&(s_sndDevices_.deviceListIsStale), 0) != 0))
+	{
+		if (checkDeviceChanges())
+			sndDevices_GetAll(hp_sndDevices_, &(s_sndDevices_.totalNumDevices));
+
+		applyAdditionalOutputs();
+
+		if (s_callback_ != nullptr)
+			s_callback_->onSoundDeviceChange(true);
+	}
+
 	if (b_need_to_start_thread)
 	{
 		/* Initialize flag which can be set by the outside telling thread to end */
@@ -844,8 +863,9 @@ void AudioPassthruPrivate::setOutputs(const std::vector<OutputConfig>& outputs)
 /*
 * FUNCTION: isDevicePresent()
 * DESCRIPTION: BetterFxSound. True if the device is an active playback device in the list read at the last
-* device enumeration. Every device arrival or removal causes a reinit, which re-reads that list and then
-* calls applyAdditionalOutputs(), so an output that is plugged in later is picked up then.
+* device enumeration. A device arrival or removal either causes a reinit or, for a device other than the virtual
+* device and the carrier, a list refresh in processTimer(); both re-read that list and then call
+* applyAdditionalOutputs(), so an output that is plugged in later is picked up then.
 */
 bool AudioPassthruPrivate::isDevicePresent(const std::wstring& device_id) const
 {

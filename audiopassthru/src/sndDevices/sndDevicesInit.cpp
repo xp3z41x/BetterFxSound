@@ -106,6 +106,7 @@ int PT_DECLSPEC sndDevicesInit(PT_HANDLE *hp_sndDevices, CSlout *hp_slout, int i
 	cast_handle->ignoreDeviceCallbacks = FALSE;
 	cast_handle->enumeratedDefaultDeviceNum = SND_DEVICES_DEVICE_NOT_PRESENT;
 	wcscpy(cast_handle->dfxDeviceID, L"");
+	InterlockedExchange(&(cast_handle->deviceListIsStale), 0);
 
 	// No playback device has been used yet, so there is no mute setting of one to hold onto.
 	// Note these must survive a re-init, they are only reset here in the one time init call.
