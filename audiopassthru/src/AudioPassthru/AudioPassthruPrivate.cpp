@@ -839,16 +839,14 @@ DWORD WINAPI AudioPassthruPrivate::processingThread(LPVOID lpParam)
 	AudioPassthruPrivate * callerClass = (AudioPassthruPrivate*)lpParam;
 
 	/*
-	* BetterFxSound: the capture loop polls every millisecond (sndDevicesDoCapture()). A high resolution waitable timer
+	* BetterFxSound: the capture loop polls every millisecond while audio flows (sndDevicesDoCapture()). A high resolution waitable timer
 	* (Windows 10 1803 and later) keeps that interval whatever the process timer resolution, which Windows 11 may
-	* ignore for a hidden window. Without one (Windows 7, older Windows 10) the timer resolution is raised to 1 ms for
-	* this thread's lifetime, instead of relying on JUCE having done it. The thread is also registered with MMCSS (Pro
-	* Audio), so other work holds it off less often; if that service is not available it keeps its own priority.
+	* ignore for a hidden window. Without one (Windows 7, older Windows 10) the capture loop raises the timer resolution
+	* to 1 ms while audio flows, instead of relying on JUCE having done it, and ends it when idle and when this thread
+	* ends. The thread is also registered with MMCSS (Pro Audio), so other work holds it off less often; if that service
+	* is not available it keeps its own priority.
 	*/
 	HANDLE wait_timer = CreateWaitableTimerExW(NULL, NULL, kCreateWaitableTimerHighResolution, TIMER_ALL_ACCESS);
-	bool timer_period_raised = false;
-	if (wait_timer == NULL)
-		timer_period_raised = (timeBeginPeriod(1) == TIMERR_NOERROR);
 	DWORD mmcss_task_index = 0;
 	HANDLE mmcss_handle = AvSetMmThreadCharacteristicsW(L"Pro Audio", &mmcss_task_index);
 
@@ -856,8 +854,7 @@ DWORD WINAPI AudioPassthruPrivate::processingThread(LPVOID lpParam)
 
 	if (mmcss_handle != NULL)
 		AvRevertMmThreadCharacteristics(mmcss_handle);
-	if (timer_period_raised)
-		timeEndPeriod(1);
+	sndDevicesReleaseTimerPeriod(callerClass->hp_sndDevices_);
 	if (wait_timer != NULL)
 		CloseHandle(wait_timer);
 

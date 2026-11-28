@@ -482,6 +482,7 @@ struct sndDevicesHdlType {
 	UINT32 carrierLastPadding;			// The carrier's queue (playback frames) as last read, or right after the last write.
 	UINT32 carrierStallCapturedFrames;	// Frames captured since the running carrier last played out of its queue.
 	int carrierStallCount;				// Consecutive stalls of the carrier, each reinit waits longer; it gives up at the max.
+	int timerPeriodRaised;				// sndDevicesDoCapture() raised the timer resolution (sndDevicesReleaseTimerPeriod()).
 	double carrierErrorAvg;				// Averaged offset of the queue from its setpoint right after a write, seconds.
 	double carrierReadPos;				// Resampler: input position of the next output frame, from -2 (see carrierHistory).
 	float carrierHistory[3][SND_DEVICES_CARRIER_MAX_CHANNELS];	// Resampler: the last 3 frames of the previous block.
@@ -584,6 +585,7 @@ int PT_DECLSPEC sndDevicesRestoreDefaultDevice(PT_HANDLE *, int *);
 /* sndDevicesDoCapture.cpp */
 int PT_DECLSPEC sndDevicesDoCapture(PT_HANDLE *, float **, int *, WAVEFORMATEX **, int *, HANDLE);
 int PT_DECLSPEC sndDevicesStartStopCapture(PT_HANDLE *, int);
+int PT_DECLSPEC sndDevicesReleaseTimerPeriod(PT_HANDLE *);
 
 /* sndDevicesDoPlayback.cpp */
 int PT_DECLSPEC sndDevicesDoPlayback(PT_HANDLE *, int *);

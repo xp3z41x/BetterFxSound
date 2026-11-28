@@ -32,6 +32,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include <endpointvolume.h>
 #include <Propvarutil.h>
 #include <Avrt.h>
+#include <mmsystem.h>
+#pragma comment(lib, "winmm.lib")
 
 #include "slout.h"
 #include "mry.h"
@@ -56,6 +58,14 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #define SND_DEVICES_CARRIER_POLL_GAP_MS			200
 
 /*
+ * BetterFxSound: capture polling (sndDevicesDoCapture()). Every millisecond while audio flows; every
+ * SND_DEVICES_IDLE_POLL_MS once the carrier is stopped with nothing queued and no packet came for
+ * SND_DEVICES_IDLE_AFTER_MS.
+ */
+#define SND_DEVICES_IDLE_AFTER_MS				100
+#define SND_DEVICES_IDLE_POLL_MS				10
+
+/*
  * FUNCTION: sndDevicesResetCarrierResampler()
  * DESCRIPTION: BetterFxSound. Starts the carrier's resampler (sndDevicesDoPlayback()) over from silence.
  */
@@ -67,13 +77,37 @@ static void sndDevicesResetCarrierResampler(struct sndDevicesHdlType *cast_handl
 }
 
 /*
+ * FUNCTION: sndDevicesReleaseTimerPeriod()
+ * DESCRIPTION: BetterFxSound. Ends the 1 ms timer resolution sndDevicesDoCapture() raised while polling without a high
+ * resolution waitable timer, if it did. Called from the processing thread, also when it ends.
+ */
+int PT_DECLSPEC sndDevicesReleaseTimerPeriod(PT_HANDLE *hp_sndDevices)
+{
+	struct sndDevicesHdlType *cast_handle;
+
+	cast_handle = (struct sndDevicesHdlType *)hp_sndDevices;
+
+	if (cast_handle == NULL)
+		return(NOT_OKAY);
+
+	if( cast_handle->timerPeriodRaised != 0 )
+	{
+		timeEndPeriod(1);
+		cast_handle->timerPeriodRaised = 0;
+	}
+
+	return(OKAY);
+}
+
+/*
  * FUNCTION: sndDevicesDoCapture()
  * DESCRIPTION: Captures audio buffers from specified capture device.
  * Returns fp_buffer to use to do audio processing in place.
  * *ip_numSampleSets will contain the number of sample sets in the buffer
  * and **pp_wfxDfx contains the format of the buffer.
- * BetterFxSound: h_waitTimer is a waitable timer the calling thread owns, used to wait 1 ms between polls; NULL
- * waits with Sleep(1).
+ * BetterFxSound: h_waitTimer is a waitable timer the calling thread owns, used to wait between polls; NULL waits
+ * with Sleep() and the timer resolution raised while audio flows (the caller ends it with
+ * sndDevicesReleaseTimerPeriod()).
  * Every loopback packet there is is read on each poll and handed over at once, whatever the carrier has queued. The
  * carrier used to pace the capture: only what it needed to get back to half the buffer was read, so the additional
  * outputs (fed with the same blocks) got nothing while it refilled from empty or stalled, a sound shorter than half
@@ -151,21 +185,42 @@ int PT_DECLSPEC sndDevicesDoCapture(PT_HANDLE *hp_sndDevices, float **fpp_buffer
 			return(OKAY);
 		}
 
-		// BetterFxSound: poll every millisecond. Sleep(1) lasts a whole timer tick (up to 15.6 ms) unless the
-		// process raised the timer resolution, which Windows 11 may ignore for a hidden window, so how soon a
+		// BetterFxSound: poll every millisecond while audio flows. Sleep(1) lasts a whole timer tick (up to 15.6 ms)
+		// unless the timer resolution is raised, which Windows 11 may ignore for a hidden window, so how soon a
 		// packet was seen depended on the environment. A high resolution timer (Windows 10 1803 and later) does
-		// not; without it the processing thread raised the timer resolution (AudioPassthruPrivate::processingThread()).
-		if( h_waitTimer != NULL )
+		// not; without it the timer resolution is raised to 1 ms here. Once idle (the carrier stopped with nothing
+		// queued and no packet for SND_DEVICES_IDLE_AFTER_MS) it polls every SND_DEVICES_IDLE_POLL_MS instead, with
+		// the timer resolution back to normal, so an idle FxSound lets the CPU sleep; the first packet after
+		// silence is seen at most that much later, which the carrier start below and the additional outputs absorb.
 		{
-			LARGE_INTEGER dueTime;
-			dueTime.QuadPart = -10000LL; // 1 ms, relative, in 100 ns units
-			if( SetWaitableTimer(h_waitTimer, &dueTime, 0, NULL, NULL, FALSE) )
-				WaitForSingleObject(h_waitTimer, 20);
+			LARGE_INTEGER qpcPoll;
+			BOOL b_idle = FALSE;
+			DWORD waitMs;
+			QueryPerformanceCounter(&qpcPoll);
+			if( (cast_handle->playbackStreamIsTemporarilyPaused != 0) && (cast_handle->carrierLastPadding == 0) &&
+				(cast_handle->qpcFrequency > 0) &&
+				((qpcPoll.QuadPart - cast_handle->lastCapturePacketQpc) > (cast_handle->qpcFrequency * SND_DEVICES_IDLE_AFTER_MS) / 1000) )
+				b_idle = TRUE;
+			waitMs = b_idle ? SND_DEVICES_IDLE_POLL_MS : 1;
+
+			if( h_waitTimer != NULL )
+			{
+				LARGE_INTEGER dueTime;
+				dueTime.QuadPart = -10000LL * (LONGLONG)waitMs; // relative, in 100 ns units
+				if( SetWaitableTimer(h_waitTimer, &dueTime, 0, NULL, NULL, FALSE) )
+					WaitForSingleObject(h_waitTimer, waitMs + 20);
+				else
+					Sleep(waitMs);
+			}
 			else
-				Sleep(1);
+			{
+				if( b_idle )
+					sndDevicesReleaseTimerPeriod(hp_sndDevices);
+				else if( cast_handle->timerPeriodRaised == 0 )
+					cast_handle->timerPeriodRaised = (timeBeginPeriod(1) == TIMERR_NOERROR) ? 1 : 0;
+				Sleep(waitMs);
+			}
 		}
-		else
-			Sleep(1);
 
 		// Check for bad value to upsample ratio, was happening when some Bluetooth devices were added or removed (11/25/15).
 		if( (cast_handle->upsampleRatio <= 0) || (cast_handle->upsampleRatio > 16) )
