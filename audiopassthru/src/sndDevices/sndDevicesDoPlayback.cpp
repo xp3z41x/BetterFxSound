@@ -72,7 +72,7 @@ static const float *sndDevicesCarrierFrame(struct sndDevicesHdlType *cast_handle
  * and the same rate, the audio is passed through unchanged, two frames late. When the block would take the queue
  * past three quarters of the capture buffer (the carrier stalled or the processing thread came late), its oldest
  * frames are skipped so the queue is left at the setpoint: the carrier keeps its latency. Writing to a carrier that
- * sndDevicesDoCapture() stopped queues the audio until it starts again.
+ * sndDevicesDoCapture() stopped queues the audio until it starts again; a backlog written to it is cut to the setpoint.
  */
 int PT_DECLSPEC sndDevicesDoPlayback(PT_HANDLE *hp_sndDevices, int *ip_resultFlag)
 {
@@ -158,9 +158,15 @@ int PT_DECLSPEC sndDevicesDoPlayback(PT_HANDLE *hp_sndDevices, int *ip_resultFla
 		if( endPos > pos )
 			numOutputFrames = (UINT32)ceil((endPos - pos) / step);
 
-		// Too much for the queue: only the newest audio, up to the setpoint.
+		// Too much for the queue: only the newest audio, up to the setpoint. A stopped carrier given a backlog (it ran
+		// empty because the processing thread came late, which then read everything at once) is cut to the setpoint
+		// too, not just to the cap: it starts as soon as it holds its setpoint, so anything above it would be extra
+		// latency against the additional outputs, left for the resampler to work off over tens of seconds. Ordinary
+		// blocks (one loopback packet, far less than half the setpoint) filling a stopped carrier keep the cap, so a
+		// sound starting after silence is not cut into.
 		numDropFrames = 0;
-		if( (numFramesQueuedUpToPlay + numOutputFrames > cap) || (numOutputFrames > space) )
+		if( (numFramesQueuedUpToPlay + numOutputFrames > cap) || (numOutputFrames > space) ||
+			((cast_handle->playbackStreamIsTemporarilyPaused != 0) && (numOutputFrames > setpoint / 2) && (numFramesQueuedUpToPlay + numOutputFrames > setpoint)) )
 		{
 			numKeepFrames = (numFramesQueuedUpToPlay < setpoint) ? setpoint - numFramesQueuedUpToPlay : 0;
 			if( numKeepFrames > space )

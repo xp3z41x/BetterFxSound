@@ -478,9 +478,10 @@ struct sndDevicesHdlType {
 	LONGLONG lastCapturePacketQpc;		// QueryPerformanceCounter() when the last loopback packet was read.
 	LONGLONG qpcFrequency;				// QueryPerformanceFrequency().
 	DWORD carrierLastConsumedTick;		// When the running carrier was last seen playing out of its queue.
+	DWORD carrierLastPollTick;			// When sndDevicesDoCapture() last read the carrier's queue.
 	UINT32 carrierLastPadding;			// The carrier's queue (playback frames) as last read, or right after the last write.
 	UINT32 carrierStallCapturedFrames;	// Frames captured since the running carrier last played out of its queue.
-	int carrierStallCount;				// Consecutive reinits for a stalled carrier, each waits longer.
+	int carrierStallCount;				// Consecutive stalls of the carrier, each reinit waits longer; it gives up at the max.
 	double carrierErrorAvg;				// Averaged offset of the queue from its setpoint right after a write, seconds.
 	double carrierReadPos;				// Resampler: input position of the next output frame, from -2 (see carrierHistory).
 	float carrierHistory[3][SND_DEVICES_CARRIER_MAX_CHANNELS];	// Resampler: the last 3 frames of the previous block.

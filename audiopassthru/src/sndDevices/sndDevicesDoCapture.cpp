@@ -41,11 +41,19 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 /*
  * BetterFxSound: carrier pacing.
  * - SND_DEVICES_CARRIER_STALL_MS: a running carrier that plays nothing out of its queue for this long while audio keeps
- *   coming ends the processing thread, so a reinit opens it again. Doubled for each consecutive one, up to 16 times.
+ *   coming ends the processing thread, so a reinit opens it again. Doubled for each consecutive one.
+ * - SND_DEVICES_CARRIER_STALL_MAX_REINITS: consecutive stalls the watchdog acts on. After 2, 4 and 8 s the carrier is
+ *   reinitialized; after the next one (16 s) the watchdog gives up instead, since each reinit interrupts the additional
+ *   outputs too, which play on while the carrier stalls. It is armed again by a
+ *   device notification or a device change (anything that stops the processing thread from outside), or once the
+ *   carrier plays again for SND_DEVICES_CARRIER_STALL_RESET_MS.
+ * - SND_DEVICES_CARRIER_POLL_GAP_MS: polls further apart than this (the processing thread was held off: a resume from
+ *   sleep, a debugger) say nothing about the carrier, the stall is measured again from the next one.
  */
-#define SND_DEVICES_CARRIER_STALL_MS		2000
-#define SND_DEVICES_CARRIER_STALL_MAX_SHIFT	4
-#define SND_DEVICES_CARRIER_STALL_RESET_MS	10000
+#define SND_DEVICES_CARRIER_STALL_MS			2000
+#define SND_DEVICES_CARRIER_STALL_MAX_REINITS	4
+#define SND_DEVICES_CARRIER_STALL_RESET_MS		10000
+#define SND_DEVICES_CARRIER_POLL_GAP_MS			200
 
 /*
  * FUNCTION: sndDevicesResetCarrierResampler()
@@ -136,6 +144,8 @@ int PT_DECLSPEC sndDevicesDoCapture(PT_HANDLE *hp_sndDevices, float **fpp_buffer
 		// If the device callbacks or an external call has thrown the stop flag, exit this thread.
 		if( cast_handle->stopAudioCaptureAndPlaybackLoop == 1 )
 		{
+			// BetterFxSound: a device notification or change, the carrier watchdog is armed again.
+			cast_handle->carrierStallCount = 0;
 			*ip_numSampleSets = 0;
 			*ip_resultFlag = SND_DEVICES_CAPTURE_FORCED_EXIT;
 			return(OKAY);
@@ -180,6 +190,14 @@ int PT_DECLSPEC sndDevicesDoCapture(PT_HANDLE *hp_sndDevices, float **fpp_buffer
 
 		halfCaptureBufferSize = cast_handle->bufferFrameSizeCapture/2;
 		now = GetTickCount();
+
+		// BetterFxSound: the carrier's stall is only measured across polls that ran (see SND_DEVICES_CARRIER_POLL_GAP_MS).
+		if( (now - cast_handle->carrierLastPollTick) > SND_DEVICES_CARRIER_POLL_GAP_MS )
+		{
+			cast_handle->carrierLastConsumedTick = now;
+			cast_handle->carrierStallCapturedFrames = 0;
+		}
+		cast_handle->carrierLastPollTick = now;
 
 		// If playback buffer is totally empty, stop it until it has 1/2 the capture buffer queued again.
 		if( numFramesQueuedUpToPlay == 0 )
@@ -228,7 +246,9 @@ int PT_DECLSPEC sndDevicesDoCapture(PT_HANDLE *hp_sndDevices, float **fpp_buffer
 			// active without playing anything out of its queue and without an error (a display sink in power save, a
 			// device half awake after a resume) would stay silent until some device notification. When audio keeps
 			// coming and the queue has not gone down for a while, the processing thread ends and a reinit opens the
-			// carrier again; a carrier that keeps stalling is given longer each time.
+			// carrier again; a carrier that keeps stalling is given longer each time, and after
+			// SND_DEVICES_CARRIER_STALL_MAX_REINITS it is left alone (its blocks are dropped, the additional outputs
+			// play on) until a device notification or change.
 			if( numFramesQueuedUpToPlay < cast_handle->carrierLastPadding )
 			{
 				cast_handle->carrierLastConsumedTick = now;
@@ -236,17 +256,18 @@ int PT_DECLSPEC sndDevicesDoCapture(PT_HANDLE *hp_sndDevices, float **fpp_buffer
 				if( (now - cast_handle->processingStartTick) >= SND_DEVICES_CARRIER_STALL_RESET_MS )
 					cast_handle->carrierStallCount = 0;
 			}
-			else if( cast_handle->carrierStallCapturedFrames > 0 )
+			else if( (cast_handle->carrierStallCapturedFrames > 0) && (cast_handle->carrierStallCount < SND_DEVICES_CARRIER_STALL_MAX_REINITS) )
 			{
-				int shift = cast_handle->carrierStallCount;
-				if( shift > SND_DEVICES_CARRIER_STALL_MAX_SHIFT )
-					shift = SND_DEVICES_CARRIER_STALL_MAX_SHIFT;
-				if( (now - cast_handle->carrierLastConsumedTick) >= ((DWORD)SND_DEVICES_CARRIER_STALL_MS << shift) )
+				if( (now - cast_handle->carrierLastConsumedTick) >= ((DWORD)SND_DEVICES_CARRIER_STALL_MS << cast_handle->carrierStallCount) )
 				{
-					SLOUT_FIRST_LINE(L"sndDevicesDoCapture():: the playback device stopped playing, reinitializing");
 					cast_handle->carrierStallCount++;
-					hr = E_FAIL;
-					goto Exit;
+					if( cast_handle->carrierStallCount < SND_DEVICES_CARRIER_STALL_MAX_REINITS )
+					{
+						SLOUT_FIRST_LINE(L"sndDevicesDoCapture():: the playback device stopped playing, reinitializing");
+						hr = E_FAIL;
+						goto Exit;
+					}
+					SLOUT_FIRST_LINE(L"sndDevicesDoCapture():: the playback device keeps stalling, waiting for a device change");
 				}
 			}
 		}
@@ -521,6 +542,7 @@ int PT_DECLSPEC sndDevicesStartStopCapture(PT_HANDLE *hp_sndDevices, int i_start
 		QueryPerformanceCounter(&qpc);
 		cast_handle->lastCapturePacketQpc = qpc.QuadPart;
 		cast_handle->carrierLastConsumedTick = cast_handle->processingStartTick;
+		cast_handle->carrierLastPollTick = cast_handle->processingStartTick;
 		cast_handle->carrierLastPadding = 0;
 		cast_handle->carrierStallCapturedFrames = 0;
 		sndDevicesResetCarrierResampler(cast_handle);
