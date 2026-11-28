@@ -3304,7 +3304,8 @@ void FxController::loadOutputSettings(const std::vector<SoundDevice>& sound_devi
 				entry.id = main_id;
 				entry.name = main_name;
 				entry.enabled = true;
-				entry.delay_ms = jlimit(0, 500, settings_.getInt("main_output_delay_ms", 0));
+				// BetterFxSound: a delay from the old keys belongs to delay model 1 (see the check below), so it starts at 0.
+				entry.delay_ms = 0;
 				entry.channel_mode = toOutputChannelMode(settings_.getInt("main_output_channel_mode", 0));
 				addEntry(entry);
 				save = true;
@@ -3371,6 +3372,30 @@ void FxController::loadOutputSettings(const std::vector<SoundDevice>& sound_devi
 
 		// With no device at all, try again on the next start rather than saving an empty set (= silence).
 		save = !output_entries_.empty();
+	}
+
+	// BetterFxSound: saved delays are relative to the engine's path latency (AudioPassthru::kDelayModelVersion). Delays
+	// synced or tuned before every path was padded to a common latency (v1.0.0 and v1.0.1 stored no model, = 1) already
+	// include the carrier/router path difference, which the engine now adds itself, so they would put the carrier late
+	// by that difference. They are cleared, and the outputs need to be synchronized again.
+	const int delay_model = settings_.getInt("output_delay_model", 1);
+	if (delay_model != AudioPassthru::kDelayModelVersion)
+	{
+		bool cleared = false;
+		for (auto& entry : output_entries_)
+		{
+			if (entry.delay_ms != 0)
+			{
+				entry.delay_ms = 0;
+				cleared = true;
+			}
+		}
+		if (cleared)
+		{
+			save = true;
+			logMessage("Output delays from delay model " + String(delay_model) + " cleared (now " + String(AudioPassthru::kDelayModelVersion) + "): synchronize the outputs again");
+		}
+		settings_.setInt("output_delay_model", AudioPassthru::kDelayModelVersion);
 	}
 
 	for (auto* key : legacy_keys)

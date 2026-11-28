@@ -961,10 +961,12 @@ public:
 	}
 
 	// BetterFxSound: a requestExactAlignment() not carried out yet, and not dropped either (kExactAlignWindowMs). Any thread.
+	// The age is signed: the stored tick (made odd) can be 1 ms ahead of GetTickCount() for a whole tick quantum, and
+	// an unsigned age then wrapped to ~4e9, so a fresh request read as expired.
 	bool exactAlignmentPending() const
 	{
 		const DWORD tick = exact_align_tick_.load();
-		return tick != 0 && GetTickCount() - tick <= kExactAlignWindowMs;
+		return tick != 0 && static_cast<LONG>(GetTickCount() - tick) <= static_cast<LONG>(kExactAlignWindowMs);
 	}
 
 	void setChannelMode(OutputChannelMode mode)
@@ -1811,8 +1813,10 @@ private:
 		// the output moves by its offset, however small, as for a lasting offset below. Below kRealignErrorSecs the offset
 		// a start leaves was only taken back by the drift correction, over ~10 s. The offset is that of the level's mean
 		// over kExactAlignPeriods more periods: fill_avg_ follows the last few periods only, so moving by it left a few ms.
+		// The age is signed (see exactAlignmentPending()): a request whose tick is ahead of now (made odd, or made after
+		// now was read) is fresh, not expired.
 		DWORD exact_tick = exact_align_tick_.load(std::memory_order_relaxed);
-		if (exact_tick != 0 && now - exact_tick > kExactAlignWindowMs)
+		if (exact_tick != 0 && static_cast<LONG>(now - exact_tick) > static_cast<LONG>(kExactAlignWindowMs))
 		{
 			exact_align_tick_.compare_exchange_strong(exact_tick, 0);
 			exact_level_sum_ = 0.0;
