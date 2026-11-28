@@ -107,6 +107,9 @@ int PT_DECLSPEC sndDevicesInit(PT_HANDLE *hp_sndDevices, CSlout *hp_slout, int i
 	cast_handle->enumeratedDefaultDeviceNum = SND_DEVICES_DEVICE_NOT_PRESENT;
 	wcscpy(cast_handle->dfxDeviceID, L"");
 	InterlockedExchange(&(cast_handle->deviceListIsStale), 0);
+	InterlockedExchange(&(cast_handle->deviceFormatChanged), 0);
+	cast_handle->carrierDelayTailFrames = 0;
+	cast_handle->capturedBlockIsSilenceFill = FALSE;
 	cast_handle->channelCacheCount = 0;
 	cast_handle->activeDeviceIsUnprobed = FALSE;
 	InterlockedExchange(&(cast_handle->channelProbeIsPending), 0);

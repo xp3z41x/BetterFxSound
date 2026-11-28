@@ -469,18 +469,32 @@ PlaybackDeviceIsSelected:  // Label to jump to when the playback device num has 
 
 	cast_handle->captureDeviceNum = cast_handle->dfxDeviceNum;
 
-	numCaptureChannels = wfx.nChannels;
+	/*
+	* BetterFxSound: the processing format (the DSP, the carrier's delay line and the additional outputs) has the
+	* carrier's channel count, but at least 2 and at most SND_DEVICES_MAX_NUM_CHANS. A mono carrier (a Bluetooth headset
+	* in hands-free mode) used to make it mono: the block was zeroed (the mono playback bug) before the additional outputs
+	* got it, so every output was silent. A carrier with more than 8 channels left it unfilled. sndDevicesDoPlayback()
+	* now maps it to the carrier's own channels.
+	*/
+	if( cast_handle->wfxDfxProcessing.nChannels < SND_DEVICES_MIN_NUM_CHANS )
+		cast_handle->wfxDfxProcessing.nChannels = SND_DEVICES_MIN_NUM_CHANS;
+	if( cast_handle->wfxDfxProcessing.nChannels > SND_DEVICES_MAX_NUM_CHANS )
+		cast_handle->wfxDfxProcessing.nChannels = SND_DEVICES_MAX_NUM_CHANS;
+	cast_handle->wfxDfxProcessing.nBlockAlign = (WORD)(cast_handle->wfxDfxProcessing.nChannels * (cast_handle->wfxDfxProcessing.wBitsPerSample / 8));
 
-	// Restrict numCaptureChannels to supported values
-	if( numCaptureChannels < SND_DEVICES_MIN_NUM_CHANS )
-		numCaptureChannels = SND_DEVICES_MIN_NUM_CHANS;
-
-	// In quad output case we will capture stereo and fill back channels with fronts
-	if( numCaptureChannels == 4 )
-		numCaptureChannels = 6;
-
-	if( numCaptureChannels > SND_DEVICES_MAX_NUM_CHANS )
-		numCaptureChannels = SND_DEVICES_MAX_NUM_CHANS;
+	/*
+	* BetterFxSound: the virtual device takes stereo, 5.1 or 7.1 only (the channel masks of
+	* sndDevicesSetDfxDeviceSampleRateAndChannels()). 3 and 5 channels are captured as 5.1 and 7 as 7.1: they were asked
+	* for as such with a 7.1 mask, which failed the reinit until some device event. sndDevicesDoCapture() picks the
+	* processing format's channels out of the capture.
+	*/
+	numCaptureChannels = cast_handle->wfxDfxProcessing.nChannels;
+	if( numCaptureChannels <= 2 )
+		numCaptureChannels = 2;
+	else if( numCaptureChannels <= 6 )
+		numCaptureChannels = 6;	// In quad output case we capture 5.1 and use its fronts and surrounds
+	else
+		numCaptureChannels = 8;
 
 	if( (playbackSamplingFrequency % 48000) == 0 )
 	{
@@ -502,6 +516,7 @@ PlaybackDeviceIsSelected:  // Label to jump to when the playback device num has 
 	}
 
 	cast_handle->wfxDfxProcessing.nSamplesPerSec = captureSamplingFrequency; // Correct DFX processing sampling freq.
+	cast_handle->wfxDfxProcessing.nAvgBytesPerSec = cast_handle->wfxDfxProcessing.nSamplesPerSec * cast_handle->wfxDfxProcessing.nBlockAlign;
 
 	// Unless the user has turned off automatic default device selection, set the Windows default device to the current DFX capture device.
 	if( defaultSelectionAutoMode == SND_DEVICES_AUTO_SELECT_DEFAULT_DEVICE_ON )
@@ -526,7 +541,10 @@ PlaybackDeviceIsSelected:  // Label to jump to when the playback device num has 
 		SND_DEVICES_SET_STATUS_AND_RETURN_OK(SND_DEVICES_CAPTURE_DEVICE_IS_NULL);
 	}
 
-	if( (captureSamplingFrequency == 0) || (playbackSamplingFrequency == 0) )
+	// BetterFxSound: only informative now. The carrier is resampled by the exact ratio of the two rates
+	// (sndDevicesDoPlayback()); this whole number was 0 (forced to 1, so the carrier played at the wrong speed) for a
+	// carrier slower than the capture (32, 24, 22.05, 16 kHz) and wrong for one that is no whole multiple (64 kHz).
+	if( (captureSamplingFrequency == 0) || (playbackSamplingFrequency < captureSamplingFrequency) )
 	{
 		cast_handle->upsampleRatio = 1;
 	}

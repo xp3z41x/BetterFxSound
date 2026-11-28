@@ -433,6 +433,11 @@ struct sndDevicesHdlType {
 	// notification callbacks, sndCheckDeviceChanges()). Such a change no longer stops the processing; the timer reads
 	// the device list again and refreshes the outputs instead (AudioPassthruPrivate::processTimer()).
 	volatile LONG deviceListIsStale;
+	// BetterFxSound: set by the device notification callback when a playback endpoint's format changed
+	// (PKEY_AudioEngine_DeviceFormat), for example a Bluetooth headset going mono while its microphone is open and
+	// back to stereo after. Its state does not change, so the comparison with the system (sndCheckDeviceChanges())
+	// would find no difference: this makes it read the list (and the channel counts) again.
+	volatile LONG deviceFormatChanged;
 	// BetterFxSound: the channel count of each device as last read by sndDevices_GetAll() (0 when unknown), by ID. A
 	// device whose format cannot be read for a moment (being reconfigured) keeps the count it had, instead of 0, which
 	// made it look absent to the controller.
@@ -486,6 +491,14 @@ struct sndDevicesHdlType {
 	double carrierErrorAvg;				// Averaged offset of the queue from its setpoint right after a write, seconds.
 	double carrierReadPos;				// Resampler: input position of the next output frame, from -2 (see carrierHistory).
 	float carrierHistory[3][SND_DEVICES_CARRIER_MAX_CHANNELS];	// Resampler: the last 3 frames of the previous block.
+	float carrierLowPassState[2][2][SND_DEVICES_CARRIER_MAX_CHANNELS];	// Resampler: anti-alias filter state (2 biquads).
+	// BetterFxSound: the carrier's delay line (AudioPassthruPrivate::applyMainDelay()) still holds this many frames of
+	// audio not played yet. While it does, a pause in the loopback (no packet for SND_DEVICES_TAIL_GAP_MS) makes
+	// sndDevicesDoCapture() hand over silence, as much as the pause lasted, so that audio plays out on time instead of
+	// staying in the line and being played before the next sound. Processing thread only.
+	UINT32 carrierDelayTailFrames;
+	LONGLONG carrierTailSilenceQpc;		// sndDevicesDoCapture(): QPC up to which the pause was handed over as silence.
+	BOOL capturedBlockIsSilenceFill;	// The block sndDevicesDoCapture() handed over is such silence, not captured audio.
 
 	// The mute setting that belongs to the real playback device FxSound is currently rendering to, ie
 	// the setting the device had before FxSound applied its own to it, plus any the user has since made

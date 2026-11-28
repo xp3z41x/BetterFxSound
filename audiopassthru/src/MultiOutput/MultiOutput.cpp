@@ -43,16 +43,129 @@ namespace
 	const GUID kSubtypeIeeeFloat = { 0x00000003, 0x0000, 0x0010, { 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71 } };
 
 	// Speaker masks, same values as the KSAUDIO_SPEAKER_* constants in ksmedia.h.
+	// BetterFxSound: the layouts of channelRole() below. 5.1 is the virtual device's own (side surrounds, 0x60F, see
+	// sndDevicesSetDfxDeviceSampleRateAndChannels()), it was labelled 5.1 with back surrounds (0x3F).
 	DWORD defaultChannelMask(UINT32 channels)
 	{
 		switch (channels)
 		{
 		case 1: return 0x4;     // FRONT_CENTER
 		case 2: return 0x3;     // STEREO
+		case 3: return 0x7;     // Front left, right, center
 		case 4: return 0x33;    // QUAD
-		case 6: return 0x3F;    // 5.1
+		case 5: return 0x607;   // 5.0: fronts, center, side surrounds
+		case 6: return 0x60F;   // 5.1 surround
+		case 7: return 0x637;   // 7.0: fronts, center, back and side surrounds
 		case 8: return 0x63F;   // 7.1 surround
 		default: return 0;
+		}
+	}
+
+	// BetterFxSound: what each channel of an interleaved frame carries, by channel count, in the order of the processing
+	// format (WAVEFORMATEXTENSIBLE: front left, front right, center, LFE, then the surrounds; 3 channels: no LFE,
+	// 4: quad, 5: 5.0, 7: 7.0, see sndDevicesCaptureChannelSource()). Back and side surrounds play the same role here.
+	enum ChannelRole { kRoleLeft, kRoleRight, kRoleCenter, kRoleLfe, kRoleSurroundLeft, kRoleSurroundRight, kRoleCount };
+	constexpr UINT32 kRoleMaxChannels = 8;
+	constexpr float kFoldGain = 0.70710678f;	// -3 dB: center and surrounds folded into left and right
+
+	ChannelRole channelRole(UINT32 channels, UINT32 c)
+	{
+		static const ChannelRole kRoles[kRoleMaxChannels + 1][kRoleMaxChannels] = {
+			{ kRoleCenter },
+			{ kRoleCenter },
+			{ kRoleLeft, kRoleRight },
+			{ kRoleLeft, kRoleRight, kRoleCenter },
+			{ kRoleLeft, kRoleRight, kRoleSurroundLeft, kRoleSurroundRight },
+			{ kRoleLeft, kRoleRight, kRoleCenter, kRoleSurroundLeft, kRoleSurroundRight },
+			{ kRoleLeft, kRoleRight, kRoleCenter, kRoleLfe, kRoleSurroundLeft, kRoleSurroundRight },
+			{ kRoleLeft, kRoleRight, kRoleCenter, kRoleSurroundLeft, kRoleSurroundRight, kRoleSurroundLeft, kRoleSurroundRight },
+			{ kRoleLeft, kRoleRight, kRoleCenter, kRoleLfe, kRoleSurroundLeft, kRoleSurroundRight, kRoleSurroundLeft, kRoleSurroundRight },
+		};
+		if (channels > kRoleMaxChannels || c >= channels)
+			return kRoleLfe;	// Not one of the listed layouts: left out of a fold-down
+		return kRoles[channels][c];
+	}
+
+	// BetterFxSound: left and right of one frame folded down to stereo (center and surrounds at -3 dB, LFE left out).
+	void foldToStereo(const float* frame, UINT32 channels, float* left, float* right)
+	{
+		if (channels == 1)
+		{
+			*left = frame[0];
+			*right = frame[0];
+			return;
+		}
+		if (channels == 2)
+		{
+			*left = frame[0];
+			*right = frame[1];
+			return;
+		}
+
+		float l = 0.0f;
+		float r = 0.0f;
+		for (UINT32 c = 0; c < channels; c++)
+		{
+			switch (channelRole(channels, c))
+			{
+			case kRoleLeft: l += frame[c]; break;
+			case kRoleRight: r += frame[c]; break;
+			case kRoleCenter: l += kFoldGain * frame[c]; r += kFoldGain * frame[c]; break;
+			case kRoleSurroundLeft: l += kFoldGain * frame[c]; break;
+			case kRoleSurroundRight: r += kFoldGain * frame[c]; break;
+			default: break;
+			}
+		}
+		*left = l;
+		*right = r;
+	}
+
+	// BetterFxSound: the coefficients that take a frame of src_channels to dst_channels (both 1 to kRoleMaxChannels,
+	// and different): out[d] = sum over s of matrix[d * kRoleMaxChannels + s] * in[s]. A channel goes to the channels
+	// of the same role (a pair of them shares it at -3 dB each); with none, the center and the surrounds are folded
+	// into left and right, the LFE is left out. Mono is the average of the stereo fold-down.
+	void buildChannelMatrix(UINT32 src_channels, UINT32 dst_channels, float* matrix)
+	{
+		for (UINT32 i = 0; i < kRoleMaxChannels * kRoleMaxChannels; i++)
+			matrix[i] = 0.0f;
+
+		if (dst_channels == 1)
+		{
+			float stereo[kRoleMaxChannels * kRoleMaxChannels];
+			buildChannelMatrix(src_channels, 2, stereo);
+			for (UINT32 s = 0; s < src_channels; s++)
+				matrix[s] = 0.5f * (stereo[s] + stereo[kRoleMaxChannels + s]);
+			return;
+		}
+
+		int src_count[kRoleCount] = {};
+		int dst_count[kRoleCount] = {};
+		for (UINT32 s = 0; s < src_channels; s++)
+			src_count[channelRole(src_channels, s)]++;
+		for (UINT32 d = 0; d < dst_channels; d++)
+			dst_count[channelRole(dst_channels, d)]++;
+
+		for (UINT32 s = 0; s < src_channels; s++)
+		{
+			const ChannelRole role = channelRole(src_channels, s);
+			if (dst_count[role] > 0)
+			{
+				const float gain = (src_count[role] > 1) ? kFoldGain : 1.0f;
+				for (UINT32 d = 0; d < dst_channels; d++)
+				{
+					if (channelRole(dst_channels, d) == role)
+						matrix[d * kRoleMaxChannels + s] += gain;
+				}
+				continue;
+			}
+
+			for (UINT32 d = 0; d < dst_channels; d++)
+			{
+				const ChannelRole dst_role = channelRole(dst_channels, d);
+				if ((dst_role == kRoleLeft && (role == kRoleCenter || role == kRoleSurroundLeft)) ||
+					(dst_role == kRoleRight && (role == kRoleCenter || role == kRoleSurroundRight)))
+					matrix[d * kRoleMaxChannels + s] += kFoldGain;
+			}
 		}
 	}
 
@@ -65,6 +178,7 @@ namespace
 		}
 	}
 
+	// BetterFxSound: an output's format is its device's channel count and the processing format's rate.
 	inline UINT32 packFormat(UINT32 channels, UINT32 sample_rate) { return (sample_rate << 4) | (channels & 0xF); }
 	inline UINT32 formatChannels(UINT32 format) { return format & 0xF; }
 	inline UINT32 formatRate(UINT32 format) { return format >> 4; }
@@ -247,8 +361,11 @@ std::vector<std::wstring> owedVolumeDevices()
  * thread of this output reads from it through a cubic (Hermite) resampler whose ratio is
  * steered so that the amount of buffered audio stays at the target latency. That absorbs the
  * small clock difference between the main device and this device, so the two never drift
- * apart. Sample rate and channel count conversion to the device's own mix format is done by
- * the Windows audio engine (AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM).
+ * apart. Sample rate conversion to the device's own mix format is done by the Windows audio
+ * engine (AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM). BetterFxSound: the stream has the device's own
+ * channel count, and write() converts the processing format's channels to it, so a new carrier
+ * with another channel count no longer closes, reopens and primes every output again. A new
+ * carrier in the other rate family (44.1 or 48 kHz) still does.
  */
 class SecondaryOutput
 {
@@ -362,25 +479,32 @@ public:
 		if (data == nullptr || frames == 0 || channels == 0 || channels > kMaxChannels || sample_rate == 0)
 			return;
 
-		const UINT32 format = packFormat(channels, sample_rate);
-		if (active_format_.load(std::memory_order_acquire) != format)
+		const UINT32 active = active_format_.load(std::memory_order_acquire);
+		if (active == 0 || formatRate(active) != sample_rate)
 		{
-			// The render thread (re)opens the device for this format, then publishes it in
+			// The render thread (re)opens the device for this rate, then publishes its format in
 			// active_format_. Until then the audio is simply not queued for this output.
-			if (pending_format_.load(std::memory_order_relaxed) != format)
+			if (pending_rate_.load(std::memory_order_relaxed) != sample_rate)
 			{
-				pending_format_.store(format, std::memory_order_release);
+				pending_rate_.store(sample_rate, std::memory_order_release);
 				SetEvent(audio_event_);
 			}
 			return;
 		}
+
+		// BetterFxSound: the stream has the device's channel count, the block is converted to it.
+		const UINT32 out_channels = formatChannels(active);
+		const bool convert = (out_channels != channels);
+		float matrix[kRoleMaxChannels * kRoleMaxChannels];
+		if (convert && !silent)
+			buildChannelMatrix(channels, out_channels, matrix);
 
 		const UINT32 w = write_pos_.load(std::memory_order_relaxed);
 		const UINT32 r = read_pos_.load(std::memory_order_acquire);
 		const UINT32 free_frames = kRingFrames - (w - r);
 		const UINT32 n = frames < free_frames ? frames : free_frames;
 
-		// Every channel is queued as is. The channel mode is applied by render(), on what is played now, so a
+		// Every channel is queued (in the device's channels). The channel mode is applied by render(), on what is played now, so a
 		// change is heard within one device period rather than after the queued audio (latency + delay).
 		for (UINT32 i = 0; i < n; i++)
 		{
@@ -388,9 +512,24 @@ public:
 			const float* src = data + static_cast<size_t>(i) * channels;
 
 			if (silent)
-				std::memset(dst, 0, channels * sizeof(float));
-			else
+			{
+				std::memset(dst, 0, out_channels * sizeof(float));
+			}
+			else if (!convert)
+			{
 				std::memcpy(dst, src, channels * sizeof(float));
+			}
+			else
+			{
+				for (UINT32 d = 0; d < out_channels; d++)
+				{
+					const float* row = &matrix[d * kRoleMaxChannels];
+					float value = 0.0f;
+					for (UINT32 c = 0; c < channels; c++)
+						value += row[c] * src[c];
+					dst[d] = value;
+				}
+			}
 		}
 		// BetterFxSound: the write time is stored before the block is published, so render() never sees the new block
 		// with the time of an older one (and flushes it at once as if nothing had come for a while).
@@ -444,26 +583,26 @@ private:
 			if (WaitForMultipleObjects(2, handles, FALSE, timeout) == WAIT_OBJECT_0)
 				break;
 
-			const UINT32 pending = pending_format_.load(std::memory_order_acquire);
+			const UINT32 pending = pending_rate_.load(std::memory_order_acquire);
 			const DWORD now = GetTickCount();
 
-			if (pending != 0 && (pending != open_format_ || client_ == nullptr))
+			if (pending != 0 && (pending != open_rate_ || client_ == nullptr))
 			{
-				if (pending == open_format_ && static_cast<LONG>(now - next_retry) < 0)
-					continue; // Same format failed recently, wait before retrying.
+				if (pending == open_rate_ && static_cast<LONG>(now - next_retry) < 0)
+					continue; // Same rate failed recently, wait before retrying.
 
 				active_format_.store(0, std::memory_order_release);
 				closeClient();
-				open_format_ = pending;
+				open_rate_ = pending;
 
-				if (openClient(formatChannels(pending), formatRate(pending)))
+				if (openClient(pending))
 				{
 					// Nothing is being written while active_format_ is 0, so the reader can
 					// safely discard anything left in the ring.
 					read_pos_.store(write_pos_.load(std::memory_order_acquire), std::memory_order_release);
 					primed_ = false;
 					idle_since_ = now;
-					active_format_.store(pending, std::memory_order_release);
+					active_format_.store(packFormat(channels_, pending), std::memory_order_release);
 				}
 				else
 				{
@@ -487,7 +626,7 @@ private:
 		closeClient();
 	}
 
-	bool openClient(UINT32 channels, UINT32 sample_rate)
+	bool openClient(UINT32 sample_rate)
 	{
 		IMMDeviceEnumerator* enumerator = nullptr;
 		HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), NULL, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), (void**)&enumerator);
@@ -507,8 +646,21 @@ private:
 		if (FAILED(hr) || client_ == nullptr)
 			return false;
 
-		// We hand the audio engine our own format (the processing format) and let it convert
-		// sample rate and channel layout to the device's mix format.
+		// BetterFxSound: the device's own channel count (at most kMaxChannels), whatever the carrier's: write()
+		// converts the processing format's channels to it. It used to be the processing format's, so every output was
+		// closed and opened again when a carrier with another channel count was chosen.
+		UINT32 channels = 2;
+		WAVEFORMATEX* mix = nullptr;
+		if (SUCCEEDED(client_->GetMixFormat(&mix)) && mix != nullptr)
+		{
+			if (mix->nChannels > 0)
+				channels = mix->nChannels;
+			CoTaskMemFree(mix);
+		}
+		if (channels > kMaxChannels)
+			channels = kMaxChannels;
+
+		// We hand the audio engine the processing format's rate and let it convert it to the device's mix format.
 		WAVEFORMATEXTENSIBLE wfx = {};
 		wfx.Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
 		wfx.Format.nChannels = static_cast<WORD>(channels);
@@ -788,8 +940,8 @@ private:
 		// realignment, a fast fade out (~2 ms) instead.
 		const float gain_target = realign_pending_ ? 0.0f : target_gain_.load(std::memory_order_relaxed) * masterVolumeGain();
 		const float gain_step = static_cast<float>(1.0 / ((realign_pending_ ? 0.002 : 0.01) * rate)); // One-pole ramp
-		// The channel mode, for this whole period. The stream has the processing format's channels
-		// (WAVEFORMATEXTENSIBLE order: front left, front right, ...); Windows converts it to the device.
+		// The channel mode, for this whole period. The stream has the device's channel count, in the
+		// WAVEFORMATEXTENSIBLE order of defaultChannelMask() (front left, front right, ...).
 		const OutputChannelMode mode = static_cast<OutputChannelMode>(channel_mode_.load(std::memory_order_relaxed));
 		bool underflow = false;
 
@@ -912,8 +1064,8 @@ private:
 	std::vector<float> ring_;
 	std::atomic<UINT32> write_pos_{ 0 };   // Written by the audio thread only
 	std::atomic<UINT32> read_pos_{ 0 };    // Written by the render thread only
-	std::atomic<UINT32> active_format_{ 0 };  // Format the ring and the device are set up for, 0 = none
-	std::atomic<UINT32> pending_format_{ 0 }; // Format the audio thread is producing
+	std::atomic<UINT32> active_format_{ 0 };  // Format (device channels, rate) the ring and the device are set up for, 0 = none
+	std::atomic<UINT32> pending_rate_{ 0 };   // Rate the audio thread is producing
 	std::atomic<LONGLONG> last_write_qpc_{ 0 }; // QPC of the last block queued by the audio thread, stored before write_pos_
 	double qpc_freq_ = 1.0;                     // QueryPerformanceFrequency(), set once in the constructor
 
@@ -925,7 +1077,7 @@ private:
 	IMMDevice* device_ = nullptr;
 	IAudioClient* client_ = nullptr;
 	IAudioRenderClient* render_ = nullptr;
-	UINT32 open_format_ = 0;
+	UINT32 open_rate_ = 0;
 	UINT32 buffer_frames_ = 0;
 	UINT32 channels_ = 0;
 	UINT32 sample_rate_ = 0;
@@ -976,13 +1128,18 @@ void applyOutputChannelMode(float* buffer, UINT32 frames, UINT32 channels, Outpu
 	for (UINT32 i = 0; i < frames; i++)
 	{
 		float* frame = buffer + static_cast<size_t>(i) * channels;
+		// BetterFxSound: from the stereo fold-down, so the center (dialogue) and the surrounds of a 5.1 or 7.1 frame are
+		// kept. Only the two front channels were used.
+		float left;
+		float right;
+		foldToStereo(frame, channels, &left, &right);
 		float value;
 		if (mode == OutputChannelMode::Left)
-			value = frame[0];
+			value = left;
 		else if (mode == OutputChannelMode::Right)
-			value = frame[1];
+			value = right;
 		else
-			value = 0.5f * (frame[0] + frame[1]);
+			value = 0.5f * (left + right);
 
 		for (UINT32 c = 0; c < channels; c++)
 			frame[c] = value;

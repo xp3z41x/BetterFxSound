@@ -52,15 +52,77 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #define SND_DEVICES_CARRIER_ERROR_AVG_SECS			0.2
 
 /*
+ * BetterFxSound: a carrier slower than the capture (32, 24, 22.05 or 16 kHz: a Bluetooth headset in hands-free mode,
+ * some USB headsets) is fed through an anti-alias filter first, a 4th order Butterworth low-pass at this share of the
+ * carrier's rate.
+ */
+#define SND_DEVICES_CARRIER_LOWPASS_FRACTION		0.45
+#define SND_DEVICES_CARRIER_LOWPASS_BELOW_RATIO		0.99
+#define SND_DEVICES_PI								3.14159265358979323846
+
+/*
+ * FUNCTION: sndDevicesCarrierLowPass()
+ * DESCRIPTION: BetterFxSound. Filters the block (numFrames frames of numChannels channels in fPlaybackBuf) in place with
+ * the anti-alias low-pass, two biquads (transposed direct form II) whose state carries over from block to block. The
+ * block has been queued for the additional outputs already. rateRatio is the carrier's rate over the capture's.
+ */
+static void sndDevicesCarrierLowPass(struct sndDevicesHdlType *cast_handle, UINT32 numFrames, int numChannels, double rateRatio)
+{
+	static const double q[2] = { 0.54119610014619698, 1.30656296487637652 };	// Butterworth, 4th order
+	const double K = tan(SND_DEVICES_PI * SND_DEVICES_CARRIER_LOWPASS_FRACTION * rateRatio);
+	float b0[2], b1[2], b2[2], a1[2], a2[2];
+	int stage, c;
+	UINT32 k;
+
+	for(stage=0; stage<2; stage++)
+	{
+		const double norm = 1.0 / (1.0 + K / q[stage] + K * K);
+		b0[stage] = (float)(K * K * norm);
+		b1[stage] = 2.0f * b0[stage];
+		b2[stage] = b0[stage];
+		a1[stage] = (float)(2.0 * (K * K - 1.0) * norm);
+		a2[stage] = (float)((1.0 - K / q[stage] + K * K) * norm);
+	}
+
+	for(c=0; c<numChannels; c++)
+	{
+		for(stage=0; stage<2; stage++)
+		{
+			float z1 = cast_handle->carrierLowPassState[stage][0][c];
+			float z2 = cast_handle->carrierLowPassState[stage][1][c];
+			float *p = cast_handle->fPlaybackBuf + c;
+
+			for(k=0; k<numFrames; k++)
+			{
+				const float x = *p;
+				const float y = b0[stage] * x + z1;
+				z1 = b1[stage] * x - a1[stage] * y + z2;
+				z2 = b2[stage] * x - a2[stage] * y;
+				*p = y;
+				p += numChannels;
+			}
+
+			// No denormals once it has decayed.
+			if( fabsf(z1) < 1e-20f )
+				z1 = 0.0f;
+			if( fabsf(z2) < 1e-20f )
+				z2 = 0.0f;
+			cast_handle->carrierLowPassState[stage][0][c] = z1;
+			cast_handle->carrierLowPassState[stage][1][c] = z2;
+		}
+	}
+}
+
+/*
  * FUNCTION: sndDevicesCarrierFrame()
  * DESCRIPTION: BetterFxSound. Frame j (-3 to capturedFramesCount - 1) of the block being played on the carrier: from
- * -3 to -1 the last frames of the previous block.
+ * -3 to -1 the last frames of the previous block. In the processing format (numProcessingChannels).
  */
-static const float *sndDevicesCarrierFrame(struct sndDevicesHdlType *cast_handle, int j, int numPlaybackChannels)
+static const float *sndDevicesCarrierFrame(struct sndDevicesHdlType *cast_handle, int j, int numProcessingChannels)
 {
 	if( j < 0 )
 		return cast_handle->carrierHistory[3 + j];
-	return cast_handle->fPlaybackBuf + (size_t)j * (size_t)numPlaybackChannels;
+	return cast_handle->fPlaybackBuf + (size_t)j * (size_t)numProcessingChannels;
 }
 
 /*
@@ -73,6 +135,10 @@ static const float *sndDevicesCarrierFrame(struct sndDevicesHdlType *cast_handle
  * past three quarters of the capture buffer (the carrier stalled or the processing thread came late), its oldest
  * frames are skipped so the queue is left at the setpoint: the carrier keeps its latency. Writing to a carrier that
  * sndDevicesDoCapture() stopped queues the audio until it starts again; a backlog written to it is cut to the setpoint.
+ * The rate ratio is the exact one: a carrier at a rate that is no whole multiple of the capture's (32, 22.05, 64 kHz)
+ * used to be fed the captured frames at a whole-number ratio, 0 forced to 1, so it played at the wrong speed and
+ * pitch. The block is in the processing format and is mapped here to the carrier's channels: a mono carrier gets the
+ * average of left and right, a carrier with more than 8 channels gets the first 8 and silence on the others.
  */
 int PT_DECLSPEC sndDevicesDoPlayback(PT_HANDLE *hp_sndDevices, int *ip_resultFlag)
 {
@@ -86,13 +152,15 @@ int PT_DECLSPEC sndDevicesDoPlayback(PT_HANDLE *hp_sndDevices, int *ip_resultFla
 	UINT32 space;
 	UINT32 setpoint;
 	UINT32 cap;
-	UINT32 upsampleRatio;
 	UINT32 k;
 	int j, c;
 	DWORD flags = 0;
 	int numPlaybackChannels;
+	int numProcessingChannels;
+	double rateRatio;
 	double ratio, step, pos, endPos, adjust, errorSecs, alpha;
 	float nextHistory[3][SND_DEVICES_CARRIER_MAX_CHANNELS];
+	float frame[SND_DEVICES_CARRIER_MAX_CHANNELS];
 	float *fptr;
 
 	cast_handle = (struct sndDevicesHdlType *)hp_sndDevices;
@@ -107,9 +175,10 @@ int PT_DECLSPEC sndDevicesDoPlayback(PT_HANDLE *hp_sndDevices, int *ip_resultFla
 	}
 
 	numPlaybackChannels = cast_handle->wfxPlayback.nChannels;
-	upsampleRatio = cast_handle->upsampleRatio;
-	if( upsampleRatio < 1 )
-		upsampleRatio = 1;
+	numProcessingChannels = cast_handle->wfxDfxProcessing.nChannels;
+	rateRatio = 1.0;
+	if( (cast_handle->wfxCapture.nSamplesPerSec > 0) && (cast_handle->wfxPlayback.nSamplesPerSec > 0) )
+		rateRatio = (double)cast_handle->wfxPlayback.nSamplesPerSec / (double)cast_handle->wfxCapture.nSamplesPerSec;
 	numInputFrames = cast_handle->capturedFramesCount;
 
 	// This call returns the number of frames still awaiting playback in the playback buffer
@@ -125,16 +194,20 @@ int PT_DECLSPEC sndDevicesDoPlayback(PT_HANDLE *hp_sndDevices, int *ip_resultFla
 	cast_handle->numPlaybackFramesAvailableToFill = space;
 
 	// The setpoint and the most the queue may hold, in playback frames.
-	setpoint = (cast_handle->bufferFrameSizeCapture / 2) * upsampleRatio;
-	cap = setpoint + (cast_handle->bufferFrameSizeCapture / 4) * upsampleRatio;
+	setpoint = (UINT32)((double)(cast_handle->bufferFrameSizeCapture / 2) * rateRatio);
+	cap = setpoint + (UINT32)((double)(cast_handle->bufferFrameSizeCapture / 4) * rateRatio);
 	if( cap > cast_handle->bufferFrameSizePlayback )
 		cap = cast_handle->bufferFrameSizePlayback;
 	if( setpoint > cap )
 		setpoint = cap;
 
 	numOutputFrames = 0;
-	if( (numInputFrames > 0) && (numPlaybackChannels > 0) && (numPlaybackChannels <= SND_DEVICES_CARRIER_MAX_CHANNELS) && (cast_handle->fPlaybackBuf != NULL) )
+	if( (numInputFrames > 0) && (numPlaybackChannels > 0) && (numPlaybackChannels <= SND_DEVICES_CARRIER_MAX_CHANNELS) &&
+		(numProcessingChannels > 0) && (numProcessingChannels <= SND_DEVICES_CARRIER_MAX_CHANNELS) && (cast_handle->fPlaybackBuf != NULL) )
 	{
+		if( rateRatio < SND_DEVICES_CARRIER_LOWPASS_BELOW_RATIO )
+			sndDevicesCarrierLowPass(cast_handle, numInputFrames, numProcessingChannels, rateRatio);
+
 		// Output frames per input frame: the rate ratio, times the speed that steers the queue to its setpoint. A
 		// stopped carrier is being filled up to it, nothing to steer.
 		ratio = 1.0;
@@ -147,7 +220,7 @@ int PT_DECLSPEC sndDevicesDoPlayback(PT_HANDLE *hp_sndDevices, int *ip_resultFla
 				adjust = -SND_DEVICES_CARRIER_MAX_RATIO_ADJUST;
 			ratio = 1.0 - adjust;
 		}
-		step = 1.0 / ((double)upsampleRatio * ratio);
+		step = 1.0 / (rateRatio * ratio);
 
 		// Output frame k is taken at input position pos + k * step, from the frames around it (floor - 1 to floor + 2),
 		// so up to the position numInputFrames - 2. "!(pos >= -2)" is also true for NaN.
@@ -206,12 +279,13 @@ int PT_DECLSPEC sndDevicesDoPlayback(PT_HANDLE *hp_sndDevices, int *ip_resultFla
 					if( t > 1.0f )
 						t = 1.0f;
 
-					const float *fm1 = sndDevicesCarrierFrame(cast_handle, base - 1, numPlaybackChannels);
-					const float *f0 = sndDevicesCarrierFrame(cast_handle, base, numPlaybackChannels);
-					const float *f1 = sndDevicesCarrierFrame(cast_handle, base + 1, numPlaybackChannels);
-					const float *f2 = sndDevicesCarrierFrame(cast_handle, base + 2, numPlaybackChannels);
+					const float *fm1 = sndDevicesCarrierFrame(cast_handle, base - 1, numProcessingChannels);
+					const float *f0 = sndDevicesCarrierFrame(cast_handle, base, numProcessingChannels);
+					const float *f1 = sndDevicesCarrierFrame(cast_handle, base + 1, numProcessingChannels);
+					const float *f2 = sndDevicesCarrierFrame(cast_handle, base + 2, numProcessingChannels);
+					float *out = (numPlaybackChannels == numProcessingChannels) ? fptr : frame;
 
-					for(c=0; c<numPlaybackChannels; c++)
+					for(c=0; c<numProcessingChannels; c++)
 					{
 						const float xm1 = fm1[c];
 						const float x0 = f0[c];
@@ -220,7 +294,19 @@ int PT_DECLSPEC sndDevicesDoPlayback(PT_HANDLE *hp_sndDevices, int *ip_resultFla
 						const float c1 = 0.5f * (x1 - xm1);
 						const float c2 = xm1 - 2.5f * x0 + 2.0f * x1 - 0.5f * x2;
 						const float c3 = 0.5f * (x2 - xm1) + 1.5f * (x0 - x1);
-						fptr[c] = ((c3 * t + c2) * t + c1) * t + x0;
+						out[c] = ((c3 * t + c2) * t + c1) * t + x0;
+					}
+
+					// BetterFxSound: to the carrier's own channels (see above).
+					if( numPlaybackChannels != numProcessingChannels )
+					{
+						if( numPlaybackChannels == 1 )
+							fptr[0] = (numProcessingChannels >= 2) ? 0.5f * (frame[0] + frame[1]) : frame[0];
+						else
+						{
+							for(c=0; c<numPlaybackChannels; c++)
+								fptr[c] = (c < numProcessingChannels) ? frame[c] : 0.0f;
+						}
 					}
 					fptr += numPlaybackChannels;
 				}
@@ -242,9 +328,9 @@ int PT_DECLSPEC sndDevicesDoPlayback(PT_HANDLE *hp_sndDevices, int *ip_resultFla
 		cast_handle->carrierReadPos = pos;
 
 		for(j=0; j<3; j++)
-			memcpy(nextHistory[j], sndDevicesCarrierFrame(cast_handle, (int)numInputFrames - 3 + j, numPlaybackChannels), sizeof(float) * (size_t)numPlaybackChannels);
+			memcpy(nextHistory[j], sndDevicesCarrierFrame(cast_handle, (int)numInputFrames - 3 + j, numProcessingChannels), sizeof(float) * (size_t)numProcessingChannels);
 		for(j=0; j<3; j++)
-			memcpy(cast_handle->carrierHistory[j], nextHistory[j], sizeof(float) * (size_t)numPlaybackChannels);
+			memcpy(cast_handle->carrierHistory[j], nextHistory[j], sizeof(float) * (size_t)numProcessingChannels);
 
 		// The queue's offset from the setpoint right after the write, averaged over SND_DEVICES_CARRIER_ERROR_AVG_SECS
 		// whatever the block size.

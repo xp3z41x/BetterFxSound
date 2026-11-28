@@ -95,6 +95,11 @@ HRESULT STDMETHODCALLTYPE CsndDevicesMMNotificationClient::QueryInterface(
 // so they read each shared index once, check its bounds, and only trust the list when enumerationSequence says it was
 // not being rewritten during the read.
 
+// The format ID of PKEY_AudioEngine_DeviceFormat ({f19f064d-082c-4e27-bc73-6882a1bb8e4c}, pid 0, mmdeviceapi.h),
+// defined here so this file does not need initguid.h for it.
+static const GUID kSndDevicesAudioEngineDeviceFormatFmtid =
+	{ 0xf19f064d, 0x082c, 0x4e27, { 0xbc, 0x73, 0x68, 0x82, 0xa1, 0xbb, 0x8e, 0x4c } };
+
 // True for a capture (recording) endpoint. MMDevice endpoint IDs start with "{0.0.<flow>.", flow being 0 for render and
 // 1 for capture. The callbacks must not release the last reference to an MMDevice API object, so they cannot open the
 // endpoint to ask for its data flow. An ID in another format is treated as a playback endpoint.
@@ -489,11 +494,36 @@ HRESULT STDMETHODCALLTYPE CsndDevicesMMNotificationClient::OnPropertyValueChange
                           const PROPERTYKEY key)
 {
   struct sndDevicesHdlType *cast_handle;
-    
+
   cast_handle = (struct sndDevicesHdlType *)g_sndDevicesCallbacks_hdl;
 
   if (cast_handle == NULL)
     return(S_OK);
+
+  /*
+  * BetterFxSound: a playback endpoint's format changed (PKEY_AudioEngine_DeviceFormat). Its state stays the same, so
+  * nothing else tells: a Bluetooth headset that went mono while an app had its microphone open stayed listed as mono
+  * (hidden from the outputs, not routed) once it was back to stereo, until some unrelated device event. The device list
+  * is read again by the timer (deviceFormatChanged, see sndCheckDeviceChanges()); the carrier's own format change
+  * stops the processing, so the reinit opens it with its new format. Every other property (the mute setting on
+  * Windows 8 and later, names, icons) is still ignored. The virtual device's format is set by the reinit itself.
+  */
+  if( (pwstrDeviceId != NULL) && (cast_handle->ignoreDeviceCallbacks == FALSE) &&
+	  IsEqualGUID(key.fmtid, kSndDevicesAudioEngineDeviceFormatFmtid) && (key.pid == 0) &&
+	  !sndDevicesCallbackIsCaptureEndpoint(pwstrDeviceId) &&
+	  !((cast_handle->dfxDeviceID[0] != L'\0') && (wcsncmp(pwstrDeviceId, cast_handle->dfxDeviceID, PT_MAX_GENERIC_STRLEN) == 0)) )
+  {
+	  SLOUT_FIRST_LINE(L"CsndDevicesMMNotificationClient::OnPropertyValueChanged() a playback device format changed");
+
+	  InterlockedExchange(&(cast_handle->deviceFormatChanged), 1);
+	  if( sndDevicesCallbackChangeStopsProcessing(cast_handle, pwstrDeviceId, FALSE) )
+		  InterlockedExchange(&(cast_handle->stopAudioCaptureAndPlaybackLoop), 1);
+	  else
+		  InterlockedExchange(&(cast_handle->deviceListIsStale), 1);
+
+	  if (cast_handle->deviceChangeCallback != NULL)
+		  cast_handle->deviceChangeCallback();
+  }
 
 	/*
 	struct sndDevicesHdlType *cast_handle;

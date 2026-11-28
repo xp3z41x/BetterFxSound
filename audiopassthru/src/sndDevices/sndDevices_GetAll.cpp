@@ -118,6 +118,10 @@ int PT_DECLSPEC sndDevices_GetAll(PT_HANDLE* hp_sndDevices, int* ip_num_devices)
 		Sleep(1);
 	}
 
+	// BetterFxSound: this enumeration reads every device's format, so a format change notified before it is covered.
+	// One notified from here on sets the flag again and is read by a later enumeration.
+	InterlockedExchange(&(cast_handle->deviceFormatChanged), 0);
+
 	// BetterFxSound: the list can be read again while processing (a device change that does not stop it, the GUI's
 	// getSoundDevices()), and its order can change. The carrier, capture and prior default indexes follow their devices'
 	// IDs, so they keep naming the same devices (or none, if they are gone). A reinit has reset them, so they stay unset then.

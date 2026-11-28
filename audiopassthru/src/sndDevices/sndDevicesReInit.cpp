@@ -244,7 +244,17 @@ int PT_DECLSPEC sndDevicesReInit(PT_HANDLE *hp_sndDevices, int i_initType, int *
 				captureBufferChannelsForAllocation = cast_handle->wfxCapture.nChannels;
 
 			captureAllocSize = (int)(cast_handle->wfxCapture.nSamplesPerSec  * captureBufferChannelsForAllocation  * (double)cast_handle->bufferSizeMilliSecs * 1.001 / 500.0);
-			playbackAllocSize = (int)(cast_handle->wfxPlayback.nSamplesPerSec * cast_handle->wfxPlayback.nChannels * (double)cast_handle->bufferSizeMilliSecs * 1.001 / 500.0);
+			// BetterFxSound: the processing buffer holds captured frames (capture rate) in the processing format, which
+			// may have more channels (a mono carrier is processed in stereo) and a higher rate than the carrier's.
+			{
+				DWORD allocRate = cast_handle->wfxPlayback.nSamplesPerSec;
+				WORD allocChannels = cast_handle->wfxPlayback.nChannels;
+				if (cast_handle->wfxCapture.nSamplesPerSec > allocRate)
+					allocRate = cast_handle->wfxCapture.nSamplesPerSec;
+				if (cast_handle->wfxDfxProcessing.nChannels > allocChannels)
+					allocChannels = cast_handle->wfxDfxProcessing.nChannels;
+				playbackAllocSize = (int)(allocRate * allocChannels * (double)cast_handle->bufferSizeMilliSecs * 1.001 / 500.0);
+			}
 
 			if (cast_handle->fCaptureBuf != NULL)
 			{
@@ -481,6 +491,14 @@ int PT_DECLSPEC sndCheckDeviceChanges(PT_HANDLE* hp_sndDevices, BOOL* bp_deviceC
 					stop_processing = TRUE;
 			}
 		}
+	}
+
+	// BetterFxSound: a playback endpoint's format changed since the last enumeration (see deviceFormatChanged): its
+	// channel count may differ from the listed one, so the list is read again. That enumeration clears the flag.
+	if (InterlockedCompareExchange(&(cast_handle->deviceFormatChanged), 0, 0) != 0)
+	{
+		*bp_deviceChanged = TRUE;
+		list_differs = TRUE;
 	}
 
 	// BetterFxSound: an active device whose channel count the last enumeration could not read is read again (the list

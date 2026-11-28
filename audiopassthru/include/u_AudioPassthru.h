@@ -67,7 +67,7 @@ public:
 	std::wstring getDelayCalibrationError();
 
 private:
-	void applyMainDelay(float* buffer, UINT32 frames, UINT32 channels, UINT32 sample_rate);
+	void applyMainDelay(float* buffer, UINT32 frames, UINT32 channels, UINT32 sample_rate, bool silence_fill);
 	void applyCarrierGain(float* buffer, UINT32 frames, UINT32 channels, UINT32 sample_rate, bool enabled);
 
 	// Recomputes the carrier settings and the additional outputs from the requested outputs and the
@@ -150,6 +150,9 @@ private:
 	std::vector<float> main_delay_buffer_;
 	UINT32 main_delay_write_ = 0;
 	UINT32 main_delay_format_ = 0;
+	UINT32 main_delay_applied_frames_ = 0;		// Delay the line reads with (frames), follows main_delay_ms_ through a fade
+	float main_delay_fade_ = 1.0f;				// Gain of the line's output during that fade
+	bool main_delay_switching_ = false;			// Fading out to move to a new delay
 
 	// Delay measurement. While it runs only one output plays: -1 = carrier, k = additional output k.
 	// solo_ is declared before calibration_ so it outlives the measurement thread that sets it.

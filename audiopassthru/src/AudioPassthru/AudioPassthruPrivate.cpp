@@ -557,6 +557,7 @@ int AudioPassthruPrivate::processTimer()
 			carrier_enabled_.store(false, std::memory_order_relaxed);
 			carrier_gain_ = 0.0f;
 			main_delay_format_ = 0;
+			s_sndDevices_.carrierDelayTailFrames = 0;
 
 			hProcessingThread_ = CreateThread(NULL, 0, processingThread, (LPVOID)this, 0L, &ProcessingThreadID_);
 
@@ -727,6 +728,12 @@ DWORD AudioPassthruPrivate::threadWorker(HANDLE h_wait_timer)
 
 		if (numSampleSets > 0)
 		{
+			/*
+			* BetterFxSound: silence handed over during a pause in the loopback, only to play out what the carrier's
+			* delay line still holds (see carrierDelayTailFrames): not processed, nor given to the additional outputs.
+			*/
+			const bool silence_fill = (s_sndDevices_.capturedBlockIsSilenceFill != FALSE);
+
 			/* Set additional processing settings */
 			i_valid_bits = pwfx->wBitsPerSample;
 			i_check_for_duplicate_buffers = IS_FALSE;
@@ -747,7 +754,7 @@ DWORD AudioPassthruPrivate::threadWorker(HANDLE h_wait_timer)
 			// 2016-08-25: Workaround for crashing when playback device has only one channel (mono). For example, a Bleutooth headset is mono. When such
 			// device is selected as the playback device, we do not apply DFX/DSP processing to the buffer for now. Otherwise it will crash.
 			// NOTE: There will also be no sound with a mono playback device until we add code to fill mono playback buffer in sndDevicesDoCapture.cpp, line 279.
-			if (pwfx->nChannels != 1 || (pwfx->nChannels == 1 && !SND_DEVICES_MONO_BUG_DO_NOT_PROCESS))
+			if (!silence_fill && (pwfx->nChannels != 1 || (pwfx->nChannels == 1 && !SND_DEVICES_MONO_BUG_DO_NOT_PROCESS)))
 			{
 				// Apply DFX processing here using data and format vars above. Format will always be 32 bit floating point.
 			//	if (dfxpUniversalModifySamples(cast_handle->dfxp_hdl, (short int *)fp_buffer, (short int *)fp_buffer, numSampleSets, i_check_for_duplicate_buffers) != OKAY)
@@ -760,9 +767,10 @@ DWORD AudioPassthruPrivate::threadWorker(HANDLE h_wait_timer)
 			* data and never blocks, so it has to happen here, before sndDevicesDoPlayback() reuses
 			* the buffer for upsampling.
 			*/
-			if (!mute_)
+			const int solo = solo_.load(std::memory_order_relaxed);
+			if (!mute_ && !silence_fill)
 			{
-				multi_output_.write(fp_buffer, (UINT32)numSampleSets, pwfx->nChannels, pwfx->nSamplesPerSec, solo_.load(std::memory_order_relaxed));
+				multi_output_.write(fp_buffer, (UINT32)numSampleSets, pwfx->nChannels, pwfx->nSamplesPerSec, solo);
 			}
 
 			/*
@@ -775,20 +783,20 @@ DWORD AudioPassthruPrivate::threadWorker(HANDLE h_wait_timer)
 			const OutputChannelMode carrier_channel_mode = static_cast<OutputChannelMode>(main_channel_mode_.load(std::memory_order_relaxed));
 
 			/* BetterFxSound: optional delay for the carrier. It keeps every channel, so a new channel mode is heard at once. */
-			applyMainDelay(fp_buffer, (UINT32)numSampleSets, pwfx->nChannels, pwfx->nSamplesPerSec);
+			applyMainDelay(fp_buffer, (UINT32)numSampleSets, pwfx->nChannels, pwfx->nSamplesPerSec, silence_fill);
 
 			/* BetterFxSound: optional channel mode for the carrier (left only, right only or mono), on what is played now */
 			applyOutputChannelMode(fp_buffer, (UINT32)numSampleSets, pwfx->nChannels, carrier_channel_mode);
 
-			/* BetterFxSound: Windows master volume x this output's trim, or silence if the carrier output is disabled */
-			applyCarrierGain(fp_buffer, (UINT32)numSampleSets, pwfx->nChannels, pwfx->nSamplesPerSec, carrier_enabled);
+			/*
+			* BetterFxSound: while an additional output is being measured, the carrier is silent. It fades out and back
+			* in through its gain (about 10 ms), as when it is disabled; the mute used to start and end abruptly. Once
+			* faded out the gain is 0, which silences the block exactly.
+			*/
+			const bool solo_muted = (solo >= 0);
 
-			/* BetterFxSound: while an additional output is being measured, the carrier is silent */
-			{
-				int solo = solo_.load(std::memory_order_relaxed);
-				if (solo >= 0)
-					memset(fp_buffer, 0, sizeof(float) * (size_t)numSampleSets * pwfx->nChannels);
-			}
+			/* BetterFxSound: Windows master volume x this output's trim, or silence if the carrier output is disabled */
+			applyCarrierGain(fp_buffer, (UINT32)numSampleSets, pwfx->nChannels, pwfx->nSamplesPerSec, carrier_enabled && !solo_muted);
 
 			/* Check if thread has been signaled to end */
 			if (i_kill_processing_thread_)
@@ -1396,11 +1404,24 @@ void AudioPassthruPrivate::applyCarrierGain(float* buffer, UINT32 frames, UINT32
 * FUNCTION: applyMainDelay()
 * DESCRIPTION: BetterFxSound. Delays the carrier in place. Processing thread only, no allocation.
 * With a delay of 0 the audio passes through unchanged.
+* A new delay is moved to the way the additional outputs do it: the line's output fades out (~2 ms), the read position
+* moves, and it fades back in. On a longer delay, what the line would play again (already played) is cleared first, so
+* the change plays silence instead. The read position used to jump at once, which clicked and played up to 500 ms of
+* audio twice (or skipped it).
+* silence_fill: the block is silence handed over during a pause in the loopback (see carrierDelayTailFrames), which plays
+* out what the line still holds. s_sndDevices_.carrierDelayTailFrames is kept up to date for sndDevicesDoCapture().
 */
-void AudioPassthruPrivate::applyMainDelay(float* buffer, UINT32 frames, UINT32 channels, UINT32 sample_rate)
+void AudioPassthruPrivate::applyMainDelay(float* buffer, UINT32 frames, UINT32 channels, UINT32 sample_rate, bool silence_fill)
 {
 	if (buffer == NULL || channels == 0 || channels > kMainDelayChannels || sample_rate == 0 || main_delay_buffer_.empty())
+	{
+		s_sndDevices_.carrierDelayTailFrames = 0;
 		return;
+	}
+
+	UINT32 delay_frames = (UINT32)((UINT64)main_delay_ms_.load(std::memory_order_relaxed) * sample_rate / 1000);
+	if (delay_frames >= kMainDelayFrames)
+		delay_frames = kMainDelayFrames - 1;
 
 	// A new format invalidates what is stored, start over with silence.
 	UINT32 format = (sample_rate << 4) | channels;
@@ -1409,22 +1430,68 @@ void AudioPassthruPrivate::applyMainDelay(float* buffer, UINT32 frames, UINT32 c
 		std::fill(main_delay_buffer_.begin(), main_delay_buffer_.end(), 0.0f);
 		main_delay_write_ = 0;
 		main_delay_format_ = format;
+		main_delay_applied_frames_ = delay_frames;
+		main_delay_fade_ = 1.0f;
+		main_delay_switching_ = false;
+		s_sndDevices_.carrierDelayTailFrames = 0;
 	}
 
-	UINT32 delay_frames = (UINT32)((UINT64)main_delay_ms_.load(std::memory_order_relaxed) * sample_rate / 1000);
-	if (delay_frames >= kMainDelayFrames)
-		delay_frames = kMainDelayFrames - 1;
-
+	UINT32 tail_frames = s_sndDevices_.carrierDelayTailFrames;
 	const UINT32 mask = kMainDelayFrames - 1;
+	const float fade_step = (float)(1.0 / (0.002 * (double)sample_rate));
 	for (UINT32 i = 0; i < frames; i++)
 	{
+		if (!main_delay_switching_ && delay_frames != main_delay_applied_frames_)
+			main_delay_switching_ = true;
+
+		if (main_delay_switching_ && main_delay_fade_ <= 0.0f)
+		{
+			// Faded out: move the read position. The frame read now under the old delay is the oldest not played
+			// yet, so on a longer delay the frames between the new and the old read positions were played already.
+			const UINT32 old_frames = main_delay_applied_frames_;
+			if (delay_frames > old_frames)
+			{
+				for (UINT32 k = old_frames + 1; k <= delay_frames; k++)
+					memset(&main_delay_buffer_[(size_t)((main_delay_write_ - k) & mask) * kMainDelayChannels], 0, sizeof(float) * channels);
+				if (tail_frames > 0)
+					tail_frames += delay_frames - old_frames;
+			}
+			else
+			{
+				tail_frames = (tail_frames > old_frames - delay_frames) ? tail_frames - (old_frames - delay_frames) : 0;
+			}
+			main_delay_applied_frames_ = delay_frames;
+			main_delay_switching_ = false;
+		}
+
+		if (main_delay_switching_)
+			main_delay_fade_ = (main_delay_fade_ > fade_step) ? main_delay_fade_ - fade_step : 0.0f;
+		else if (main_delay_fade_ < 1.0f)
+			main_delay_fade_ = (main_delay_fade_ + fade_step < 1.0f) ? main_delay_fade_ + fade_step : 1.0f;
+
 		float* frame = buffer + (size_t)i * channels;
 		float* slot_in = &main_delay_buffer_[(size_t)(main_delay_write_ & mask) * kMainDelayChannels];
 		memcpy(slot_in, frame, sizeof(float) * channels);
-		const float* slot_out = &main_delay_buffer_[(size_t)((main_delay_write_ - delay_frames) & mask) * kMainDelayChannels];
-		memcpy(frame, slot_out, sizeof(float) * channels);
+		const float* slot_out = &main_delay_buffer_[(size_t)((main_delay_write_ - main_delay_applied_frames_) & mask) * kMainDelayChannels];
+		if (main_delay_fade_ >= 1.0f)
+		{
+			memcpy(frame, slot_out, sizeof(float) * channels);
+		}
+		else
+		{
+			for (UINT32 c = 0; c < channels; c++)
+				frame[c] = slot_out[c] * main_delay_fade_;
+		}
 		main_delay_write_++;
 	}
+
+	// What the line holds that is not played yet: after captured audio, a whole delay's worth; silence handed over
+	// for a pause pushes that much of it out.
+	if (!silence_fill)
+		tail_frames = main_delay_applied_frames_;
+	else
+		tail_frames = (tail_frames > frames) ? tail_frames - frames : 0;
+	s_sndDevices_.carrierDelayTailFrames = tail_frames;
 }
 
 /*
