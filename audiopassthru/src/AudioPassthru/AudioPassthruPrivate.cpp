@@ -466,7 +466,10 @@ int AudioPassthruPrivate::processTimer()
 		* BetterFxSound: the reinit settled which device is the carrier, a requested switch is no longer pending.
 		* The carrier's stream was opened again, so the engine starts using its device again: its volume is set
 		* to 100% and unmuted once more by applyAdditionalOutputs() below.
+		* The engine's request ends with it: a reinit that returned before the device rules ran (virtual device not
+		* found, no real device) left it in place, and a later reinit would take that stale carrier over a newer choice.
 		*/
+		s_sndDevices_.requestedPlaybackID[0] = L'\0';
 		{
 			std::lock_guard<std::mutex> lock(config_mutex_);
 			pending_carrier_id_.clear();
