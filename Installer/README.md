@@ -32,7 +32,7 @@ Command-line switch `/SKIPDRIVER` (setup and uninstaller) skips the driver step.
 Local build (Windows, Inno Setup installed):
 
 ```powershell
-& "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DAppVersion=1.0.1 /DFxSoundExe=<path>\FxSound.exe /DFxDiagExe=<path>\fxdiag.exe /DFxMcpExe=<path>\fxmcp.exe Installer\BetterFxSound.iss
+& "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DAppVersion=1.0.2 /DFxSoundExe=<path>\FxSound.exe /DFxDiagExe=<path>\fxdiag.exe /DFxMcpExe=<path>\fxmcp.exe Installer\BetterFxSound.iss
 ```
 
 ## Releasing
