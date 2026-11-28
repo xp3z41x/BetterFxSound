@@ -1369,9 +1369,15 @@ void AudioPassthruPrivate::applyAdditionalOutputs()
 */
 void AudioPassthruPrivate::handBackUnusedDevices(const std::vector<std::wstring>& in_use)
 {
+	/* An additional output still opening its stream hands its device back itself once it is done (setDriven() did not
+	   wait for it): a take-over it is still running would undo this sweep's hand-back and the record would be gone. */
+	const std::vector<std::wstring> pending = multi_output_.pendingVolumeDevices();
+
 	for (const auto& id : owedVolumeDevices())
 	{
 		if (std::find(in_use.begin(), in_use.end(), id) != in_use.end())
+			continue;
+		if (std::find(pending.begin(), pending.end(), id) != pending.end())
 			continue;
 		if (!isDevicePresent(id))
 			continue;

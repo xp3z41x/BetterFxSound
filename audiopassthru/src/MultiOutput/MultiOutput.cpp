@@ -460,6 +460,9 @@ public:
 
 	const std::wstring& deviceId() const { return device_id_; }
 
+	// BetterFxSound: setDriven() left its change to the render thread, which has not applied it yet. Any thread.
+	bool volumeChangePending() const { return volume_recheck_.load(); }
+
 	// Router, UI thread: the output is removed. Asks the render thread to stop; it closes the stream and exits.
 	void requestStop()
 	{
@@ -478,20 +481,15 @@ public:
 	// Router, UI thread: the engine starts or stops driving the outputs. Starting takes over a device
 	// whose stream is already open (the others are taken over when their stream opens). Stopping
 	// puts the device's own level and mute back.
-	// BetterFxSound: starting never waits for the render thread. While it is opening its stream it holds volume_mutex_
-	// across the device volume calls (seconds on a Bluetooth device that is connecting), and the UI thread waited for
-	// it. Then the render thread applies the change itself, with the router's flag as it is then, once it is done.
-	// Stopping still waits: the callers sweep the owed volumes right after (handBackUnusedDevices(), without this
-	// mutex), and a take-over still running then would set the device to 100% after the sweep put its level back and
-	// erased the record, losing the user's level. The router cleared its flag first, so no take-over starts after it.
+	// BetterFxSound: never waits for the render thread. While it is opening its stream it holds volume_mutex_ across
+	// the device volume calls (seconds on a Bluetooth device that is connecting), and the UI thread waited for it (power
+	// off froze the app). Then the render thread applies the change itself, with the router's flag as it is then, once
+	// it is done. Until it has, volumeChangePending() is true and the engine's sweep of owed volumes
+	// (handBackUnusedDevices()) leaves the device to it: a take-over still running would otherwise set the device to
+	// 100% after the sweep put its level back and erased the record, losing the user's level. The router cleared its
+	// flag first, so no take-over starts after it.
 	void setDriven(bool driven)
 	{
-		if (!driven)
-		{
-			std::lock_guard<std::mutex> lock(volume_mutex_);
-			applyDrivenLocked(false);
-			return;
-		}
 		std::unique_lock<std::mutex> lock(volume_mutex_, std::try_to_lock);
 		if (!lock.owns_lock())
 		{
@@ -1834,6 +1832,20 @@ std::vector<AdditionalOutputStatus> MultiOutputRouter::getStatus() const
 	}
 	ReleaseSRWLockShared(&lock_);
 	return status;
+}
+
+std::vector<std::wstring> MultiOutputRouter::pendingVolumeDevices() const
+{
+	// Under the shared lock, not from copies of the outputs (see getStatus()).
+	std::vector<std::wstring> devices;
+	AcquireSRWLockShared(&lock_);
+	for (const auto& output : outputs_)
+	{
+		if (output != nullptr && output->volumeChangePending())
+			devices.push_back(output->deviceId());
+	}
+	ReleaseSRWLockShared(&lock_);
+	return devices;
 }
 
 void MultiOutputRouter::setDriven(bool driven)

@@ -97,9 +97,13 @@ public:
 	// 100% and unmuted while driven (at stream open, or here when driving starts), and puts the saved
 	// setting back when driving stops (here, on power off), when it is removed, and at exit.
 	// The device volume calls are made on the calling thread, without holding the router's lock. BetterFxSound: an
-	// output whose render thread is opening its stream (and setting its device's volume) is not waited for: that
-	// thread applies the change itself once it is done. UI/timer thread.
+	// output whose render thread is opening its stream (and setting its device's volume) is not waited for, in either
+	// direction: that thread applies the change itself once it is done (see pendingVolumeDevices()). UI/timer thread.
 	void setDriven(bool driven);
+
+	// BetterFxSound: the devices of the outputs whose render thread has not yet applied a setDriven() it was busy for
+	// (opening its stream). Their owed volume is that thread's to hand back: the engine's sweep leaves them. Any thread.
+	std::vector<std::wstring> pendingVolumeDevices() const;
 
 	// Whether the engine drives the outputs (see setDriven()). Only then do they take their devices over.
 	bool isDriven() const;
