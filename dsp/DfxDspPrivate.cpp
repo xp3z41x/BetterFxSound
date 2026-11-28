@@ -225,10 +225,9 @@ int DfxDspPrivate::setSignalFormat(int i_bps, int i_nch, int i_srate, int i_vali
 * first setSignalFormat() call finds it unchanged and does nothing. Only call this while no
 * processing thread is running for this instance (last_signal_* belong to that thread
 * otherwise), and never from the processing thread itself.
-* Not wired yet: until AudioPassthruPrivate's reinit calls it (after the old processing thread
-* is joined, before CreateThread, with the wfxDfxProcessing bps/nch/rate and valid_bits = bps,
-* exactly what threadWorker passes to setSignalFormat()), a format change still reinitializes
-* on the processing thread, under setSignalFormat()'s try-lock.
+* AudioPassthruPrivate::processTimer() calls it after a reinit, once the old processing thread
+* has exited and before it starts the new one, with the wfxDfxProcessing bps/nch/rate and
+* valid_bits = bps, exactly what threadWorker passes to setSignalFormat().
 */
 int DfxDspPrivate::prepareSignalFormat(int i_bps, int i_nch, int i_srate, int i_valid_bits)
 {

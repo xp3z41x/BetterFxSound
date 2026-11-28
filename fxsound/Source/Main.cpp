@@ -207,10 +207,10 @@ private:
 
         relaunchAfterCrash();
 
-        // BetterFxSound: best effort, so the relaunched instance (or the next start) gets the last settings changes.
-        // After the relaunch, so a fault or a held settings lock here can't cost it: the new instance starts about
-        // 3 s later (launchNewInstance), after this flush.
-        controller.flushSettings();
+        // BetterFxSound: no settings flush here. This runs on the faulting thread, which can be any thread, and
+        // PropertiesFile::saveIfNeeded() takes the settings lock: held by another thread (the message thread mid-set
+        // or mid-save) it would hang this process for good, and the instance relaunched above would only forward its
+        // command line to the hung one and exit. The 3 s settings save timer covers all but the last few seconds.
 
         return EXCEPTION_EXECUTE_HANDLER;
     }

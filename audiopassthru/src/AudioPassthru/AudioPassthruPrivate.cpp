@@ -699,6 +699,16 @@ int AudioPassthruPrivate::processTimer()
 			main_delay_format_ = 0;
 			s_sndDevices_.carrierDelayTailFrames = 0;
 
+			/*
+			* BetterFxSound: a format change (a carrier switch across channel count or rate family) reinitializes the DSP:
+			* it reallocates its tables and reads every setting from the registry. Applied here, while no processing thread
+			* runs, with exactly what threadWorker passes to setSignalFormat() (the processing format sndDevicesDoCapture()
+			* returns, valid bits = bits per sample), so that thread finds the format unchanged and does none of it.
+			*/
+			if (p_dfx_dsp_ != nullptr)
+				p_dfx_dsp_->prepareSignalFormat(s_sndDevices_.wfxDfxProcessing.wBitsPerSample, s_sndDevices_.wfxDfxProcessing.nChannels,
+					s_sndDevices_.wfxDfxProcessing.nSamplesPerSec, s_sndDevices_.wfxDfxProcessing.wBitsPerSample);
+
 			hProcessingThread_ = CreateThread(NULL, 0, processingThread, (LPVOID)this, 0L, &ProcessingThreadID_);
 
 			/* BetterFxSound: processing, with the virtual device as the default: a real device made the default from here
