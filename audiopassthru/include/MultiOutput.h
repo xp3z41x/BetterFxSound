@@ -47,7 +47,8 @@ bool handBackOwedVolumeById(const std::wstring& device_id);
 
 // Rewrites an interleaved block in place for the given channel mode (no-op for Both).
 // Channel 0 is front left and channel 1 is front right in every standard layout. BetterFxSound: with more than two
-// channels, left, right and mono are taken from the stereo fold-down (center and surrounds at -3 dB, no LFE).
+// channels, left, right and mono are taken from the stereo fold-down (center and surrounds at -3 dB, no LFE), and played
+// on front left and front right only (the other channels are silenced).
 void applyOutputChannelMode(float* buffer, UINT32 frames, UINT32 channels, OutputChannelMode mode);
 
 /*

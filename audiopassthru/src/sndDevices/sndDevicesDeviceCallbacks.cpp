@@ -504,9 +504,12 @@ HRESULT STDMETHODCALLTYPE CsndDevicesMMNotificationClient::OnPropertyValueChange
   * BetterFxSound: a playback endpoint's format changed (PKEY_AudioEngine_DeviceFormat). Its state stays the same, so
   * nothing else tells: a Bluetooth headset that went mono while an app had its microphone open stayed listed as mono
   * (hidden from the outputs, not routed) once it was back to stereo, until some unrelated device event. The device list
-  * is read again by the timer (deviceFormatChanged, see sndCheckDeviceChanges()); the carrier's own format change
-  * stops the processing, so the reinit opens it with its new format. Every other property (the mute setting on
-  * Windows 8 and later, names, icons) is still ignored. The virtual device's format is set by the reinit itself.
+  * is read again by the timer (deviceFormatChanged, see sndCheckDeviceChanges()). The processing is not stopped here:
+  * Windows sends bursts of these while a Bluetooth endpoint connects or renegotiates, and some drivers send the
+  * property again unchanged, so each one interrupted every output. A real change of the carrier's format invalidates
+  * its stream (the processing thread ends), and sndCheckDeviceChanges() stops it too when the carrier's format no
+  * longer matches the one it was opened with. Every other property (the mute setting on Windows 8 and later, names,
+  * icons) is still ignored. The virtual device's format is set by the reinit itself.
   */
   if( (pwstrDeviceId != NULL) && (cast_handle->ignoreDeviceCallbacks == FALSE) &&
 	  IsEqualGUID(key.fmtid, kSndDevicesAudioEngineDeviceFormatFmtid) && (key.pid == 0) &&
@@ -516,10 +519,7 @@ HRESULT STDMETHODCALLTYPE CsndDevicesMMNotificationClient::OnPropertyValueChange
 	  SLOUT_FIRST_LINE(L"CsndDevicesMMNotificationClient::OnPropertyValueChanged() a playback device format changed");
 
 	  InterlockedExchange(&(cast_handle->deviceFormatChanged), 1);
-	  if( sndDevicesCallbackChangeStopsProcessing(cast_handle, pwstrDeviceId, FALSE) )
-		  InterlockedExchange(&(cast_handle->stopAudioCaptureAndPlaybackLoop), 1);
-	  else
-		  InterlockedExchange(&(cast_handle->deviceListIsStale), 1);
+	  InterlockedExchange(&(cast_handle->deviceListIsStale), 1);
 
 	  if (cast_handle->deviceChangeCallback != NULL)
 		  cast_handle->deviceChangeCallback();

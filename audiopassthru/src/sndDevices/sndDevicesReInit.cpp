@@ -338,6 +338,39 @@ static BOOL sndCheckDeviceChangeStopsProcessing(struct sndDevicesHdlType* cast_h
 }
 
 /*
+* BetterFxSound: TRUE when the carrier's mix format, read now, has another channel count or rate than the one the
+* carrier was opened with (wfxPlayback). FALSE when it is the same or cannot be read (an invalidated stream ends the
+* processing thread by itself). Timer thread.
+*/
+static BOOL sndCheckCarrierFormatChanged(struct sndDevicesHdlType* cast_handle, IMMDeviceEnumerator* pEnumerator, const wchar_t* wcp_carrier_ID)
+{
+	IMMDevice* pDevice = NULL;
+	IAudioClient* pClient = NULL;
+	WAVEFORMATEX* pwfx = NULL;
+	BOOL changed = FALSE;
+
+	if ((pEnumerator == NULL) || (wcp_carrier_ID[0] == 0) || (cast_handle->wfxPlayback.nChannels == 0))
+		return(FALSE);
+
+	if (SUCCEEDED(pEnumerator->GetDevice(wcp_carrier_ID, &pDevice)) && (pDevice != NULL))
+	{
+		if (SUCCEEDED(pDevice->Activate(cast_handle->IID_IAudioClient, CLSCTX_ALL, NULL, (void**)&pClient)) && (pClient != NULL))
+		{
+			if (SUCCEEDED(pClient->GetMixFormat(&pwfx)) && (pwfx != NULL))
+			{
+				if ((pwfx->nChannels != cast_handle->wfxPlayback.nChannels) || (pwfx->nSamplesPerSec != cast_handle->wfxPlayback.nSamplesPerSec))
+					changed = TRUE;
+				CoTaskMemFree(pwfx);
+			}
+			pClient->Release();
+		}
+		pDevice->Release();
+	}
+
+	return(changed);
+}
+
+/*
 * BetterFxSound: reports any difference between the device list read at the last enumeration and the system (count, IDs,
 * states), so the caller reads the list again. The processing is only stopped when a difference concerns it (see
 * sndCheckDeviceChangeStopsProcessing()), as the device notification callbacks do. Stopping it for any difference
@@ -495,10 +528,14 @@ int PT_DECLSPEC sndCheckDeviceChanges(PT_HANDLE* hp_sndDevices, BOOL* bp_deviceC
 
 	// BetterFxSound: a playback endpoint's format changed since the last enumeration (see deviceFormatChanged): its
 	// channel count may differ from the listed one, so the list is read again. That enumeration clears the flag.
+	// The processing is stopped only when the carrier's format now differs (channel count or rate) from the one it was
+	// opened with: the notification comes in bursts, or unchanged, for which it used to stop the processing every time.
 	if (InterlockedCompareExchange(&(cast_handle->deviceFormatChanged), 0, 0) != 0)
 	{
 		*bp_deviceChanged = TRUE;
 		list_differs = TRUE;
+		if (sndCheckCarrierFormatChanged(cast_handle, pEnumerator, carrier_ID))
+			stop_processing = TRUE;
 	}
 
 	// BetterFxSound: an active device whose channel count the last enumeration could not read is read again (the list

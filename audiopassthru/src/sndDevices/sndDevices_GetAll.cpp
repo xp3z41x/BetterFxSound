@@ -450,7 +450,19 @@ static int sndDevices_GetAllDevices(PT_HANDLE* hp_sndDevices, int* ip_num_device
 				PropVariantClear(&DeviceDesc);
 				return(NOT_OKAY);
 			}
-			if (resultFlag == SND_DEVICES_DEVICE_OPERATION_COMPLETED)
+			if ((resultFlag == SND_DEVICES_DEVICE_OPERATION_COMPLETED) && (wfx.nChannels == 1) && (known_num_channel[i] >= 2) &&
+				(cast_handle->deviceState[i] == DEVICE_STATE_ACTIVE))
+			{
+				// BetterFxSound: an active device that had two or more channels and reads mono now (a Bluetooth headset
+				// in hands-free mode while an app has its microphone open) keeps its count while it stays active. Mono
+				// devices are left out of the outputs and refused as the carrier, so the carrier moved to another device
+				// (perhaps a disabled one playing silence) and the headset was dropped until it was back to stereo. Its
+				// mono format is played correctly: a mono carrier is processed in stereo and averaged
+				// (sndDevicesDoPlayback()), an additional output folds its stereo ring down after the channel mode.
+				cast_handle->deviceNumChannel[i] = known_num_channel[i];
+				probe_retries[i] = 0;
+			}
+			else if (resultFlag == SND_DEVICES_DEVICE_OPERATION_COMPLETED)
 			{
 				cast_handle->deviceNumChannel[i] = wfx.nChannels;
 				known_num_channel[i] = wfx.nChannels;

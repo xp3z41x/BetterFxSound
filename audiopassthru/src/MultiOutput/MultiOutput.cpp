@@ -26,6 +26,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include <Audioclient.h>
 #include <endpointvolume.h>
 #include <atomic>
+#include <cmath>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -361,11 +362,13 @@ std::vector<std::wstring> owedVolumeDevices()
  * thread of this output reads from it through a cubic (Hermite) resampler whose ratio is
  * steered so that the amount of buffered audio stays at the target latency. That absorbs the
  * small clock difference between the main device and this device, so the two never drift
- * apart. Sample rate conversion to the device's own mix format is done by the Windows audio
- * engine (AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM). BetterFxSound: the stream has the device's own
- * channel count, and write() converts the processing format's channels to it, so a new carrier
- * with another channel count no longer closes, reopens and primes every output again. A new
- * carrier in the other rate family (44.1 or 48 kHz) still does.
+ * apart. BetterFxSound: the stream is opened once in the device's own mix format (its rate and
+ * channel count), whatever the processing format. write() converts the processing format's
+ * channels to the ring's (the device's; stereo for a mono device, so the channel mode is applied
+ * before the fold to mono), and the resampler also takes the ring from the processing rate to the
+ * device's (its ratio is the nominal rate ratio times the drift correction). A new carrier with
+ * another channel count or in the other rate family (44.1 or 48 kHz) used to close, reopen and
+ * prime every output again; now a new processing rate only empties the ring and primes it again.
  */
 class SecondaryOutput
 {
@@ -479,20 +482,25 @@ public:
 		if (data == nullptr || frames == 0 || channels == 0 || channels > kMaxChannels || sample_rate == 0)
 			return;
 
-		const UINT32 active = active_format_.load(std::memory_order_acquire);
+		// BetterFxSound: marks the write in progress before active_format_ is read (both sequentially consistent), so
+		// the render thread, after clearing active_format_, empties the ring only once no write that still saw the old
+		// format is copying into it (see tryResetRing()).
+		writing_.store(true);
+		const UINT32 active = active_format_.load();
 		if (active == 0 || formatRate(active) != sample_rate)
 		{
-			// The render thread (re)opens the device for this rate, then publishes its format in
-			// active_format_. Until then the audio is simply not queued for this output.
+			// The render thread opens the device (once) and sets the ring up for this rate, then publishes
+			// the ring's format in active_format_. Until then the audio is simply not queued for this output.
 			if (pending_rate_.load(std::memory_order_relaxed) != sample_rate)
 			{
 				pending_rate_.store(sample_rate, std::memory_order_release);
 				SetEvent(audio_event_);
 			}
+			writing_.store(false, std::memory_order_release);
 			return;
 		}
 
-		// BetterFxSound: the stream has the device's channel count, the block is converted to it.
+		// BetterFxSound: the ring has the device's channel count (stereo for a mono device), the block is converted to it.
 		const UINT32 out_channels = formatChannels(active);
 		const bool convert = (out_channels != channels);
 		float matrix[kRoleMaxChannels * kRoleMaxChannels];
@@ -504,7 +512,7 @@ public:
 		const UINT32 free_frames = kRingFrames - (w - r);
 		const UINT32 n = frames < free_frames ? frames : free_frames;
 
-		// Every channel is queued (in the device's channels). The channel mode is applied by render(), on what is played now, so a
+		// Every channel is queued (in the ring's channels). The channel mode is applied by render(), on what is played now, so a
 		// change is heard within one device period rather than after the queued audio (latency + delay).
 		for (UINT32 i = 0; i < n; i++)
 		{
@@ -537,6 +545,7 @@ public:
 		QueryPerformanceCounter(&qpc_now);
 		last_write_qpc_.store(qpc_now.QuadPart, std::memory_order_relaxed);
 		write_pos_.store(w + n, std::memory_order_release);
+		writing_.store(false, std::memory_order_release);
 	}
 
 private:
@@ -586,33 +595,35 @@ private:
 			const UINT32 pending = pending_rate_.load(std::memory_order_acquire);
 			const DWORD now = GetTickCount();
 
-			if (pending != 0 && (pending != open_rate_ || client_ == nullptr))
+			// BetterFxSound: the device is opened once audio comes, in its own mix format, and only opened again after it
+			// failed. A new processing rate (a carrier in the other rate family) only sets the ring up again: the stream
+			// keeps running. It used to be closed, opened again and primed, a dropout of seconds on Bluetooth.
+			if (client_ == nullptr)
 			{
-				if (pending == open_rate_ && static_cast<LONG>(now - next_retry) < 0)
-					continue; // Same rate failed recently, wait before retrying.
+				if (pending == 0 || static_cast<LONG>(now - next_retry) < 0)
+					continue; // Nothing to play yet, or the device failed recently: wait before retrying.
 
-				active_format_.store(0, std::memory_order_release);
-				closeClient();
-				open_rate_ = pending;
-
-				if (openClient(pending))
-				{
-					// Nothing is being written while active_format_ is 0, so the reader can
-					// safely discard anything left in the ring.
-					read_pos_.store(write_pos_.load(std::memory_order_acquire), std::memory_order_release);
-					primed_ = false;
-					idle_since_ = now;
-					active_format_.store(packFormat(channels_, pending), std::memory_order_release);
-				}
-				else
+				active_format_.store(0);
+				if (!openClient())
 				{
 					closeClient();
 					next_retry = now + kRetryMs;
+					continue;
 				}
-				continue;
+				ring_rate_ = pending;
+				ring_reset_pending_ = true;
+			}
+			else if (pending != 0 && pending != ring_rate_)
+			{
+				active_format_.store(0);
+				ring_rate_ = pending;
+				ring_reset_pending_ = true;
 			}
 
-			if (client_ != nullptr && !render())
+			if (ring_reset_pending_)
+				tryResetRing(now);
+
+			if (!render())
 			{
 				// Typically AUDCLNT_E_DEVICE_INVALIDATED: the device was unplugged or its
 				// format changed. Close it and reopen it later.
@@ -626,7 +637,73 @@ private:
 		closeClient();
 	}
 
-	bool openClient(UINT32 sample_rate)
+	// BetterFxSound: empties the ring and sets it up for ring_rate_ (the processing rate), once no write() that saw the
+	// previous format is still copying into it; otherwise on a later pass of run(). The caller cleared active_format_
+	// first, so no later write() queues anything until it is published again here. Render thread.
+	void tryResetRing(DWORD now)
+	{
+		if (writing_.load())
+			return;
+
+		read_pos_.store(write_pos_.load(std::memory_order_acquire), std::memory_order_release);
+		play_rate_ = ring_rate_;
+		setUpLowPass();
+		primed_ = false;
+		idle_since_ = now;
+		hold_frames_ = 0;
+		realign_pending_ = false;
+		ring_reset_pending_ = false;
+		active_format_.store(packFormat(ring_channels_, ring_rate_), std::memory_order_release);
+	}
+
+	// BetterFxSound: a device slower than the processing rate (44.1 kHz next to a 48 kHz carrier, a 16 kHz hands-free
+	// headset) is fed through an anti-alias filter first, as the carrier is (sndDevicesDoPlayback()): a 4th order
+	// Butterworth low-pass at 0.45 of the device's rate, on the ring frames as they are pulled. The Windows audio engine
+	// did that rate conversion before. Render thread, when the ring is set up.
+	void setUpLowPass()
+	{
+		std::memset(lowpass_state_, 0, sizeof(lowpass_state_));
+		const double device_ratio = (play_rate_ > 0) ? static_cast<double>(sample_rate_) / static_cast<double>(play_rate_) : 1.0;
+		lowpass_ = device_ratio < 0.99;
+		if (!lowpass_)
+			return;
+
+		static const double q[2] = { 0.54119610014619698, 1.30656296487637652 };
+		const double k = std::tan(3.14159265358979323846 * 0.45 * device_ratio);
+		for (int stage = 0; stage < 2; stage++)
+		{
+			const double norm = 1.0 / (1.0 + k / q[stage] + k * k);
+			lowpass_b0_[stage] = static_cast<float>(k * k * norm);
+			lowpass_a1_[stage] = static_cast<float>(2.0 * (k * k - 1.0) * norm);
+			lowpass_a2_[stage] = static_cast<float>((1.0 - k / q[stage] + k * k) * norm);
+		}
+	}
+
+	// The anti-alias filter on one frame of ring_channels_ (b1 = 2 * b0, b2 = b0), transposed direct form II.
+	void lowPassFrame(float* frame)
+	{
+		for (int stage = 0; stage < 2; stage++)
+		{
+			const float b0 = lowpass_b0_[stage];
+			const float a1 = lowpass_a1_[stage];
+			const float a2 = lowpass_a2_[stage];
+			for (UINT32 c = 0; c < ring_channels_; c++)
+			{
+				float& z1 = lowpass_state_[stage][0][c];
+				float& z2 = lowpass_state_[stage][1][c];
+				const float x = frame[c];
+				const float y = b0 * x + z1;
+				z1 = 2.0f * b0 * x - a1 * y + z2;
+				z2 = b0 * x - a2 * y;
+				// No denormals once it has decayed.
+				if (std::fabs(z1) < 1e-20f) z1 = 0.0f;
+				if (std::fabs(z2) < 1e-20f) z2 = 0.0f;
+				frame[c] = y;
+			}
+		}
+	}
+
+	bool openClient()
 	{
 		IMMDeviceEnumerator* enumerator = nullptr;
 		HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), NULL, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), (void**)&enumerator);
@@ -646,21 +723,25 @@ private:
 		if (FAILED(hr) || client_ == nullptr)
 			return false;
 
-		// BetterFxSound: the device's own channel count (at most kMaxChannels), whatever the carrier's: write()
-		// converts the processing format's channels to it. It used to be the processing format's, so every output was
-		// closed and opened again when a carrier with another channel count was chosen.
-		UINT32 channels = 2;
+		// BetterFxSound: the device's own mix format (channel count at most kMaxChannels), whatever the carrier's:
+		// write() converts the processing format's channels to the ring's and render() its rate to the device's. It
+		// used to be the processing format's, so every output was closed and opened again when a carrier with another
+		// channel count or in the other rate family was chosen.
+		UINT32 channels = 0;
+		UINT32 sample_rate = 0;
 		WAVEFORMATEX* mix = nullptr;
-		if (SUCCEEDED(client_->GetMixFormat(&mix)) && mix != nullptr)
-		{
-			if (mix->nChannels > 0)
-				channels = mix->nChannels;
-			CoTaskMemFree(mix);
-		}
+		if (FAILED(client_->GetMixFormat(&mix)) || mix == nullptr)
+			return false;
+		channels = mix->nChannels;
+		sample_rate = mix->nSamplesPerSec;
+		CoTaskMemFree(mix);
+		if (channels == 0 || sample_rate == 0)
+			return false;
 		if (channels > kMaxChannels)
 			channels = kMaxChannels;
 
-		// We hand the audio engine the processing format's rate and let it convert it to the device's mix format.
+		// At the device's mix rate: the audio engine has no rate to convert. AUTOCONVERTPCM still maps the channels when
+		// the device has more than kMaxChannels.
 		WAVEFORMATEXTENSIBLE wfx = {};
 		wfx.Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
 		wfx.Format.nChannels = static_cast<WORD>(channels);
@@ -698,8 +779,11 @@ private:
 			render_->ReleaseBuffer(buffer_frames_, AUDCLNT_BUFFERFLAGS_SILENT);
 
 		channels_ = channels;
+		// A mono device's ring is stereo: the channel mode picks left, right or both before the fold to mono (render()).
+		ring_channels_ = (channels == 1) ? 2 : channels;
 		sample_rate_ = sample_rate;
 		running_ = false;
+		primed_ = false;
 
 		// The device's own volume, once per stream open, never while rendering. While the engine drives the
 		// outputs it records the device's own level and mute, then sets 100% and unmuted so they do not stack
@@ -797,8 +881,10 @@ private:
 			return false;
 
 		std::memmove(history_[0], history_[1], sizeof(float) * kMaxChannels * 3);
-		std::memcpy(history_[3], &ring_[static_cast<size_t>(r & kRingMask) * kMaxChannels], sizeof(float) * channels_);
+		std::memcpy(history_[3], &ring_[static_cast<size_t>(r & kRingMask) * kMaxChannels], sizeof(float) * ring_channels_);
 		read_pos_.store(r + 1, std::memory_order_release);
+		if (lowpass_)
+			lowPassFrame(history_[3]);
 		return true;
 	}
 
@@ -811,11 +897,21 @@ private:
 
 		const UINT32 space = buffer_frames_ > padding ? buffer_frames_ - padding : 0;
 		const DWORD now = GetTickCount();
-		const double rate = static_cast<double>(sample_rate_);
+
+		// BetterFxSound: the ring is being set up for a new processing rate (tryResetRing()): silence meanwhile.
+		if (ring_reset_pending_ || play_rate_ == 0)
+			return !running_ || writeSilence(space);
+
+		// BetterFxSound: the queue, the target and the offsets are in ring frames (at the processing rate, play_rate_);
+		// the device plays at its own rate. hold_frames_ counts device frames, holdQueued() is it in ring frames.
+		const double rate = static_cast<double>(play_rate_);
+		const double device_rate = static_cast<double>(sample_rate_);
+		const double nominal = rate / device_rate;	// Ring frames per device frame, before the drift correction
+		auto holdQueued = [this, nominal]() -> UINT32 { return static_cast<UINT32>(hold_frames_ * nominal + 0.5); };
 		const UINT32 target = static_cast<UINT32>((kBaseLatencyMs + delay_ms_.load(std::memory_order_relaxed)) * rate / 1000.0);
 		const UINT32 slack = static_cast<UINT32>(rate * 0.15); // 150 ms
 		// Silence still to be played before the queued audio (a raised delay) counts as queued.
-		UINT32 fill = write_pos_.load(std::memory_order_acquire) - read_pos_.load(std::memory_order_relaxed) + hold_frames_;
+		UINT32 fill = write_pos_.load(std::memory_order_acquire) - read_pos_.load(std::memory_order_relaxed) + holdQueued();
 
 		if (primed_)
 		{
@@ -872,9 +968,9 @@ private:
 				{
 					const double waited = since_write * rate;
 					const double missing = static_cast<double>(target - queued) - waited;
-					hold_frames_ = missing > 0.0 ? static_cast<UINT32>(missing) : 0;
+					hold_frames_ = missing > 0.0 ? static_cast<UINT32>(missing / nominal) : 0;
 				}
-				fill = queued + hold_frames_;
+				fill = queued + holdQueued();
 
 				if (!running_)
 				{
@@ -928,7 +1024,7 @@ private:
 		double adjust = error_avg_ * 0.1;
 		if (adjust > 0.005) adjust = 0.005;
 		if (adjust < -0.005) adjust = -0.005;
-		ratio_ = 1.0 + adjust;
+		ratio_ = nominal * (1.0 + adjust);
 
 		BYTE* buffer = nullptr;
 		if (FAILED(render_->GetBuffer(space, &buffer)) || buffer == nullptr)
@@ -939,9 +1035,9 @@ private:
 		// This output's own trim times the Windows master volume (level and mute), see MasterVolume.h. Before a
 		// realignment, a fast fade out (~2 ms) instead.
 		const float gain_target = realign_pending_ ? 0.0f : target_gain_.load(std::memory_order_relaxed) * masterVolumeGain();
-		const float gain_step = static_cast<float>(1.0 / ((realign_pending_ ? 0.002 : 0.01) * rate)); // One-pole ramp
-		// The channel mode, for this whole period. The stream has the device's channel count, in the
-		// WAVEFORMATEXTENSIBLE order of defaultChannelMask() (front left, front right, ...).
+		const float gain_step = static_cast<float>(1.0 / ((realign_pending_ ? 0.002 : 0.01) * device_rate)); // One-pole ramp
+		// The channel mode, for this whole period. The ring has the device's channel count (stereo for a mono device),
+		// in the WAVEFORMATEXTENSIBLE order of defaultChannelMask() (front left, front right, ...).
 		const OutputChannelMode mode = static_cast<OutputChannelMode>(channel_mode_.load(std::memory_order_relaxed));
 		bool underflow = false;
 
@@ -972,8 +1068,8 @@ private:
 			const float gain = current_gain_;
 
 			const float t = static_cast<float>(frac_);
-			float* frame = out + static_cast<size_t>(produced) * channels_;
-			for (UINT32 c = 0; c < channels_; c++)
+			float value[kMaxChannels];
+			for (UINT32 c = 0; c < ring_channels_; c++)
 			{
 				const float xm1 = history_[0][c];
 				const float x0 = history_[1][c];
@@ -982,9 +1078,14 @@ private:
 				const float c1 = 0.5f * (x1 - xm1);
 				const float c2 = xm1 - 2.5f * x0 + 2.0f * x1 - 0.5f * x2;
 				const float c3 = 0.5f * (x2 - xm1) + 1.5f * (x0 - x1);
-				frame[c] = (((c3 * t + c2) * t + c1) * t + x0) * gain;
+				value[c] = (((c3 * t + c2) * t + c1) * t + x0) * gain;
 			}
-			applyOutputChannelMode(frame, 1, channels_, mode);
+			applyOutputChannelMode(value, 1, ring_channels_, mode);
+			float* frame = out + static_cast<size_t>(produced) * channels_;
+			if (channels_ == ring_channels_)
+				std::memcpy(frame, value, channels_ * sizeof(float));
+			else
+				frame[0] = 0.5f * (value[0] + value[1]);	// Mono device: its stereo ring folded down, after the channel mode
 			frac_ += ratio_;
 		}
 
@@ -1010,8 +1111,10 @@ private:
 			if (shift > 0)
 			{
 				// Silence not played yet goes first, then queued audio.
-				const UINT32 from_hold = static_cast<UINT64>(shift) < hold_frames_ ? static_cast<UINT32>(shift) : hold_frames_;
-				hold_frames_ -= from_hold;
+				const UINT32 hold_queued = holdQueued();
+				const UINT32 from_hold = static_cast<UINT64>(shift) < hold_queued ? static_cast<UINT32>(shift) : hold_queued;
+				const UINT32 from_hold_frames = static_cast<UINT32>(from_hold / nominal + 0.5);
+				hold_frames_ -= (from_hold_frames < hold_frames_) ? from_hold_frames : hold_frames_;
 				const UINT64 rest = static_cast<UINT64>(shift) - from_hold;
 				if (rest > 0)
 				{
@@ -1021,7 +1124,7 @@ private:
 			}
 			else if (shift < 0)
 			{
-				hold_frames_ += static_cast<UINT32>(-shift);
+				hold_frames_ += static_cast<UINT32>(static_cast<double>(-shift) / nominal + 0.5);
 			}
 			fill_avg_ -= static_cast<double>(shift);	// Re-seeded instead if resetResampler() ran
 			error_avg_ = 0.0;
@@ -1064,7 +1167,8 @@ private:
 	std::vector<float> ring_;
 	std::atomic<UINT32> write_pos_{ 0 };   // Written by the audio thread only
 	std::atomic<UINT32> read_pos_{ 0 };    // Written by the render thread only
-	std::atomic<UINT32> active_format_{ 0 };  // Format (device channels, rate) the ring and the device are set up for, 0 = none
+	std::atomic<UINT32> active_format_{ 0 };  // Format (ring channels, processing rate) the ring is set up for, 0 = none
+	std::atomic<bool> writing_{ false };      // write() is copying into the ring (see tryResetRing())
 	std::atomic<UINT32> pending_rate_{ 0 };   // Rate the audio thread is producing
 	std::atomic<LONGLONG> last_write_qpc_{ 0 }; // QPC of the last block queued by the audio thread, stored before write_pos_
 	double qpc_freq_ = 1.0;                     // QueryPerformanceFrequency(), set once in the constructor
@@ -1077,10 +1181,18 @@ private:
 	IMMDevice* device_ = nullptr;
 	IAudioClient* client_ = nullptr;
 	IAudioRenderClient* render_ = nullptr;
-	UINT32 open_rate_ = 0;
 	UINT32 buffer_frames_ = 0;
-	UINT32 channels_ = 0;
-	UINT32 sample_rate_ = 0;
+	UINT32 channels_ = 0;			// The device's (its mix format's, at most kMaxChannels)
+	UINT32 ring_channels_ = 2;		// The ring's: the device's, or 2 for a mono device
+	UINT32 sample_rate_ = 0;		// The device's mix rate
+	UINT32 ring_rate_ = 0;			// Processing rate the ring is set up (or being set up) for
+	UINT32 play_rate_ = 0;			// Processing rate of the audio in the ring now, 0 = none yet
+	bool ring_reset_pending_ = false;	// The ring is to be emptied for ring_rate_ (tryResetRing())
+	bool lowpass_ = false;			// The device is slower than the processing rate: anti-alias filter (setUpLowPass())
+	float lowpass_b0_[2] = {};
+	float lowpass_a1_[2] = {};
+	float lowpass_a2_[2] = {};
+	float lowpass_state_[2][2][kMaxChannels] = {};
 	bool running_ = false;
 	bool primed_ = false;
 	DWORD idle_since_ = 0;
@@ -1141,8 +1253,21 @@ void applyOutputChannelMode(float* buffer, UINT32 frames, UINT32 channels, Outpu
 		else
 			value = 0.5f * (left + right);
 
+		// BetterFxSound: only front left and front right play it, as when a stereo stream was upmixed by Windows. Every
+		// channel used to get it, so the LFE (a subwoofer) got the full-band signal at 0 dB, and the center and the
+		// surrounds played it too.
 		for (UINT32 c = 0; c < channels; c++)
-			frame[c] = value;
+		{
+			bool front;
+			if (channels > kRoleMaxChannels)
+				front = (c < 2);
+			else
+			{
+				const ChannelRole role = channelRole(channels, c);
+				front = (role == kRoleLeft || role == kRoleRight);
+			}
+			frame[c] = front ? value : 0.0f;
+		}
 	}
 }
 

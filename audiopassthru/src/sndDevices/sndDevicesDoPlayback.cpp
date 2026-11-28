@@ -114,6 +114,52 @@ static void sndDevicesCarrierLowPass(struct sndDevicesHdlType *cast_handle, UINT
 }
 
 /*
+ * FUNCTION: sndDevicesCarrierMapFrame()
+ * DESCRIPTION: BetterFxSound. One frame of the processing format (numProcessingChannels) to the carrier's channels
+ * (numPlaybackChannels, a different count), by channel role. The processing format is stereo, quad, 5.1 (front left,
+ * front right, center, LFE, side left, side right) or 7.1 (5.1 then the other surround pair); see
+ * sndDevicesImplementDeviceRules(). A mono carrier gets the average of left and right. A 5.0 carrier (5 channels) gets
+ * 5.1 and a 7.0 one 7.1 without the LFE; a 3 channel one (front left, front right, center) gets the fronts and the
+ * center, with the surrounds folded into the fronts at -3 dB. Any other carrier gets the first channels and silence
+ * on the others (more than 8: the first 8).
+ */
+static void sndDevicesCarrierMapFrame(const float *frame, int numProcessingChannels, float *out, int numPlaybackChannels)
+{
+	int c;
+
+	if( numPlaybackChannels == 1 )
+	{
+		out[0] = (numProcessingChannels >= 2) ? 0.5f * (frame[0] + frame[1]) : frame[0];
+		return;
+	}
+
+	if( ((numProcessingChannels == 6) || (numProcessingChannels == 8)) && (numPlaybackChannels == numProcessingChannels - 1) )
+	{
+		for(c=0; c<numPlaybackChannels; c++)
+			out[c] = frame[(c < 3) ? c : c + 1];
+		return;
+	}
+
+	if( ((numProcessingChannels == 6) || (numProcessingChannels == 8)) && (numPlaybackChannels == 3) )
+	{
+		float surroundLeft = 0.0f;
+		float surroundRight = 0.0f;
+		for(c=4; c+1<numProcessingChannels; c+=2)
+		{
+			surroundLeft += frame[c];
+			surroundRight += frame[c + 1];
+		}
+		out[0] = frame[0] + 0.70710678f * surroundLeft;
+		out[1] = frame[1] + 0.70710678f * surroundRight;
+		out[2] = frame[2];
+		return;
+	}
+
+	for(c=0; c<numPlaybackChannels; c++)
+		out[c] = (c < numProcessingChannels) ? frame[c] : 0.0f;
+}
+
+/*
  * FUNCTION: sndDevicesCarrierFrame()
  * DESCRIPTION: BetterFxSound. Frame j (-3 to capturedFramesCount - 1) of the block being played on the carrier: from
  * -3 to -1 the last frames of the previous block. In the processing format (numProcessingChannels).
@@ -137,8 +183,8 @@ static const float *sndDevicesCarrierFrame(struct sndDevicesHdlType *cast_handle
  * sndDevicesDoCapture() stopped queues the audio until it starts again; a backlog written to it is cut to the setpoint.
  * The rate ratio is the exact one: a carrier at a rate that is no whole multiple of the capture's (32, 22.05, 64 kHz)
  * used to be fed the captured frames at a whole-number ratio, 0 forced to 1, so it played at the wrong speed and
- * pitch. The block is in the processing format and is mapped here to the carrier's channels: a mono carrier gets the
- * average of left and right, a carrier with more than 8 channels gets the first 8 and silence on the others.
+ * pitch. The block is in the processing format and is mapped here to the carrier's channels by channel role
+ * (sndDevicesCarrierMapFrame()).
  */
 int PT_DECLSPEC sndDevicesDoPlayback(PT_HANDLE *hp_sndDevices, int *ip_resultFlag)
 {
@@ -297,17 +343,9 @@ int PT_DECLSPEC sndDevicesDoPlayback(PT_HANDLE *hp_sndDevices, int *ip_resultFla
 						out[c] = ((c3 * t + c2) * t + c1) * t + x0;
 					}
 
-					// BetterFxSound: to the carrier's own channels (see above).
+					// BetterFxSound: to the carrier's own channels (sndDevicesCarrierMapFrame()).
 					if( numPlaybackChannels != numProcessingChannels )
-					{
-						if( numPlaybackChannels == 1 )
-							fptr[0] = (numProcessingChannels >= 2) ? 0.5f * (frame[0] + frame[1]) : frame[0];
-						else
-						{
-							for(c=0; c<numPlaybackChannels; c++)
-								fptr[c] = (c < numProcessingChannels) ? frame[c] : 0.0f;
-						}
-					}
+						sndDevicesCarrierMapFrame(frame, numProcessingChannels, fptr, numPlaybackChannels);
 					fptr += numPlaybackChannels;
 				}
 			}

@@ -72,6 +72,13 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #define SND_DEVICES_TAIL_GAP_MS					30
 
 /*
+ * BetterFxSound: ... and only once the carrier has less than this much left to play (it is about to run dry). Its queue
+ * is held at about half the capture buffer, so a shorter hiccup in the loopback (the audio engine or a driver late by
+ * 30 to 80 ms) is still covered by the queue, and no silence is put in front of the late audio.
+ */
+#define SND_DEVICES_TAIL_QUEUE_MS				10
+
+/*
  * FUNCTION: sndDevicesCaptureChannelSource()
  * DESCRIPTION: BetterFxSound. The capture channel that processing channel p is taken from, -1 for silence. The
  * capture is stereo, 5.1 (front left, front right, center, LFE, surround left, surround right) or 7.1 (5.1 then side
@@ -475,15 +482,24 @@ int PT_DECLSPEC sndDevicesDoCapture(PT_HANDLE *hp_sndDevices, float **fpp_buffer
 			// time; up to what the line holds. It used to stay there, cut from the end of the sound, and played before
 			// the next one. The silence is for the carrier only: it is not processed nor given to the additional
 			// outputs (capturedBlockIsSilenceFill), and it is not captured audio for the pacing above.
+			// BetterFxSound: the silence starts once the carrier is about to run dry (SND_DEVICES_TAIL_QUEUE_MS), and is
+			// counted from then (carrierTailSilenceQpc), so it only replaces what the carrier's queue could not cover: a
+			// hiccup shorter than the queue no longer puts silence in front of the late audio, which made the carrier
+			// drop that much and stay late against the additional outputs.
 			LARGE_INTEGER qpcGap;
 			QueryPerformanceCounter(&qpcGap);
-			if( (qpcGap.QuadPart - cast_handle->lastCapturePacketQpc) >= (cast_handle->qpcFrequency * SND_DEVICES_TAIL_GAP_MS) / 1000 )
+			if( (cast_handle->carrierTailSilenceQpc <= cast_handle->lastCapturePacketQpc) &&
+				((qpcGap.QuadPart - cast_handle->lastCapturePacketQpc) >= (cast_handle->qpcFrequency * SND_DEVICES_TAIL_GAP_MS) / 1000) &&
+				((UINT64)numFramesQueuedUpToPlayReferencedToCapture * 1000 < (UINT64)cast_handle->wfxCapture.nSamplesPerSec * SND_DEVICES_TAIL_QUEUE_MS) )
+			{
+				// This pause's silence starts now.
+				cast_handle->carrierTailSilenceQpc = qpcGap.QuadPart;
+			}
+			if( cast_handle->carrierTailSilenceQpc > cast_handle->lastCapturePacketQpc )
 			{
 				LONGLONG silenceFrom = cast_handle->carrierTailSilenceQpc;
 				double gapFrames;
 				UINT32 silenceFrames = 0;
-				if( silenceFrom < cast_handle->lastCapturePacketQpc )
-					silenceFrom = cast_handle->lastCapturePacketQpc;
 				gapFrames = (double)(qpcGap.QuadPart - silenceFrom) * (double)cast_handle->wfxCapture.nSamplesPerSec / (double)cast_handle->qpcFrequency;
 				if( gapFrames >= 1.0 )
 					silenceFrames = (gapFrames < (double)maxCaptureFrames) ? (UINT32)gapFrames : maxCaptureFrames;

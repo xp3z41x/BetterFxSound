@@ -480,13 +480,20 @@ PlaybackDeviceIsSelected:  // Label to jump to when the playback device num has 
 		cast_handle->wfxDfxProcessing.nChannels = SND_DEVICES_MIN_NUM_CHANS;
 	if( cast_handle->wfxDfxProcessing.nChannels > SND_DEVICES_MAX_NUM_CHANS )
 		cast_handle->wfxDfxProcessing.nChannels = SND_DEVICES_MAX_NUM_CHANS;
+	// BetterFxSound: the DSP processes 1, 2, 4, 6 or 8 channels only (its effects and the equalizer were silently
+	// bypassed for 3, 5 or 7). A 3 or 5 channel carrier is processed as 5.1 and a 7 channel one as 7.1, the capture's
+	// own layouts (see below); sndDevicesDoPlayback() maps them to the carrier by channel role.
+	if( (cast_handle->wfxDfxProcessing.nChannels == 3) || (cast_handle->wfxDfxProcessing.nChannels == 5) )
+		cast_handle->wfxDfxProcessing.nChannels = 6;
+	else if( cast_handle->wfxDfxProcessing.nChannels == 7 )
+		cast_handle->wfxDfxProcessing.nChannels = 8;
 	cast_handle->wfxDfxProcessing.nBlockAlign = (WORD)(cast_handle->wfxDfxProcessing.nChannels * (cast_handle->wfxDfxProcessing.wBitsPerSample / 8));
 
 	/*
 	* BetterFxSound: the virtual device takes stereo, 5.1 or 7.1 only (the channel masks of
 	* sndDevicesSetDfxDeviceSampleRateAndChannels()). 3 and 5 channels are captured as 5.1 and 7 as 7.1: they were asked
 	* for as such with a 7.1 mask, which failed the reinit until some device event. sndDevicesDoCapture() picks the
-	* processing format's channels out of the capture.
+	* processing format's channels out of the capture (the same layout, except quad).
 	*/
 	numCaptureChannels = cast_handle->wfxDfxProcessing.nChannels;
 	if( numCaptureChannels <= 2 )
