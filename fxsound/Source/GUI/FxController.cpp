@@ -1640,6 +1640,22 @@ static String findEngineCarrierId(const std::vector<SoundDevice>& sound_devices)
 	return {};
 }
 
+// BetterFxSound: true while the engine processes with the FxSound virtual device as the Windows default and a
+// usable carrier. There setAsPlaybackDevice() only stops the capture loop for a reinit (harmless if one is already
+// on its way); otherwise it makes the device the Windows default.
+static bool isEngineSwitchingInPlace(AudioPassthru* audio_passthru, const std::vector<SoundDevice>& sound_devices)
+{
+	if (!audio_passthru->isPlaybackDeviceAvailable())
+		return false;
+
+	for (auto& sound_device : sound_devices)
+	{
+		if (sound_device.isDFXDevice)
+			return sound_device.isDefaultDevice;
+	}
+	return false;
+}
+
 // Handled when FxSound processing is on, after every reinit of the engine and when the HDMI wait ends.
 void FxController::updateOutputs(std::vector<SoundDevice>& sound_devices, const StringArray& new_device_ids)
 {
@@ -1657,16 +1673,21 @@ void FxController::updateOutputs(std::vector<SoundDevice>& sound_devices, const 
 		failed_carrier_ids_.clear();
 	}
 
-	// The carrier the engine is using after this reinit.
+	// The carrier the engine is using after this reinit, and the one before it (the requested one while a
+	// switch is pending, see requestCarrier()).
 	String engine_carrier_id = findEngineCarrierId(sound_devices);
+	const String previous_carrier_id = carrier_id_;
+
+	// BetterFxSound: the carrier to keep when electing below; empty elects by priority.
+	String keep_carrier_id;
 
 	if (requested_carrier_id_.isNotEmpty())
 	{
 		// A switch asked for with setAsPlaybackDevice(). BetterFxSound: the engine's device rules can choose
-		// another device for this reinit (a device was added or removed, one just arrived and Windows made it the
-		// default, the reinit found no carrier): then it is simply asked for again below. Only a switch missed
-		// MAX_CARRIER_MISSES times in a row with none of these reasons is given up on until the devices change,
-		// so this can't loop.
+		// another device for this reinit (a device was added or removed, or one just arrived and Windows made it
+		// the default): then it is asked for again below. Only those reasons are finite; any other miss (the
+		// reinit found no carrier included) is counted, and a switch missed MAX_CARRIER_MISSES times in a row is
+		// given up on until the devices change, so this can't loop.
 		if (engine_carrier_id == requested_carrier_id_)
 		{
 			missed_carrier_id_.clear();
@@ -1674,8 +1695,13 @@ void FxController::updateOutputs(std::vector<SoundDevice>& sound_devices, const 
 		}
 		else if (findActiveOutput(requested_carrier_id_) != nullptr)
 		{
-			const bool engine_rules_reason = list_changed || engine_carrier_id.isEmpty() || isRecentOutputArrival(engine_carrier_id);
-			if (!engine_rules_reason)
+			const bool engine_rules_reason = list_changed || isRecentOutputArrival(engine_carrier_id);
+			if (engine_rules_reason)
+			{
+				if (!failed_carrier_ids_.contains(requested_carrier_id_))
+					keep_carrier_id = requested_carrier_id_;
+			}
+			else
 			{
 				if (missed_carrier_id_ == requested_carrier_id_)
 				{
@@ -1690,6 +1716,8 @@ void FxController::updateOutputs(std::vector<SoundDevice>& sound_devices, const 
 
 			if (missed_carrier_id_ == requested_carrier_id_ && missed_carrier_count_ >= MAX_CARRIER_MISSES)
 			{
+				// No longer a carrier candidate. This reinit dropped the engine's pending switch, so the device still
+				// plays as an additional output while it is enabled (also when it is the only one).
 				logMessage("Output switch not taken by the audio engine: " + requested_carrier_id_);
 				failed_carrier_ids_.addIfNotAlreadyThere(requested_carrier_id_);
 				missed_carrier_id_.clear();
@@ -1698,6 +1726,8 @@ void FxController::updateOutputs(std::vector<SoundDevice>& sound_devices, const 
 			else
 			{
 				logMessage("Output switch not taken by the audio engine this time: " + requested_carrier_id_);
+				if (!failed_carrier_ids_.contains(requested_carrier_id_))
+					keep_carrier_id = requested_carrier_id_;
 			}
 		}
 		requested_carrier_id_.clear();
@@ -1723,6 +1753,8 @@ void FxController::updateOutputs(std::vector<SoundDevice>& sound_devices, const 
 				saveOutputSettings();
 				outputs_changed = true;
 			}
+			// The user's choice: it stays the carrier, whatever its priority.
+			keep_carrier_id = engine_carrier_id;
 		}
 	}
 
@@ -1788,9 +1820,17 @@ void FxController::updateOutputs(std::vector<SoundDevice>& sound_devices, const 
 		return;
 	}
 
-	// Zero enabled outputs is fine here: the carrier plays silence and processing goes on. BetterFxSound: the
-	// engine's carrier stays while it is still an enabled output (see electCarrier()).
-	applyCarrier(returned_carrier_id.isNotEmpty() ? returned_carrier_id : carrier_id_);
+	// Zero enabled outputs is fine here: the carrier plays silence and processing goes on. BetterFxSound: kept
+	// (see electCarrier()) are HDMI back in time, a switch the engine's rules got in the way of (asked for
+	// again), and a device the user made the Windows default. Otherwise the carrier stays only when this reinit
+	// neither changed the devices nor moved the carrier, so a turned-on output does not cost a reinit (see
+	// setOutputEnabled()). After a device change, or a carrier the engine's rules took on their own (a device just
+	// added), the election is by priority: the same devices always give the same carrier.
+	if (returned_carrier_id.isNotEmpty())
+		keep_carrier_id = returned_carrier_id;
+	else if (keep_carrier_id.isEmpty() && !list_changed && engine_carrier_id == previous_carrier_id)
+		keep_carrier_id = engine_carrier_id;
+	applyCarrier(keep_carrier_id);
 
 	if (outputs_changed)
 	{
@@ -2331,29 +2371,56 @@ void FxController::timerCallback()
 		// request). The engine's stop request can be lost (a new processing thread starting just after it), and
 		// then nothing else would ever switch: the new carrier stays silent while shown as playing. With no
 		// reinit after CARRIER_REQUEST_TIMEOUT ticks, ask again; after MAX_CARRIER_REQUEST_RETRIES, give up on
-		// that device until the devices change and elect again from what the engine actually plays.
+		// that device until the devices change and elect again from what the engine actually plays. Only while
+		// the engine processes (see isEngineSwitchingInPlace()): otherwise asking again would set the Windows
+		// default device each time, and the engine's own next reinit settles the request anyway.
 		if (!system_sleeping_ && requested_carrier_id_.isNotEmpty() && ++carrier_request_ticks_ >= CARRIER_REQUEST_TIMEOUT)
 		{
 			carrier_request_ticks_ = 0;
-			auto* device = findActiveOutput(requested_carrier_id_);
-			if (device != nullptr && carrier_request_retries_ < MAX_CARRIER_REQUEST_RETRIES)
+			auto sound_devices = audio_passthru_->getSoundDevices(true);
+			if (isEngineSwitchingInPlace(audio_passthru_, sound_devices))
 			{
-				carrier_request_retries_++;
-				logMessage("Output switch still pending, asking the audio engine again: " + requested_carrier_id_);
-				audio_passthru_->setAsPlaybackDevice(*device);
-			}
-			else
-			{
-				logMessage("Output switch never taken by the audio engine: " + requested_carrier_id_);
-				if (device != nullptr)
-					failed_carrier_ids_.addIfNotAlreadyThere(requested_carrier_id_);
-				requested_carrier_id_.clear();
-				carrier_request_retries_ = 0;
+				const String engine_carrier_id = findEngineCarrierId(sound_devices);
+				auto* device = findActiveOutput(requested_carrier_id_);
+				if (device != nullptr && carrier_request_retries_ < MAX_CARRIER_REQUEST_RETRIES)
+				{
+					carrier_request_retries_++;
+					logMessage("Output switch still pending, asking the audio engine again: " + requested_carrier_id_);
+					audio_passthru_->setAsPlaybackDevice(*device);
+				}
+				else
+				{
+					logMessage("Output switch never taken by the audio engine: " + requested_carrier_id_);
+					const String given_up_id = requested_carrier_id_;
+					requested_carrier_id_.clear();
+					carrier_request_retries_ = 0;
+					// The engine's own carrier is never a failed one (a lost request to keep it, see below).
+					if (device != nullptr && given_up_id != engine_carrier_id)
+						failed_carrier_ids_.addIfNotAlreadyThere(given_up_id);
 
-				auto sound_devices = audio_passthru_->getSoundDevices(true);
-				carrier_id_ = findEngineCarrierId(sound_devices);
-				if (!hdmi_reconnect_pending_ && !active_output_devices_.empty())
-					applyCarrier(carrier_id_);
+					carrier_id_ = engine_carrier_id;
+					if (!hdmi_reconnect_pending_ && !active_output_devices_.empty())
+					{
+						// By priority, the failed device left out.
+						applyCarrier(String());
+
+						// The engine keeps the given-up switch pending, and so that device out of the additional
+						// outputs and named in the registry as the one to take, until its next reinit. When the
+						// election keeps the engine's carrier there is no new switch to replace it: ask for the
+						// engine's carrier, so a reinit drops it and the device, if enabled, plays as an
+						// additional output (also when it is the only enabled one).
+						if (requested_carrier_id_.isEmpty() && given_up_id != carrier_id_)
+						{
+							if (auto* engine_carrier = findActiveOutput(carrier_id_))
+							{
+								audio_passthru_->setAsPlaybackDevice(*engine_carrier);
+								requested_carrier_id_ = carrier_id_;
+								carrier_request_ticks_ = 0;
+								carrier_request_retries_ = 0;
+							}
+						}
+					}
+				}
 			}
 		}
 	}
@@ -3735,6 +3802,8 @@ SoundDevice FxController::electCarrier(const String& keep_id)
 	// Owner's decision: no enabled output is connected (none enabled, or the enabled ones are unplugged)
 	// means silence with a notice in the UI, never a fallback to another device. The carrier stays where
 	// the engine put it, so there is no new switch request and nothing can loop: it only plays silence.
+	// BetterFxSound: enabled outputs the engine failed to take as the carrier (failed_carrier_ids_) are not
+	// candidates either, but they still play as additional outputs.
 	if (!no_enabled_output_present_)
 	{
 		no_enabled_output_present_ = true;
@@ -3743,6 +3812,16 @@ SoundDevice FxController::electCarrier(const String& keep_id)
 
 	if (auto* current = findActiveOutput(carrier_id_))
 		return *current;
+
+	// BetterFxSound: the preferred device, but not one the engine already failed to take (it would be asked for
+	// again and again).
+	auto devices = active_output_devices_;
+	sortByDeviceConfigPriority(devices);
+	for (auto& device : devices)
+	{
+		if (!failed_carrier_ids_.contains(String(device.pwszID.c_str())))
+			return device;
+	}
 
 	return getPreferredOutput();
 }
