@@ -254,6 +254,7 @@ struct sndDevicesVirtualDefaultWork
 {
 	struct sndDevicesHdlType *cast_handle;
 	LONG sequence;
+	LONG guardEpoch;	// virtualDefaultGuardEpoch when the notification came, see there.
 	wchar_t pickedID[PT_MAX_GENERIC_STRLEN];
 	wchar_t dfxID[PT_MAX_GENERIC_STRLEN];
 };
@@ -285,7 +286,9 @@ static DWORD WINAPI sndDevicesVirtualDefaultWorker(LPVOID pv_work)
 	{
 		std::lock_guard<std::mutex> lock(cast_handle->virtualDefaultMutex);
 
-		if (cast_handle->virtualDefaultGuardArmed)
+		// BetterFxSound: and only for the arming the notification came in: a late item must neither change the default
+		// nor record its pick once the reinit it caused has run (see virtualDefaultGuardEpoch).
+		if (cast_handle->virtualDefaultGuardArmed && (work->guardEpoch == cast_handle->virtualDefaultGuardEpoch.load()))
 		{
 			hr = CoCreateInstance(__uuidof(CPolicyConfigVistaClient), NULL, CLSCTX_ALL, __uuidof(IPolicyConfigVista), (LPVOID *)&pPolicyConfig);
 			if (SUCCEEDED(hr) && (pPolicyConfig != NULL))
@@ -312,7 +315,7 @@ static DWORD WINAPI sndDevicesVirtualDefaultWorker(LPVOID pv_work)
 }
 
 // Queues sndDevicesVirtualDefaultWorker() for a real device made the default. Cheap, nothing blocks.
-static void sndDevicesQueueVirtualDefault(struct sndDevicesHdlType *cast_handle, LPCWSTR pwstrDeviceId)
+static void sndDevicesQueueVirtualDefault(struct sndDevicesHdlType *cast_handle, LPCWSTR pwstrDeviceId, LONG guardEpoch)
 {
 	sndDevicesVirtualDefaultWork *work;
 
@@ -325,6 +328,7 @@ static void sndDevicesQueueVirtualDefault(struct sndDevicesHdlType *cast_handle,
 
 	work->cast_handle = cast_handle;
 	work->sequence = InterlockedIncrement(&(cast_handle->defaultPickSequence));
+	work->guardEpoch = guardEpoch;
 	wcsncpy_s(work->pickedID, PT_MAX_GENERIC_STRLEN, pwstrDeviceId, _TRUNCATE);
 	wcsncpy_s(work->dfxID, PT_MAX_GENERIC_STRLEN, cast_handle->dfxDeviceID, _TRUNCATE);
 
@@ -376,11 +380,15 @@ HRESULT STDMETHODCALLTYPE CsndDevicesMMNotificationClient::OnDefaultDeviceChange
 	  //if (sndDevicesSetDeviceType(g_sndDevicesCallbacks_hdl, SND_DEVICES_DEFAULT, &temp_string[0], &i_resultFlag) != OKAY)
 		//  return(NOT_OKAY);
 
+	  // BetterFxSound: the guard's arming is read before the stop below, so it cannot be a later arming, made after the
+	  // reinit that this stop causes (see virtualDefaultGuardEpoch).
+	  const LONG guardEpoch = cast_handle->virtualDefaultGuardEpoch.load();
+
 	  InterlockedExchange(&(cast_handle->stopAudioCaptureAndPlaybackLoop), 1);
 
 	  // BetterFxSound: while the processing runs, the virtual device is put back as the default at once (it held every
 	  // app's sound on that device, unprocessed and at 100%, until the reinit did it).
-	  sndDevicesQueueVirtualDefault(cast_handle, pwstrDeviceId);
+	  sndDevicesQueueVirtualDefault(cast_handle, pwstrDeviceId, guardEpoch);
   }
 
   // Ignore the notification for the device selected in the application.

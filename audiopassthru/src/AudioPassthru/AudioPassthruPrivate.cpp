@@ -1179,6 +1179,16 @@ void AudioPassthruPrivate::setOutputs(const std::vector<OutputConfig>& outputs)
 	/* BetterFxSound: the controller elects the carrier from here on, the device rules no longer pick a new device */
 	s_sndDevices_.outputsAreManaged = TRUE;
 	applyAdditionalOutputs();
+
+	/* BetterFxSound: the devices of the enabled outputs, which the engine holds at 100% while processing: the
+	   communications default is moved to the virtual device only when it is one of them (sndDevicesSetDrivenOutputs()) */
+	std::vector<std::wstring> driven_ids;
+	for (const auto& output : outputs)
+	{
+		if (output.enabled && !output.device_id.empty())
+			driven_ids.push_back(output.device_id);
+	}
+	sndDevicesSetDrivenOutputs(hp_sndDevices_, driven_ids);
 }
 
 /*

@@ -27,6 +27,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include <endpointvolume.h>
 #include <atomic>
 #include <mutex>
+#include <string>
+#include <vector>
 #include "slout.h"
 
 #define PT_MAX_GENERIC_STRLEN          512
@@ -543,6 +545,16 @@ struct sndDevicesHdlType {
 	wchar_t pickedDefaultID[PT_MAX_GENERIC_STRLEN];
 	LONG pickedDefaultSequence;			// Sequence of the notification pickedDefaultID came from.
 	volatile LONG defaultPickSequence;	// Counts the notifications that queued the worker.
+	// BetterFxSound: incremented under virtualDefaultMutex each time the guard is armed or disarmed. A work item queued
+	// while the guard was armed acts only if it is still the same arming: one that ran late, after the reinit that the
+	// same notification caused had already taken the device picked and armed the guard again, recorded a stale pick that
+	// the next, unrelated reinit then took for the Windows default the user had just chosen.
+	std::atomic<LONG> virtualDefaultGuardEpoch;
+	// BetterFxSound: the devices of the enabled outputs (carrier included), as passed to AudioPassthru::setOutputs(). While
+	// FxSound processes, the engine holds these devices at 100% and unmuted; the communications default is moved to the
+	// virtual device only when it is one of them (sndDevicesSetCommunicationsDefault()). Under drivenOutputsMutex.
+	std::mutex drivenOutputsMutex;
+	std::vector<std::wstring> drivenOutputIDs;
 	// BetterFxSound: the last level and mute this app set on the playback device, and when (GetTickCount()). Some
 	// drivers (Bluetooth with absolute volume) report such a change back a second time, without this app's event
 	// context; the playback volume callback must not take that for the user's own setting.
@@ -649,6 +661,7 @@ int PT_DECLSPEC sndDevicesSetIconFileName(PT_HANDLE *, int, wchar_t *, int *);
 int PT_DECLSPEC sndDevicesSetDeviceName(PT_HANDLE *, int, wchar_t *, int *);
 int PT_DECLSPEC sndDevicesSetDefaultDeviceSelectionMode(PT_HANDLE *, int);
 int PT_DECLSPEC sndDevicesSetVirtualDefaultGuard(PT_HANDLE *, BOOL);
+int PT_DECLSPEC sndDevicesSetDrivenOutputs(PT_HANDLE *, const std::vector<std::wstring> &);
 int PT_DECLSPEC sndDevicesSetDeviceEnabledStatus(PT_HANDLE *, int, BOOL, int *);
 int PT_DECLSPEC sndDevicesSetDeviceEnabledStatusFromGuid(PT_HANDLE *, wchar_t *, BOOL, int *);
 int PT_DECLSPEC sndDevicesSetDfxDeviceSampleRateAndChannels(PT_HANDLE *, int, int, int *);

@@ -198,7 +198,7 @@ int PT_DECLSPEC sndDevicesReInit(PT_HANDLE *hp_sndDevices, int i_initType, int *
 					const BOOL muteChanged = ((cast_handle->savedPlaybackMute != FALSE) != (cast_handle->handedBackPlaybackMute != FALSE)) ? TRUE : FALSE;
 					const float levelDiff = cast_handle->savedPlaybackLevel - cast_handle->handedBackPlaybackLevel;
 					const BOOL levelChanged = (cast_handle->savedPlaybackLevelIsSaved && cast_handle->handedBackPlaybackLevelIsSaved &&
-						((levelDiff > 0.005f) || (levelDiff < -0.005f))) ? TRUE : FALSE;
+						((levelDiff > 0.015f) || (levelDiff < -0.015f))) ? TRUE : FALSE;	// Below one volume key step (2%).
 
 					if( muteChanged || levelChanged )
 					{

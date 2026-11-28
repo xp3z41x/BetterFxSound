@@ -147,6 +147,7 @@ int PT_DECLSPEC sndDevicesInit(PT_HANDLE *hp_sndDevices, CSlout *hp_slout, int i
 		cast_handle->virtualDefaultGuardHint = FALSE;
 		wcscpy(cast_handle->pickedDefaultID, L"");
 		cast_handle->pickedDefaultSequence = 0;
+		cast_handle->virtualDefaultGuardEpoch++;
 	}
 	InterlockedExchange(&(cast_handle->defaultPickSequence), 0);
 

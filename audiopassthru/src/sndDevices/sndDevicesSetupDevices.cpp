@@ -234,9 +234,12 @@ int PT_DECLSPEC sndDevicesFinalSetupCaptureDevice(PT_HANDLE *hp_sndDevices, int 
  * BetterFxSound: if the device is no longer present, its setting stays owed (OwedVolume.h, with the latest own
  * setting known here) and goes back on the device when it is next seen while the engine does not use it, or is
  * saved from there if the device becomes the carrier again. Once it is put back, nothing is owed any more.
- * BetterFxSound: returns TRUE when the setting was put back on the device.
+ * BetterFxSound: returns TRUE when the setting was put back on the device. Then, if fp_heldLevel is not NULL, the level
+ * and mute the device actually holds afterwards are read back into fp_heldLevel/bp_heldLevelIsRead/bp_heldMute: a driver
+ * with stepped volume (hardware dB steps, Bluetooth absolute volume) stores the nearest step, not the level asked for.
  */
-static BOOL sndDevices_RestoreSavedPlaybackDeviceSettings(struct sndDevicesHdlType *cast_handle)
+static BOOL sndDevices_RestoreSavedPlaybackDeviceSettings(struct sndDevicesHdlType *cast_handle, float *fp_heldLevel = NULL,
+	BOOL *bp_heldLevelIsRead = NULL, BOOL *bp_heldMute = NULL)
 {
 	IMMDevice *pDevice = NULL;
 	IAudioEndpointVolume *pEndptVol = NULL;
@@ -272,6 +275,25 @@ static BOOL sndDevices_RestoreSavedPlaybackDeviceSettings(struct sndDevicesHdlTy
 			hr = pEndptVol->SetMute(cast_handle->savedPlaybackMute, &(cast_handle->guidThisApplication));
 
 			restored = SUCCEEDED(hrLevel) && SUCCEEDED(hr);
+
+			// BetterFxSound: what the device holds now, see the description.
+			if( restored && (fp_heldLevel != NULL) && (bp_heldLevelIsRead != NULL) && (bp_heldMute != NULL) )
+			{
+				float heldLevel = 0.0f;
+				BOOL heldMute = FALSE;
+
+				*fp_heldLevel = cast_handle->savedPlaybackLevel;
+				*bp_heldLevelIsRead = cast_handle->savedPlaybackLevelIsSaved;
+				*bp_heldMute = cast_handle->savedPlaybackMute;
+
+				if( SUCCEEDED(pEndptVol->GetMasterVolumeLevelScalar(&heldLevel)) )
+				{
+					*fp_heldLevel = heldLevel;
+					*bp_heldLevelIsRead = TRUE;
+				}
+				if( SUCCEEDED(pEndptVol->GetMute(&heldMute)) )
+					*bp_heldMute = heldMute;
+			}
 
 			pEndptVol->Release();
 		}
@@ -635,17 +657,20 @@ int PT_DECLSPEC sndDevicesRestoreDefaultDevice(PT_HANDLE *hp_sndDevices, int *ip
 		std::lock_guard<std::mutex> lock(cast_handle->virtualDefaultMutex);
 		cast_handle->virtualDefaultGuardArmed = FALSE;
 		cast_handle->virtualDefaultGuardHint = FALSE;
+		cast_handle->virtualDefaultGuardEpoch++;
 		cast_handle->pickedDefaultID[0] = L'\0';
 	}
 	{
 		const BOOL settingIsSaved = cast_handle->playbackSettingsAreSaved;
 		wchar_t handedBackID[PT_MAX_GENERIC_STRLEN];
-		const BOOL handedBackMute = cast_handle->savedPlaybackMute;
-		const float handedBackLevel = cast_handle->savedPlaybackLevel;
-		const BOOL handedBackLevelIsSaved = cast_handle->savedPlaybackLevelIsSaved;
+		// BetterFxSound: what the device holds after the hand-back, read back from it (a stepped driver stores the nearest
+		// step, which the next reinit must not take for a change the user made while FxSound was off).
+		BOOL handedBackMute = cast_handle->savedPlaybackMute;
+		float handedBackLevel = cast_handle->savedPlaybackLevel;
+		BOOL handedBackLevelIsSaved = cast_handle->savedPlaybackLevelIsSaved;
 		wcscpy_s(handedBackID, PT_MAX_GENERIC_STRLEN, cast_handle->savedPlaybackDeviceID);
 
-		if( settingIsSaved && sndDevices_RestoreSavedPlaybackDeviceSettings(cast_handle) )
+		if( settingIsSaved && sndDevices_RestoreSavedPlaybackDeviceSettings(cast_handle, &handedBackLevel, &handedBackLevelIsSaved, &handedBackMute) )
 		{
 			cast_handle->playbackSettingsAreSaved = FALSE;
 			cast_handle->playbackCallbackIsOnSavedDevice = FALSE;
