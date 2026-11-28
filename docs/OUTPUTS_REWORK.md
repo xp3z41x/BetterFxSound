@@ -13,6 +13,13 @@ needs to change the contract, it asks the orchestrator first.
    stacking two volumes, the real device of every enabled output is set to 100% and unmuted
    when the engine starts using it; its own level and mute are saved and restored when
    FxSound hands it back (power off, exit). Owner's decision after review.
+   Consequence: sound that reaches an enabled output's device without going through the
+   FxSound virtual device skips that gain, so it plays at the device's 100% and ignores the
+   Windows volume and mute. The communications default is moved to the virtual device while
+   it is an enabled output (and given back on disable or hand-back), but an app set to play
+   to a specific device (its own device setting, a browser's `setSinkId`) is not followed:
+   changing other apps' per-app volumes would outlive a crash, since Windows keeps them. The
+   output's tooltip in Settings > Outputs says so; point such apps at FxSound instead.
 2. **No "main output" in the UI or in the model.** Every output has a checkbox and can be
    disabled. Internally the engine still has a **carrier**: one enabled output on the original
    low-latency path (`SND_DEVICES_TARGETED_REAL_PLAYBACK`). The other enabled outputs go

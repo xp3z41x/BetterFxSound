@@ -4,7 +4,7 @@ BetterFxSound is an **unofficial fork** of [FxSound](https://github.com/fxsound2
 
 What BetterFxSound adds:
 
-* **Multiple simultaneous outputs.** Play the enhanced sound on two or more devices at the same time (for example speakers and headphones). Choose them in Settings > Outputs. The main output works as before; each additional output gets its own delay slider (0 to 500 ms) to line the devices up, and its clock drift is corrected automatically so the devices stay in sync.
+* **Multiple simultaneous outputs.** Play the enhanced sound on two or more devices at the same time (for example speakers and headphones). Choose them in Settings > Outputs. The main output works as before; each additional output gets its own delay slider (0 to 500 ms) to line the devices up, and its clock drift is corrected automatically so the devices stay in sync. Leave your apps playing to FxSound (the default device): an app set to play straight to one of these devices is not enhanced and plays at that device's full level, ignoring the Windows volume and mute.
 
 BetterFxSound is distributed under the same license as FxSound, the GNU Affero General Public License v3 (see [LICENSE](LICENSE)). Files changed or added by BetterFxSound say so in their headers.
 

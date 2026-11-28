@@ -31,7 +31,8 @@ namespace FxSound
 	constexpr wchar_t SETTINGS_EXTN[] = L"settings";
 	constexpr wchar_t SECURE_EXTN[] = L"secure";
 
-	class Settings final
+	// BetterFxSound: an AsyncUpdater so that a change is written on the next message loop turn (see flush()).
+	class Settings final : private juce::AsyncUpdater
 	{
 	public:
 		Settings();
@@ -54,11 +55,16 @@ namespace FxSound
 		// Removes the key from the user settings.
 		void   removeValue(juce::StringRef key) noexcept;
 
-		// BetterFxSound: writes pending changes to disk now. A change is otherwise written by a JUCE timer
-		// 3 s later, which never fires once the message loop has ended (quit, restart, crash relaunch, logoff).
+		// BetterFxSound: writes pending changes to disk now. JUCE's own save timer fires 3 s after a change, and
+		// never once the message loop has ended (quit, restart, logoff), so those paths call this. Every change to the
+		// user settings also schedules this on the message thread, so it is on disk by the next
+		// message loop turn rather than 3 s later: a crash (whose handler cannot flush safely) and the relaunch after
+		// it no longer lose it. It runs outside any caller's lock, and the changes of one turn are written once.
 		void   flush() noexcept;
 
 	private:
+		void handleAsyncUpdate() override;
+
 		ApplicationProperties app_default_properties_;
 		ApplicationProperties app_user_properties_;
 		ApplicationProperties app_secure_properties_;

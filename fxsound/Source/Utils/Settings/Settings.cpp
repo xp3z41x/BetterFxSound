@@ -67,12 +67,18 @@ FxSound::Settings::Settings()
 
 FxSound::Settings::~Settings()
 {
+	cancelPendingUpdate();
 }
 
 void FxSound::Settings::flush() noexcept
 {
 	app_user_properties_.saveIfNeeded();
 	app_secure_properties_.saveIfNeeded();
+}
+
+void FxSound::Settings::handleAsyncUpdate()
+{
+	flush();
 }
 
 String FxSound::Settings::getString(StringRef key) noexcept
@@ -114,6 +120,7 @@ void FxSound::Settings::setString(StringRef key, String value, bool default_valu
     else
     {
         user_settings_->setValue(key, value);
+        triggerAsyncUpdate();
     }	
 }
 
@@ -126,6 +133,7 @@ void FxSound::Settings::setInt(StringRef key, int value, bool default_value) noe
     else
     {
         user_settings_->setValue(key, value);
+        triggerAsyncUpdate();
     }
 }
 
@@ -138,6 +146,7 @@ void FxSound::Settings::setDouble(StringRef key, double value, bool default_valu
     else
     {
         user_settings_->setValue(key, value);
+        triggerAsyncUpdate();
     }
 }
 
@@ -150,12 +159,14 @@ void FxSound::Settings::setBool(StringRef key, bool value, bool default_value) n
     else
     {
         user_settings_->setValue(key, value);
+        triggerAsyncUpdate();
     }
 }
 
 void FxSound::Settings::setJson(juce::StringRef key, const juce::var& json) noexcept
 {
 	user_settings_->setValue(key, juce::JSON::toString(json));
+	triggerAsyncUpdate();
 }
 
 bool FxSound::Settings::containsKey(juce::StringRef key) noexcept
@@ -166,5 +177,8 @@ bool FxSound::Settings::containsKey(juce::StringRef key) noexcept
 void FxSound::Settings::removeValue(juce::StringRef key) noexcept
 {
 	if (user_settings_ != nullptr)
+	{
 		user_settings_->removeValue(key);
+		triggerAsyncUpdate();
+	}
 }

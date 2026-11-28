@@ -277,6 +277,11 @@ void FxOutputsGrid::Tile::setOutput(const FxController::OutputState& output)
 		tooltip += "\n" + TRANS("Disconnected, this output does not play");
 	else if (output_.failed)
 		tooltip += "\n" + TRANS("FxSound could not open this device, this output does not play. Another app may be using it exclusively. FxSound keeps trying.");
+	// BetterFxSound: an enabled output's device is held at 100% and the Windows volume is applied by FxSound to the
+	// sound it plays. An app set to play straight to this device (its own device setting, or the communications
+	// default when that is not FxSound) bypasses both, so say so where the output is chosen.
+	else if (output_.enabled)
+		tooltip += "\n" + TRANS("Apps set to play straight to this device, instead of to FxSound, are not enhanced and ignore the Windows volume and mute.");
 	toggle_.setTooltip(tooltip);
 
 	repaint();

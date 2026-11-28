@@ -210,7 +210,8 @@ private:
         // BetterFxSound: no settings flush here. This runs on the faulting thread, which can be any thread, and
         // PropertiesFile::saveIfNeeded() takes the settings lock: held by another thread (the message thread mid-set
         // or mid-save) it would hang this process for good, and the instance relaunched above would only forward its
-        // command line to the hung one and exit. The 3 s settings save timer covers all but the last few seconds.
+        // command line to the hung one and exit. Settings writes each change on the next message loop turn
+        // (FxSound::Settings::flush), so only a change made in the turn that crashed can be lost.
 
         return EXCEPTION_EXECUTE_HANDLER;
     }
