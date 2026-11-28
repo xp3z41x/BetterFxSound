@@ -425,13 +425,16 @@ int AudioPassthruPrivate::processTimer()
 	{
 		/*
 		* BetterFxSound: sndCheckDeviceChanges() marks the list stale again for the difference this refresh is about to
-		* read, which made every change refresh twice. The flag is cleared once more before the list is read: a change
-		* notified from here on (during the read) still marks it, and is refreshed on a later tick.
+		* read, which made every change refresh twice. The flag is cleared once more, only when the list is about to be
+		* read: a change notified from here on (during the read) still marks it, and is refreshed on a later tick. When
+		* the comparison found no difference it marked nothing, and a change notified during the comparison is kept.
 		*/
 		bool list_changed = checkDeviceChanges();
-		InterlockedExchange(&(s_sndDevices_.deviceListIsStale), 0);
 		if (list_changed)
+		{
+			InterlockedExchange(&(s_sndDevices_.deviceListIsStale), 0);
 			sndDevices_GetAll(hp_sndDevices_, &(s_sndDevices_.totalNumDevices));
+		}
 
 		applyAdditionalOutputs();
 

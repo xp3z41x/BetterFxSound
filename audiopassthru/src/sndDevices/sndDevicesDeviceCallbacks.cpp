@@ -159,9 +159,11 @@ static BOOL sndDevicesCallbackFindDevice(struct sndDevicesHdlType *cast_handle, 
 // outputs without stopping (deviceListIsStale). When the list cannot be relied on (an enumeration is rewriting it), only
 // the virtual device stops the processing: any other endpoint marks the list stale, and the timer then compares the
 // list with the system (sndCheckDeviceChanges(), same rule), which stops the processing if the change concerns the
-// carrier. Stopping on an unreliable list let the rest of a notification burst (a device connect raises about ten
-// state changes) land in the enumeration started by its first one and stop the processing anyway. A stale flag set
-// during a reinit's enumeration is kept, the reinit clears it before enumerating.
+// carrier. If that enumeration already read the change, the comparison finds no difference: sndDevices_GetAll() then
+// stops the processing itself when the carrier or the virtual device is gone or changed to or from active. Stopping
+// on an unreliable list let the rest of a notification burst (a device connect raises about ten state changes) land
+// in the enumeration started by its first one and stop the processing anyway. A stale flag set during a reinit's
+// enumeration is kept, the reinit clears it before enumerating.
 static BOOL sndDevicesCallbackChangeStopsProcessing(struct sndDevicesHdlType *cast_handle, LPCWSTR pwstrDeviceId, BOOL b_becomes_active)
 {
 	LONG seq_before;

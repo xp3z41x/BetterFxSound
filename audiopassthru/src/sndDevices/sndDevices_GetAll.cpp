@@ -65,6 +65,26 @@ static int sndDevices_GetAllFindListedID(struct sndDevicesHdlType* cast_handle, 
 	return(SND_DEVICES_DEVICE_NOT_PRESENT);
 }
 
+// BetterFxSound: true when the device listed at i_before_index before an enumeration (with dw_before_state) is gone from
+// the list just read, or its state changed to or from active. The same rule as sndCheckDeviceChanges() for a listed device.
+static BOOL sndDevices_GetAllListedDeviceChanged(struct sndDevicesHdlType* cast_handle, const wchar_t* wcp_ID,
+	int i_before_index, DWORD dw_before_state)
+{
+	int i_after_index;
+	DWORD dw_after_state;
+
+	if ((wcp_ID[0] == L'\0') || (i_before_index == SND_DEVICES_DEVICE_NOT_PRESENT))
+		return(FALSE);
+
+	i_after_index = sndDevices_GetAllFindListedID(cast_handle, wcp_ID);
+	if (i_after_index == SND_DEVICES_DEVICE_NOT_PRESENT)
+		return(TRUE);
+
+	dw_after_state = cast_handle->deviceState[i_after_index];
+	return((dw_after_state != dw_before_state) &&
+		((dw_after_state == DEVICE_STATE_ACTIVE) || (dw_before_state == DEVICE_STATE_ACTIVE)));
+}
+
 // Gets an array of objects for all audio devices and stores indexes to the default device and DFX device if installed.
 // BetterFxSound: enumerationSequence is odd while the list is rewritten, see sndDevicesHdlType.
 int PT_DECLSPEC sndDevices_GetAll(PT_HANDLE* hp_sndDevices, int* ip_num_devices)
@@ -74,6 +94,12 @@ int PT_DECLSPEC sndDevices_GetAll(PT_HANDLE* hp_sndDevices, int* ip_num_devices)
 	LONG sequence;
 	wchar_t wcp_playback_ID[PT_MAX_GENERIC_STRLEN];
 	wchar_t wcp_capture_ID[PT_MAX_GENERIC_STRLEN];
+	wchar_t wcp_virtual_ID[PT_MAX_GENERIC_STRLEN];
+	int i_playback_before;
+	int i_virtual_before;
+	DWORD dw_playback_state_before;
+	DWORD dw_virtual_state_before;
+	BOOL b_stop_processing;
 
 	cast_handle = (struct sndDevicesHdlType*)hp_sndDevices;
 
@@ -97,10 +123,38 @@ int PT_DECLSPEC sndDevices_GetAll(PT_HANDLE* hp_sndDevices, int* ip_num_devices)
 	sndDevices_GetAllCopyListedID(cast_handle, cast_handle->playbackDeviceNum, wcp_playback_ID);
 	sndDevices_GetAllCopyListedID(cast_handle, cast_handle->captureDeviceNum, wcp_capture_ID);
 
+	// BetterFxSound: a change of the carrier or the virtual device always stops the processing. A notification that
+	// arrives while this enumeration holds the list only marks it stale, and this enumeration may already read the
+	// change, after which the timer's comparison with the system finds no difference and would not stop either. So the
+	// carrier's and the virtual device's entries before and after the read are compared here too. Only while a carrier is
+	// set: a reinit unsets it before enumerating, so the changes that reinit is for do not stop the processing it starts.
+	i_playback_before = SND_DEVICES_DEVICE_NOT_PRESENT;
+	dw_playback_state_before = 0;
+	wcp_virtual_ID[0] = L'\0';
+	i_virtual_before = SND_DEVICES_DEVICE_NOT_PRESENT;
+	dw_virtual_state_before = 0;
+	if (wcp_playback_ID[0] != L'\0')
+	{
+		i_playback_before = cast_handle->playbackDeviceNum;
+		dw_playback_state_before = cast_handle->deviceState[i_playback_before];
+
+		wcscpy_s(wcp_virtual_ID, PT_MAX_GENERIC_STRLEN, cast_handle->dfxDeviceID);
+		i_virtual_before = sndDevices_GetAllFindListedID(cast_handle, wcp_virtual_ID);
+		if (i_virtual_before != SND_DEVICES_DEVICE_NOT_PRESENT)
+			dw_virtual_state_before = cast_handle->deviceState[i_virtual_before];
+	}
+
 	i_return = sndDevices_GetAllDevices(hp_sndDevices, ip_num_devices);
+
+	b_stop_processing =
+		sndDevices_GetAllListedDeviceChanged(cast_handle, wcp_playback_ID, i_playback_before, dw_playback_state_before) ||
+		sndDevices_GetAllListedDeviceChanged(cast_handle, wcp_virtual_ID, i_virtual_before, dw_virtual_state_before);
 
 	cast_handle->playbackDeviceNum = sndDevices_GetAllFindListedID(cast_handle, wcp_playback_ID);
 	cast_handle->captureDeviceNum = sndDevices_GetAllFindListedID(cast_handle, wcp_capture_ID);
+
+	if (b_stop_processing)
+		InterlockedExchange(&(cast_handle->stopAudioCaptureAndPlaybackLoop), 1);
 
 	InterlockedIncrement(&(cast_handle->enumerationSequence));
 
