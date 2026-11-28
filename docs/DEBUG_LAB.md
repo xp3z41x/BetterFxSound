@@ -12,6 +12,9 @@ The design spec is `docs/OUTPUTS_REWORK.md`.
 - BetterFxSound 1.0.0 is installed in `C:\Program Files\BetterFxSound`, with the FxSound
   virtual driver. The owner's settings are in `%APPDATA%\FxSound\FxSound.settings`. The app
   log is `%APPDATA%\FxSound\fxsound.log`, and a crash dump `fxsound.dmp` is there too.
+  The engine's runtime state of the outputs (carrier in use, each other output's stream state,
+  last error and underflow/realign counters) is in the `engine` object of `status.json`
+  (`FxSound.exe --status`, or fxmcp's `fxsound_get_status`).
 - There is no local C++ compiler. CI builds every pushed branch:
   - `.github/workflows/windows-build.yml` produces the `BetterFxSound-x64-<sha>` artifact
     with `FxSound.exe`.

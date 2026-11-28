@@ -719,6 +719,26 @@ public:
 	bool isOpen() const { return stream_open_.load(); }
 	HRESULT lastError() const { return last_error_.load(); }
 
+	// BetterFxSound: the diagnostics of AdditionalOutputStatus (status.json), from relaxed atomics. Any thread.
+	void fillDiagnostics(AdditionalOutputStatus& entry) const
+	{
+		entry.started = started();
+		entry.streaming = diag_streaming_.load(std::memory_order_relaxed);
+		entry.primed = diag_primed_.load(std::memory_order_relaxed);
+		entry.volume_taken = diag_volume_taken_.load(std::memory_order_relaxed);
+		entry.device_rate = diag_device_rate_.load(std::memory_order_relaxed);
+		entry.queue_ms = diag_queue_ms_.load(std::memory_order_relaxed);
+		entry.target_ms = diag_target_ms_.load(std::memory_order_relaxed);
+		entry.opens = diag_opens_.load(std::memory_order_relaxed);
+		entry.open_failures = diag_open_failures_.load(std::memory_order_relaxed);
+		entry.stream_failures = diag_stream_failures_.load(std::memory_order_relaxed);
+		entry.underflows = diag_underflows_.load(std::memory_order_relaxed);
+		entry.reprimes = diag_reprimes_.load(std::memory_order_relaxed);
+		entry.realigns = diag_realigns_.load(std::memory_order_relaxed);
+		entry.stall_jumps = diag_stall_jumps_.load(std::memory_order_relaxed);
+		entry.overflows = diag_overflows_.load(std::memory_order_relaxed);
+	}
+
 	// Runs when the last reference goes: on the UI thread once the render thread has exited, or on the render
 	// thread itself, as its last step, if it was still busy when the output was removed. Either way nothing
 	// uses this object any more.
@@ -1031,6 +1051,8 @@ public:
 		const UINT32 w = w0 + lead;
 		const UINT32 free_frames = free_total - lead;
 		const UINT32 n = frames < free_frames ? frames : free_frames;
+		if (n < frames)
+			countUp(diag_overflows_);	// BetterFxSound: diagnostics, written by this (the audio) thread only
 
 		// Every channel is queued (in the ring's channels). The channel mode is applied by render(), on what is played now, so a
 		// change is heard within one device period rather than after the queued audio (latency + delay).
@@ -1166,6 +1188,8 @@ private:
 				{
 					closeClient();
 					handBackAfterLoss();
+					countUp(diag_open_failures_);
+					publishDiagnostics();
 					// BetterFxSound: a device that keeps failing (held in exclusive mode, a driver that does not come back)
 					// is tried less often. The error is reported (lastError()).
 					failures++;
@@ -1174,6 +1198,8 @@ private:
 				}
 				last_error_.store(S_OK);
 				opened_tick = now;
+				countUp(diag_opens_);
+				diag_device_rate_.store(sample_rate_, std::memory_order_relaxed);
 				ring_rate_ = pending;
 				ring_reset_pending_ = true;
 			}
@@ -1195,6 +1221,7 @@ private:
 				active_format_.store(0, std::memory_order_release);
 				closeClient();
 				handBackAfterLoss();
+				countUp(diag_stream_failures_);
 				failures++;
 				next_retry = now + (failures > kRetriesBeforeBackoff ? kRetryLongMs : kRetryMs);
 			}
@@ -1205,10 +1232,12 @@ private:
 				// period and was reopened every few seconds forever, never backing off.
 				failures = 0;
 			}
+			publishDiagnostics();
 		}
 
 		active_format_.store(0, std::memory_order_release);
 		closeClient();
+		publishDiagnostics();
 
 		if (mmcss_handle != NULL)
 			AvRevertMmThreadCharacteristics(mmcss_handle);
@@ -1493,6 +1522,7 @@ private:
 				owedVolumeRecord(device_id_, level, mute);
 			}
 			volume_taken_ = true;
+			diag_volume_taken_.store(true, std::memory_order_relaxed);
 			if (user_level_)
 			{
 				owedVolumeEndTakeOver(device_id_, false, level, mute);
@@ -1534,6 +1564,7 @@ private:
 	void handBackVolumeLocked(IMMDevice* device)
 	{
 		volume_taken_ = false;
+		diag_volume_taken_.store(false, std::memory_order_relaxed);
 		full_volume_pending_ = false;
 		full_volume_attempts_ = 0;
 		volume_retry_.store(false);
@@ -1675,6 +1706,9 @@ private:
 		// Silence still to be played before the queued audio (a raised delay) counts as queued.
 		UINT32 fill = ring_queued + holdQueued();
 		double level = levelOf(fill);
+		// BetterFxSound: diagnostics (status.json).
+		diag_queue_ms_.store(static_cast<int>(level * 1000.0 / rate), std::memory_order_relaxed);
+		diag_target_ms_.store(static_cast<int>(level_target * 1000.0 / rate), std::memory_order_relaxed);
 
 		if (primed_)
 		{
@@ -1698,6 +1732,7 @@ private:
 				// below does, let the ring fill up until write() dropped the newest audio, and the jump then landed in
 				// the stale audio. The output fades back in (current_gain_).
 				shiftOutput(static_cast<INT64>(level + 0.5) - static_cast<INT64>(level_target + 0.5), nominal);
+				countUp(diag_stall_jumps_);
 				fill_avg_valid_ = false;
 				error_avg_ = 0.0;
 				current_gain_ = 0.0f;
@@ -1932,6 +1967,7 @@ private:
 					frame[c] *= scale;
 			}
 			std::memset(out + static_cast<size_t>(produced) * channels_, 0, static_cast<size_t>(space - produced) * channels_ * sizeof(float));
+			countUp(diag_underflows_);
 			primed_ = false;
 			idle_since_ = now;
 			hold_frames_ = 0;
@@ -1941,6 +1977,7 @@ private:
 		{
 			// BetterFxSound: faded out, the starved queue builds up again before playing. Silence still to be played
 			// is dropped (it used to count as queued audio when priming); the queued audio stays and is counted.
+			countUp(diag_reprimes_);
 			primed_ = false;
 			idle_since_ = now;
 			hold_frames_ = 0;
@@ -1970,6 +2007,7 @@ private:
 			else
 				shift = static_cast<INT64>(fill_avg_ + 0.5) - level_target_frames;
 			shiftOutput(shift, nominal);
+			countUp(realign_reason_ == kRealignJump ? diag_stall_jumps_ : diag_realigns_);
 			fill_avg_ -= static_cast<double>(shift);	// Re-seeded instead if resetResampler() ran
 			exact_level_sum_ = 0.0;	// BetterFxSound: what was summed is from before the move
 			exact_level_count_ = 0;
@@ -1991,6 +2029,20 @@ private:
 	{
 		render_error_ = FAILED(hr) ? hr : E_FAIL;
 		return false;
+	}
+
+	// BetterFxSound: a diagnostics counter goes up by one. Each has a single writer thread, so a relaxed load and store
+	// do (no locked instruction on the audio or render thread); readers only ever load it.
+	static void countUp(std::atomic<UINT32>& counter)
+	{
+		counter.store(counter.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+	}
+
+	// BetterFxSound: publishes the render thread's own state for the diagnostics (fillDiagnostics()). Render thread.
+	void publishDiagnostics()
+	{
+		diag_streaming_.store(client_ != nullptr && running_, std::memory_order_relaxed);
+		diag_primed_.store(client_ != nullptr && running_ && primed_, std::memory_order_relaxed);
 	}
 
 	// BetterFxSound: moves the output by shift ring frames (render()). Later (shift > 0): silence not played yet goes
@@ -2056,6 +2108,23 @@ private:
 	std::atomic<bool> stopping_{ false };		// requestStop() was called: the device is not taken over any more
 	std::atomic<HRESULT> last_error_{ S_OK };	// BetterFxSound: last failed open or render, S_OK once a stream opened (lastError())
 	std::atomic<bool> volume_recheck_{ false };	// BetterFxSound: setDriven() left the change to the render thread (applyDeferredDriven())
+
+	// BetterFxSound: diagnostics (fillDiagnostics(), status.json). Relaxed atomics, each with a single writer: the render
+	// thread, write() (the audio thread) for diag_overflows_, and the holder of volume_mutex_ for diag_volume_taken_.
+	std::atomic<bool> diag_streaming_{ false };
+	std::atomic<bool> diag_primed_{ false };
+	std::atomic<bool> diag_volume_taken_{ false };
+	std::atomic<UINT32> diag_device_rate_{ 0 };
+	std::atomic<int> diag_queue_ms_{ 0 };
+	std::atomic<int> diag_target_ms_{ 0 };
+	std::atomic<UINT32> diag_opens_{ 0 };
+	std::atomic<UINT32> diag_open_failures_{ 0 };
+	std::atomic<UINT32> diag_stream_failures_{ 0 };
+	std::atomic<UINT32> diag_underflows_{ 0 };
+	std::atomic<UINT32> diag_reprimes_{ 0 };
+	std::atomic<UINT32> diag_realigns_{ 0 };
+	std::atomic<UINT32> diag_stall_jumps_{ 0 };
+	std::atomic<UINT32> diag_overflows_{ 0 };
 
 	// The device's own volume is recorded in the owed volume record (OwedVolume.h) when the engine takes the
 	// device over (100% and unmuted), and put back when it stops using it. Stream open (render thread), power
@@ -2411,6 +2480,7 @@ std::vector<AdditionalOutputStatus> MultiOutputRouter::getStatus() const
 		const HRESULT error = output->lastError();
 		entry.failed = !entry.open && FAILED(error);
 		entry.last_error = error;
+		output->fillDiagnostics(entry);
 		status.push_back(entry);
 	}
 	ReleaseSRWLockShared(&lock_);

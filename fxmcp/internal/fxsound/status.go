@@ -72,6 +72,52 @@ type OutputInfo struct {
 	ChannelMode string `json:"channel_mode"`
 }
 
+// EngineOutput is the audio engine's runtime state of one output played
+// next to the carrier (the "outputs" of status.json's "engine" object).
+// LastError is the HRESULT of the last failed open or render, as "0x" and 8
+// hex digits ("0x00000000" once a stream opened). The counters count since
+// the output was added and wrap around.
+type EngineOutput struct {
+	ID             string `json:"id"`
+	Name           string `json:"name"`
+	Started        bool   `json:"started"`
+	Open           bool   `json:"open"`
+	Streaming      bool   `json:"streaming"`
+	Primed         bool   `json:"primed"`
+	Failed         bool   `json:"failed"`
+	LastError      string `json:"last_error"`
+	VolumeTaken    bool   `json:"volume_taken"`
+	DeviceRate     uint32 `json:"device_rate"`
+	QueueMs        int    `json:"queue_ms"`
+	TargetMs       int    `json:"target_ms"`
+	Opens          uint32 `json:"opens"`
+	OpenFailures   uint32 `json:"open_failures"`
+	StreamFailures uint32 `json:"stream_failures"`
+	Underflows     uint32 `json:"underflows"`
+	Reprimes       uint32 `json:"reprimes"`
+	Realigns       uint32 `json:"realigns"`
+	StallJumps     uint32 `json:"stall_jumps"`
+	Overflows      uint32 `json:"overflows"`
+}
+
+// Engine is what the audio engine actually does with the outputs
+// (status.json's "engine" object), as opposed to their settings (Outputs):
+// the carrier in use on the low-latency path, and every other output it
+// plays. Absent while the engine is not initialized.
+type Engine struct {
+	Processing       bool           `json:"processing"`
+	Muted            bool           `json:"muted"`
+	Parked           bool           `json:"parked"`
+	HandedBack       bool           `json:"handed_back"`
+	Driven           bool           `json:"driven"`
+	CarrierID        string         `json:"carrier_id"`
+	CarrierName      string         `json:"carrier_name"`
+	CarrierEnabled   bool           `json:"carrier_enabled"`
+	PendingCarrierID string         `json:"pending_carrier_id"`
+	FailedCarrierID  string         `json:"failed_carrier_id"`
+	Outputs          []EngineOutput `json:"outputs"`
+}
+
 // Status is the shape of %APPDATA%\FxSound\status.json, written by
 // FxController::printStatus (the --status command-line option).
 type Status struct {
@@ -86,6 +132,18 @@ type Status struct {
 	SelectedOutput string    `json:"selected_output"`
 	Equalizer      Equalizer `json:"equalizer"`
 	Effects        Effects   `json:"effects"`
+	// Engine is the audio engine's runtime state of the outputs; nil when
+	// status.json has none (engine not initialized, or an older FxSound).
+	Engine *Engine `json:"engine,omitempty"`
+}
+
+// parseStatus decodes the contents of status.json.
+func parseStatus(data []byte) (*Status, error) {
+	var s Status
+	if err := json.Unmarshal(data, &s); err != nil {
+		return nil, fmt.Errorf("parse status.json: %w", err)
+	}
+	return &s, nil
 }
 
 func statusFilePath() (string, error) {
@@ -139,11 +197,7 @@ func ReadStatus(ctx context.Context, paths *Paths) (*Status, error) {
 			if readErr != nil {
 				lastErr = readErr
 			} else {
-				var s Status
-				if jsonErr := json.Unmarshal(data, &s); jsonErr != nil {
-					return nil, fmt.Errorf("parse status.json: %w", jsonErr)
-				}
-				return &s, nil
+				return parseStatus(data)
 			}
 		} else if statErr != nil {
 			lastErr = statErr

@@ -67,6 +67,7 @@ public:
 	std::vector<DelayCalibrationResult> getDelayCalibrationResults();
 	std::wstring getDelayCalibrationError();
 	std::vector<AdditionalOutputStatus> getAdditionalOutputStatus();
+	EngineStatus getEngineStatus();
 
 private:
 	void applyMainDelay(float* buffer, UINT32 frames, UINT32 channels, UINT32 sample_rate, bool silence_fill);
@@ -153,6 +154,7 @@ private:
 	bool handed_back_ = false;					// restoreDefaultPlaybackDevice() called, until processing starts again
 	bool parked_ = false;						// The last reinit failed, until one succeeds or power off
 	std::wstring failed_carrier_id_;			// Carrier reported as failed (getFailedCarrierId()), until a reinit succeeds
+	std::wstring routed_carrier_id_;			// BetterFxSound: carrier effective_outputs_ was built around (getEngineStatus())
 
 	MultiOutputRouter multi_output_;
 

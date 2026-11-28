@@ -756,7 +756,8 @@ void FxController::printStatus()
 	// compatibility: the first enabled output in the list below, or empty when none is enabled.
 	Array<var> outputs;
 	String first_enabled_output;
-	for (auto& output : getOutputs())
+	const auto controller_outputs = getOutputs();
+	for (auto& output : controller_outputs)
 	{
 		auto* output_obj = new DynamicObject();
 		output_obj->setProperty("id", output.id);
@@ -782,6 +783,69 @@ void FxController::printStatus()
 	}
 	settings->setProperty("outputs", outputs);
 	settings->setProperty("selected_output", first_enabled_output);
+
+	// BetterFxSound: what the engine actually does with the outputs (the above is the settings): the carrier in use, and
+	// the state and counters of every output played next to it, so a silent output can be told apart in the field
+	// (excluded as the carrier, failing to open, not primed, underflowing, not driven, ...).
+	if (audio_passthru_ != nullptr)
+	{
+		const EngineStatus engine = audio_passthru_->getEngineStatus();
+		auto nameOf = [&controller_outputs](const std::wstring& device_id) -> String
+		{
+			const String id(device_id.c_str());
+			for (const auto& output : controller_outputs)
+			{
+				if (output.id == id)
+					return output.name;
+			}
+			return {};
+		};
+		auto hresultText = [](long hr) -> String
+		{
+			return "0x" + String::toHexString(static_cast<int64>(static_cast<uint32>(hr))).paddedLeft('0', 8);
+		};
+
+		auto* engine_obj = new DynamicObject();
+		engine_obj->setProperty("processing", engine.processing);
+		engine_obj->setProperty("muted", engine.muted);
+		engine_obj->setProperty("parked", engine.parked);
+		engine_obj->setProperty("handed_back", engine.handed_back);
+		engine_obj->setProperty("driven", engine.driven);
+		engine_obj->setProperty("carrier_id", String(engine.carrier_id.c_str()));
+		engine_obj->setProperty("carrier_name", nameOf(engine.carrier_id));
+		engine_obj->setProperty("carrier_enabled", engine.carrier_enabled);
+		engine_obj->setProperty("pending_carrier_id", String(engine.pending_carrier_id.c_str()));
+		engine_obj->setProperty("failed_carrier_id", String(engine.failed_carrier_id.c_str()));
+
+		Array<var> engine_outputs;
+		for (const auto& status : engine.outputs)
+		{
+			auto* status_obj = new DynamicObject();
+			status_obj->setProperty("id", String(status.device_id.c_str()));
+			status_obj->setProperty("name", nameOf(status.device_id));
+			status_obj->setProperty("started", status.started);
+			status_obj->setProperty("open", status.open);
+			status_obj->setProperty("streaming", status.streaming);
+			status_obj->setProperty("primed", status.primed);
+			status_obj->setProperty("failed", status.failed);
+			status_obj->setProperty("last_error", hresultText(status.last_error));
+			status_obj->setProperty("volume_taken", status.volume_taken);
+			status_obj->setProperty("device_rate", static_cast<int64>(status.device_rate));
+			status_obj->setProperty("queue_ms", status.queue_ms);
+			status_obj->setProperty("target_ms", status.target_ms);
+			status_obj->setProperty("opens", static_cast<int64>(status.opens));
+			status_obj->setProperty("open_failures", static_cast<int64>(status.open_failures));
+			status_obj->setProperty("stream_failures", static_cast<int64>(status.stream_failures));
+			status_obj->setProperty("underflows", static_cast<int64>(status.underflows));
+			status_obj->setProperty("reprimes", static_cast<int64>(status.reprimes));
+			status_obj->setProperty("realigns", static_cast<int64>(status.realigns));
+			status_obj->setProperty("stall_jumps", static_cast<int64>(status.stall_jumps));
+			status_obj->setProperty("overflows", static_cast<int64>(status.overflows));
+			engine_outputs.add(var(status_obj));
+		}
+		engine_obj->setProperty("outputs", engine_outputs);
+		settings->setProperty("engine", var(engine_obj));
+	}
 
 	Array<var> bands;
 	for (int i = 0; i < getNumEqBands(); i++)

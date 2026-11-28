@@ -1421,6 +1421,7 @@ void AudioPassthruPrivate::applyAdditionalOutputs()
 
 			apply_pending_ = false;
 			effective_outputs_ = effective;
+			routed_carrier_id_ = carrier_id;
 			multi_output_.configure(effective);
 
 			if (carrier_was_routed && carrier_plays && processing && !handed_back_ && carrier_setting_saved)
@@ -1965,6 +1966,30 @@ std::vector<DelayCalibrationResult> AudioPassthruPrivate::getDelayCalibrationRes
 std::vector<AdditionalOutputStatus> AudioPassthruPrivate::getAdditionalOutputStatus()
 {
 	return multi_output_.getStatus();
+}
+
+/*
+* FUNCTION: getEngineStatus()
+* DESCRIPTION: BetterFxSound. The engine's runtime state of the outputs, for diagnostics (status.json). UI/timer thread:
+* config_mutex_ is never taken by the audio threads, and the router's status is read from relaxed atomics.
+*/
+EngineStatus AudioPassthruPrivate::getEngineStatus()
+{
+	EngineStatus status;
+	status.processing = isProcessing();
+	status.muted = mute_;
+	status.driven = multi_output_.isDriven();
+	status.carrier_enabled = carrier_enabled_.load(std::memory_order_relaxed);
+	{
+		std::lock_guard<std::mutex> lock(config_mutex_);
+		status.parked = parked_;
+		status.handed_back = handed_back_;
+		status.carrier_id = routed_carrier_id_;
+		status.pending_carrier_id = pending_carrier_id_;
+		status.failed_carrier_id = failed_carrier_id_;
+	}
+	status.outputs = multi_output_.getStatus();
+	return status;
 }
 
 std::wstring AudioPassthruPrivate::getDelayCalibrationError()

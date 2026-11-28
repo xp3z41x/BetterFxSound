@@ -76,6 +76,38 @@ struct AdditionalOutputStatus {
 	bool open = false;		// Its stream is open (it opens when audio first comes)
 	bool failed = false;	// Not open, and its device could not be opened or stopped working; the engine keeps retrying it
 	long last_error = 0;	// HRESULT of the last failed open or render, 0 (S_OK) once a stream opened
+	// BetterFxSound: runtime diagnostics (status.json), sampled without waiting on the output's threads, so the fields
+	// may be a render period apart. The counters count since the output was created (configure()) and wrap around.
+	bool started = false;		// Its render thread runs (one that could not be created is created again)
+	bool streaming = false;		// Its stream is started (stopped while idle, so the PC can sleep)
+	bool primed = false;		// Playing from its queue (not building it up, after a start or an underflow)
+	bool volume_taken = false;	// Its device is held at 100% and unmuted by the engine
+	unsigned int device_rate = 0;	// Its device's mix rate (Hz), 0 before its first open
+	int queue_ms = 0;			// Latency of its newest queued audio at the last period (ms)
+	int target_ms = 0;			// What that latency is held at (ms)
+	unsigned int opens = 0;			// Streams opened
+	unsigned int open_failures = 0;	// Opens that failed (retried later)
+	unsigned int stream_failures = 0;	// Open streams that failed or stalled (closed and opened again)
+	unsigned int underflows = 0;	// Ran dry, then built its queue up again
+	unsigned int reprimes = 0;		// Faded out to build a starved queue up again
+	unsigned int realigns = 0;		// Moved to its target (delay change, lasting offset, exact alignment)
+	unsigned int stall_jumps = 0;	// Jumped ahead after its device stalled with far too much queued
+	unsigned int overflows = 0;		// Blocks that did not fit its queue (the newest audio dropped)
+};
+
+// BetterFxSound: what the engine is doing with the outputs right now (AudioPassthru::getEngineStatus()), for
+// diagnostics (status.json). The controller's own view of the outputs is its settings; this is the engine's.
+struct EngineStatus {
+	bool processing = false;	// The processing thread runs (FxSound drives the devices)
+	bool muted = false;			// Muted by the controller (AudioPassthru::mute())
+	bool parked = false;		// The last reinit failed; the engine waits to retry it
+	bool handed_back = false;	// restoreDefaultPlaybackDevice() was called, until processing starts again
+	bool driven = false;		// The additional outputs are driven (take their devices over and play)
+	bool carrier_enabled = false;	// The carrier plays (it is enabled, and its device's take-over is done)
+	std::wstring carrier_id;			// Carrier the outputs were last routed around (empty: none)
+	std::wstring pending_carrier_id;	// Carrier switch asked for, until the reinit that takes it
+	std::wstring failed_carrier_id;		// Carrier the engine reports as failed (getFailedCarrierId())
+	std::vector<AdditionalOutputStatus> outputs;	// The additional outputs (getAdditionalOutputStatus())
 };
 
 // BetterFxSound: one output in the set passed to AudioPassthru::setOutputs(), carrier included.
@@ -150,6 +182,9 @@ public:
 	// other than the carrier), so an output whose device cannot be opened (held by an exclusive-mode app, a driver
 	// failing after a resume) can be shown as such. The engine keeps retrying it meanwhile.
 	std::vector<AdditionalOutputStatus> getAdditionalOutputStatus();
+	// BetterFxSound: the engine's runtime state of the outputs, for diagnostics. UI/timer thread; never waits on the
+	// audio threads or on a device.
+	EngineStatus getEngineStatus();
 
 	// BetterFxSound: measures the delay of every enabled output that is present (the carrier
 	// only if it is enabled) with the default microphone. Runs in the background; poll

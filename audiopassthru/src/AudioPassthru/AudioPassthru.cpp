@@ -133,6 +133,11 @@ std::vector<AdditionalOutputStatus> AudioPassthru::getAdditionalOutputStatus()
 	return data_->getAdditionalOutputStatus();
 }
 
+EngineStatus AudioPassthru::getEngineStatus()
+{
+	return data_->getEngineStatus();
+}
+
 bool AudioPassthru::startDelayCalibration()
 {
 	return data_->startDelayCalibration();
