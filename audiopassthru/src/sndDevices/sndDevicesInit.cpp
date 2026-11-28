@@ -141,6 +141,8 @@ int PT_DECLSPEC sndDevicesInit(PT_HANDLE *hp_sndDevices, CSlout *hp_slout, int i
 	cast_handle->handedBackPlaybackLevel = 1.0f;
 	cast_handle->handedBackPlaybackLevelIsSaved = FALSE;
 	cast_handle->handedBackPlaybackIsPending = FALSE;
+	// BetterFxSound: a hand-back made at the last exit of the app still counts (sndDevicesLoadHandedBackRecord()).
+	sndDevicesLoadHandedBackRecord(hp_sndDevices);
 	{
 		std::lock_guard<std::mutex> lock(cast_handle->virtualDefaultMutex);
 		cast_handle->virtualDefaultGuardArmed = FALSE;

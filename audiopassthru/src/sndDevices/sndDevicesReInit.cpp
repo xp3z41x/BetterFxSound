@@ -191,6 +191,7 @@ int PT_DECLSPEC sndDevicesReInit(PT_HANDLE *hp_sndDevices, int i_initType, int *
 			if( cast_handle->handedBackPlaybackIsPending )
 			{
 				cast_handle->handedBackPlaybackIsPending = FALSE;
+				sndDevicesClearHandedBackRecord(hp_sndDevices);	// BetterFxSound: used, also at the next start of the app.
 
 				if( cast_handle->playbackSettingsAreSaved &&
 					(wcscmp(cast_handle->handedBackPlaybackDeviceID, cast_handle->savedPlaybackDeviceID) == 0) )

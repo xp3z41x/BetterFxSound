@@ -177,6 +177,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #define SND_DEVICES_REGISTRY_USER_BUFFER_SIZE					L"user_buffer_size"
 // BetterFxSound: the communications default the user had before the virtual device was made the default for that role too
 #define SND_DEVICES_REGISTRY_PRIOR_COMMUNICATIONS_WIDE		L"prior_communications_default"
+// BetterFxSound: the handed-back record (handedBackPlaybackDeviceID and the rest), kept across a restart of the app
+#define SND_DEVICES_REGISTRY_HANDED_BACK_PLAYBACK_WIDE		L"handed_back_playback"
 
 /* Registry related defines, local machine */
 #define SND_DEVICES_REGISTRY_DFX_GUID								L"dfx_guid"
@@ -527,6 +529,8 @@ struct sndDevicesHdlType {
 	// pending until the next reinit that sets the devices up. If that device is the carrier again and its own setting is
 	// no longer this one (the user changed its volume or mute while FxSound was off), the virtual device (the master) takes
 	// the new one, so FxSound comes back at the level the user was just listening at. UI/timer thread only.
+	// BetterFxSound: also kept in the registry (SND_DEVICES_REGISTRY_HANDED_BACK_PLAYBACK_WIDE), so the hand-back at exit
+	// still counts at the next start of the app (sndDevicesInit() loads it), until the reinit that uses it clears it.
 	wchar_t handedBackPlaybackDeviceID[PT_MAX_GENERIC_STRLEN];
 	BOOL handedBackPlaybackMute;
 	float handedBackPlaybackLevel;
@@ -688,5 +692,8 @@ int PT_DECLSPEC sndDevicesDoPlayback(PT_HANDLE *, int *);
 /* sndDevicesReg.cpp */
 int sndDevicesWriteToRegistry(PT_HANDLE *, int, wchar_t *, wchar_t *);
 int sndDeviceReadFromRegistry(PT_HANDLE *, int, wchar_t *, wchar_t *);
+void sndDevicesStoreHandedBackRecord(PT_HANDLE *);
+void sndDevicesLoadHandedBackRecord(PT_HANDLE *);
+void sndDevicesClearHandedBackRecord(PT_HANDLE *);
 
 #endif //_SND_DEVICES_H_

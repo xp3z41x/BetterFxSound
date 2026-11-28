@@ -681,6 +681,8 @@ int PT_DECLSPEC sndDevicesRestoreDefaultDevice(PT_HANDLE *hp_sndDevices, int *ip
 			cast_handle->handedBackPlaybackLevel = handedBackLevel;
 			cast_handle->handedBackPlaybackLevelIsSaved = handedBackLevelIsSaved;
 			cast_handle->handedBackPlaybackIsPending = TRUE;
+			// BetterFxSound: kept in the registry too, so a hand-back at exit counts at the next start of the app.
+			sndDevicesStoreHandedBackRecord(hp_sndDevices);
 		}
 	}
 
