@@ -385,7 +385,7 @@ public:
 	static constexpr double kRealignErrorSecs = 0.020;        // A lasting offset from the target this big is too
 	static constexpr DWORD kFlushMs = 30;                     // Less than the target queued and nothing more for this long: play it
 	static constexpr double kWriteGapSecs = 0.050;            // Writes further apart than this are a pause, not the write spacing
-	static constexpr double kPhaseCapSecs = 0.100;            // Time since the last write counted in the queue level at most
+	static constexpr double kPhaseCapSecs = 0.100;            // Time since the last write counted in the level of an empty queue at most
 	static constexpr int kDeviceAllowanceMs = 10;             // Device queue counted in the target (a 20 ms buffer less a period)
 	static constexpr int kDeviceHeadroomUseMs = 20;           // A larger device queue may take this much of the ring's headroom
 
@@ -800,15 +800,21 @@ private:
 		// BetterFxSound: the device queue counted in the latency target (render()). A fixed allowance, so the output's
 		// latency does not move with the buffer size and engine period of each open; only a device that keeps a much
 		// larger queue (its buffer less a period) gets a larger one, so the ring keeps its headroom for the bursty writes.
-		REFERENCE_TIME default_period = 0;
-		REFERENCE_TIME minimum_period = 0;
-		if (FAILED(client_->GetDevicePeriod(&default_period, &minimum_period)) || default_period < 0)
-			default_period = 0;
-		const UINT32 period_frames = static_cast<UINT32>(static_cast<double>(default_period) * sample_rate / 10000000.0);
-		const UINT32 device_queue = buffer_frames_ > period_frames ? buffer_frames_ - period_frames : 0;
-		const UINT32 headroom_use = static_cast<UINT32>(static_cast<double>(kDeviceHeadroomUseMs) * sample_rate / 1000.0);
-		const UINT32 allowance = static_cast<UINT32>(static_cast<double>(kDeviceAllowanceMs) * sample_rate / 1000.0);
-		device_allowance_frames_ = (device_queue > allowance + headroom_use) ? device_queue - headroom_use : allowance;
+		// It is set at this output's first successful open and kept across reopens: recomputed at each open, a large-queue
+		// device's latency followed the buffer size and period of every open (in seconds, the device rate may change).
+		if (device_allowance_secs_ < 0.0)
+		{
+			REFERENCE_TIME default_period = 0;
+			REFERENCE_TIME minimum_period = 0;
+			if (FAILED(client_->GetDevicePeriod(&default_period, &minimum_period)) || default_period < 0)
+				default_period = 0;
+			const double period_secs = static_cast<double>(default_period) / 10000000.0;
+			const double buffer_secs = static_cast<double>(buffer_frames_) / static_cast<double>(sample_rate);
+			const double device_queue = buffer_secs > period_secs ? buffer_secs - period_secs : 0.0;
+			const double headroom_use = static_cast<double>(kDeviceHeadroomUseMs) / 1000.0;
+			const double allowance = static_cast<double>(kDeviceAllowanceMs) / 1000.0;
+			device_allowance_secs_ = (device_queue > allowance + headroom_use) ? device_queue - headroom_use : allowance;
+		}
 
 		hr = client_->GetService(__uuidof(IAudioRenderClient), (void**)&render_);
 		if (FAILED(hr) || render_ == nullptr)
@@ -986,15 +992,20 @@ private:
 		const LONGLONG since_write_qpc = (write_qpc != 0) ? qpc_now.QuadPart - write_qpc : 0;
 		const double since_write = since_write_qpc > 0 ? static_cast<double>(since_write_qpc) / qpc_freq_ : 0.0; // seconds
 		const double write_period = write_period_qpc > 0 ? static_cast<double>(write_period_qpc) / qpc_freq_ : 0.0;
-		const double phase_frames = ((since_write < kPhaseCapSecs ? since_write : kPhaseCapSecs) - 0.5 * write_period) * rate;
+		UINT32 ring_queued = write_pos - read_pos_.load(std::memory_order_relaxed);
+		// While audio is queued, the whole time since the write counts: as the queue drains after the writes stopped (the
+		// end of a sound), its level stays the latency of its newest frame, so a re-prime or flush plays the tail on time.
+		// Capped, a tail queued for longer than the cap was primed with that much silence in front of it, played late.
+		// The cap is only for an empty queue, where the time since the write measures nothing.
+		const double counted_since = (ring_queued > 0 || since_write < kPhaseCapSecs) ? since_write : kPhaseCapSecs;
+		const double phase_frames = (counted_since - 0.5 * write_period) * rate;
 		const double device_frames = static_cast<double>(padding) * nominal;
-		const double level_target = static_cast<double>(target) + static_cast<double>(device_allowance_frames_) * nominal;
+		const double level_target = static_cast<double>(target) + (device_allowance_secs_ > 0.0 ? device_allowance_secs_ : 0.0) * rate;
 		auto levelOf = [phase_frames, device_frames](UINT32 queue_frames) -> double
 		{
 			return static_cast<double>(queue_frames) + device_frames + phase_frames;
 		};
 
-		UINT32 ring_queued = write_pos - read_pos_.load(std::memory_order_relaxed);
 		// Silence still to be played before the queued audio (a raised delay) counts as queued.
 		UINT32 fill = ring_queued + holdQueued();
 		double level = levelOf(fill);
@@ -1013,7 +1024,21 @@ private:
 			}
 
 			// BetterFxSound: a stall and a starved queue fade out first too (realign_pending_); they cut at full gain.
-			if (realign_pending_)
+			if (fill > target + slack && space == 0)
+			{
+				// Far too much audio queued and the device still takes none (stalled): jump ahead now, by the level's
+				// offset (whatever realignment was pending: the level is measured against the current target). Nothing
+				// is produced while it stalls, so there is nothing to fade out; waiting for space, as the faded jump
+				// below does, let the ring fill up until write() dropped the newest audio, and the jump then landed in
+				// the stale audio. The output fades back in (current_gain_).
+				shiftOutput(static_cast<INT64>(level + 0.5) - static_cast<INT64>(level_target + 0.5), nominal);
+				fill_avg_valid_ = false;
+				error_avg_ = 0.0;
+				current_gain_ = 0.0f;
+				aligned_target_ = target;
+				realign_pending_ = false;
+			}
+			else if (realign_pending_)
 			{
 				// Handled after this block's fade out.
 			}
@@ -1023,9 +1048,11 @@ private:
 				realign_pending_ = true;
 				realign_reason_ = kRealignJump;
 			}
-			else if (fill + slack < target)
+			else if (fill + slack < target && since_write * 1000.0 < static_cast<double>(kFlushMs))
 			{
-				// Far too little: build the buffer up again before playing.
+				// Far too little: build the buffer up again before playing. BetterFxSound: only while the writes go on;
+				// once they stopped (the end of a sound), the queue is its tail, at the right level: it drains and
+				// underflows instead of fading out mid-tail.
 				realign_pending_ = true;
 				realign_reason_ = kRealignReprime;
 			}
@@ -1229,8 +1256,6 @@ private:
 			// measured against the current target, so a pending delay change is part of an offset or a stall's shift.
 			// A stall jumps by the level now, silence still to be played first; it skipped the queue by the level
 			// with that silence counted, then dropped the silence too.
-			const UINT32 r = read_pos_.load(std::memory_order_relaxed);
-			const UINT32 queued = write_pos_.load(std::memory_order_acquire) - r;
 			const INT64 level_target_frames = static_cast<INT64>(level_target + 0.5);
 			INT64 shift = 0;
 			if (realign_reason_ == kRealignDelay)
@@ -1239,24 +1264,7 @@ private:
 				shift = static_cast<INT64>(level + 0.5) - level_target_frames;
 			else
 				shift = static_cast<INT64>(fill_avg_ + 0.5) - level_target_frames;
-			if (shift > 0)
-			{
-				// Silence not played yet goes first, then queued audio.
-				const UINT32 hold_queued = holdQueued();
-				const UINT32 from_hold = static_cast<UINT64>(shift) < hold_queued ? static_cast<UINT32>(shift) : hold_queued;
-				const UINT32 from_hold_frames = static_cast<UINT32>(from_hold / nominal + 0.5);
-				hold_frames_ -= (from_hold_frames < hold_frames_) ? from_hold_frames : hold_frames_;
-				const UINT64 rest = static_cast<UINT64>(shift) - from_hold;
-				if (rest > 0)
-				{
-					read_pos_.store(r + (rest < queued ? static_cast<UINT32>(rest) : queued), std::memory_order_release);
-					resetResampler();
-				}
-			}
-			else if (shift < 0)
-			{
-				hold_frames_ += static_cast<UINT32>(static_cast<double>(-shift) / nominal + 0.5);
-			}
+			shiftOutput(shift, nominal);
 			fill_avg_ -= static_cast<double>(shift);	// Re-seeded instead if resetResampler() ran
 			error_avg_ = 0.0;
 			current_gain_ = 0.0f;
@@ -1265,6 +1273,32 @@ private:
 		}
 
 		return SUCCEEDED(render_->ReleaseBuffer(space, 0));
+	}
+
+	// BetterFxSound: moves the output by shift ring frames (render()). Later (shift > 0): silence not played yet goes
+	// first, then queued audio is skipped, and the audio restarts from silence (resetResampler()). Earlier (shift < 0):
+	// that much silence is played first. nominal is ring frames per device frame. Render thread.
+	void shiftOutput(INT64 shift, double nominal)
+	{
+		if (shift > 0)
+		{
+			const UINT32 r = read_pos_.load(std::memory_order_relaxed);
+			const UINT32 queued = write_pos_.load(std::memory_order_acquire) - r;
+			const UINT32 hold_queued = static_cast<UINT32>(hold_frames_ * nominal + 0.5);
+			const UINT32 from_hold = static_cast<UINT64>(shift) < hold_queued ? static_cast<UINT32>(shift) : hold_queued;
+			const UINT32 from_hold_frames = static_cast<UINT32>(from_hold / nominal + 0.5);
+			hold_frames_ -= (from_hold_frames < hold_frames_) ? from_hold_frames : hold_frames_;
+			const UINT64 rest = static_cast<UINT64>(shift) - from_hold;
+			if (rest > 0)
+			{
+				read_pos_.store(r + (rest < queued ? static_cast<UINT32>(rest) : queued), std::memory_order_release);
+				resetResampler();
+			}
+		}
+		else if (shift < 0)
+		{
+			hold_frames_ += static_cast<UINT32>(static_cast<double>(-shift) / nominal + 0.5);
+		}
 	}
 
 	bool writeSilence(UINT32 frames)
@@ -1351,7 +1385,7 @@ private:
 	bool fill_avg_valid_ = false;
 	bool realign_pending_ = false;	// Fading out before the output is moved (realign_reason_)
 	RealignReason realign_reason_ = kRealignDelay;	// Why realign_pending_ was set: what the output moves by
-	UINT32 device_allowance_frames_ = 0;	// Device queue counted in the latency target (device frames, openClient())
+	double device_allowance_secs_ = -1.0;	// Device queue counted in the latency target (seconds, first openClient()), < 0 = not set
 };
 
 bool setDeviceFullVolumeById(const std::wstring& device_id, const GUID* event_context)
