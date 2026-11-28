@@ -3891,6 +3891,10 @@ bool FxController::migrateOutputEntries()
 		if (failover_output_id_ == old_id)
 			failover_output_id_ = id;
 		failed_carrier_ids_.removeString(old_id);
+		// BetterFxSound: the stand-in marker of the outputs migration (loadOutputSettings) follows the id too,
+		// else the stand-in is not recognized and the old main output is added next to it.
+		if (settings_.containsKey("outputs_provisional_default") && settings_.getString("outputs_provisional_default") == old_id)
+			settings_.setString("outputs_provisional_default", id);
 		logMessage("Output \"" + name + "\" is back under a new device id, its settings follow it");
 		migrated = true;
 	}
