@@ -76,6 +76,8 @@ private:
 	// in_use, the devices the engine drives right now. UI/timer thread, never under config_mutex_ (COM calls).
 	void handBackUnusedDevices(const std::vector<std::wstring>& in_use);
 	bool isDevicePresent(const std::wstring& device_id) const;
+	// BetterFxSound: present and usable as an output (2 channels or more), the controller's own test.
+	bool isOutputPresent(const std::wstring& device_id) const;
 	bool isProcessing() const;
 
 	int sndDeviceHandleToSoundDevices(bool active_devices = true);

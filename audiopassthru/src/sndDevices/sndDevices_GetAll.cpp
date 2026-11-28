@@ -181,6 +181,35 @@ static int sndDevices_GetAllFindCachedID(struct sndDevicesHdlType* cast_handle, 
 	return(-1);
 }
 
+// BetterFxSound: the channel count of entry i when its format is not read by this enumeration (its properties or its
+// format cannot be read right now). An active device (being reconfigured: a format change, a Bluetooth reconnection, a
+// monitor waking up) keeps the count it had: with none it looked absent, or mono, to the controller while the engine
+// still played to it. One never read before gets 0 (unknown, neither present as an output nor mono) and is read again
+// shortly (sndDevicesGetChannelProbeIsDue()), up to SND_DEVICES_MAX_CHANNEL_PROBE_RETRIES due probes for this device:
+// one that can never be read does not use up the retries of another. A device that is not active is read afresh (with
+// new retries) once it is active again.
+static void sndDevices_GetAllKeepUnreadChannelCount(struct sndDevicesHdlType* cast_handle, int i, int* ip_known_num_channel,
+	int* ip_probe_retries, BOOL b_is_probe, BOOL* bp_active_device_is_unprobed)
+{
+	if (cast_handle->deviceState[i] == DEVICE_STATE_ACTIVE)
+	{
+		cast_handle->deviceNumChannel[i] = ip_known_num_channel[i];
+		if (ip_known_num_channel[i] <= 0)
+		{
+			if (b_is_probe && (ip_probe_retries[i] < SND_DEVICES_MAX_CHANNEL_PROBE_RETRIES))
+				ip_probe_retries[i]++;
+			if (ip_probe_retries[i] < SND_DEVICES_MAX_CHANNEL_PROBE_RETRIES)
+				*bp_active_device_is_unprobed = TRUE;
+		}
+	}
+	else
+	{
+		cast_handle->deviceNumChannel[i] = 0;
+		ip_known_num_channel[i] = 0;
+		ip_probe_retries[i] = 0;
+	}
+}
+
 // BetterFxSound: an enumeration that stops part way keeps only the entries it has read completely, so the list never
 // holds entries of an earlier enumeration (sndCheckDeviceChanges() then finds the difference and the list is read again).
 // ip_num_devices is usually &totalNumDevices itself.
@@ -337,8 +366,9 @@ static int sndDevices_GetAllDevices(PT_HANDLE* hp_sndDevices, int* ip_num_device
 		CoTaskMemFree(pID);
 
 		// BetterFxSound: its state first (sndCheckDeviceChanges() compares it with the system and would report a stale
-		// one as a change on every comparison). A property that cannot be read leaves the values written above; the
-		// channel count and the probe retries the previous enumeration had for this device are kept then.
+		// one as a change on every comparison). A property that cannot be read leaves the names written above; the
+		// channel count is then set by sndDevices_GetAllKeepUnreadChannelCount(), from the count and the probe retries
+		// the previous enumeration had for this device.
 		if (FAILED(cast_handle->pAllDevices[i]->GetState(&cast_handle->deviceState[i])))
 			cast_handle->deviceState[i] = 0;
 		cache_index = sndDevices_GetAllFindCachedID(cast_handle, cast_handle->pwszID[i]);
@@ -351,13 +381,19 @@ static int sndDevices_GetAllDevices(PT_HANDLE* hp_sndDevices, int* ip_num_device
 		// Access the registry properties for this device.
 		hr = cast_handle->pAllDevices[i]->OpenPropertyStore(STGM_READ, &pProps);
 		if (FAILED(hr))
+		{
+			sndDevices_GetAllKeepUnreadChannelCount(cast_handle, (int)i, known_num_channel, probe_retries, b_is_probe,
+				&b_active_device_is_unprobed);
 			continue;
+		}
 
 		PropVariantInit(&FriendlyName);
 		hr = pProps->GetValue(PKEY_Device_FriendlyName, &FriendlyName);
 		if (FAILED(hr))
 		{
 			PropVariantClear(&FriendlyName);
+			sndDevices_GetAllKeepUnreadChannelCount(cast_handle, (int)i, known_num_channel, probe_retries, b_is_probe,
+				&b_active_device_is_unprobed);
 			continue;
 		}
 
@@ -367,6 +403,8 @@ static int sndDevices_GetAllDevices(PT_HANDLE* hp_sndDevices, int* ip_num_device
 		{
 			PropVariantClear(&FriendlyName);
 			PropVariantClear(&DeviceDesc);
+			sndDevices_GetAllKeepUnreadChannelCount(cast_handle, (int)i, known_num_channel, probe_retries, b_is_probe,
+				&b_active_device_is_unprobed);
 			continue;
 		}
 
@@ -414,28 +452,11 @@ static int sndDevices_GetAllDevices(PT_HANDLE* hp_sndDevices, int* ip_num_device
 				known_num_channel[i] = wfx.nChannels;
 				probe_retries[i] = 0;
 			}
-			else if (cast_handle->deviceState[i] == DEVICE_STATE_ACTIVE)
-			{
-				// BetterFxSound: an active device whose format cannot be read right now (it is being reconfigured: a
-				// format change, a Bluetooth reconnection, a monitor waking up) keeps the count it had. With 0 it looked
-				// absent to the controller while the engine still played to it. A device never read before is read
-				// again shortly (sndDevicesGetChannelProbeIsDue()), up to SND_DEVICES_MAX_CHANNEL_PROBE_RETRIES due
-				// probes for this device: one that can never be read does not use up the retries of another.
-				cast_handle->deviceNumChannel[i] = known_num_channel[i];
-				if (known_num_channel[i] <= 0)
-				{
-					if (b_is_probe && (probe_retries[i] < SND_DEVICES_MAX_CHANNEL_PROBE_RETRIES))
-						probe_retries[i]++;
-					if (probe_retries[i] < SND_DEVICES_MAX_CHANNEL_PROBE_RETRIES)
-						b_active_device_is_unprobed = TRUE;
-				}
-			}
 			else
 			{
-				// BetterFxSound: not active; read afresh (with new retries) once it is active again.
-				cast_handle->deviceNumChannel[i] = 0;
-				known_num_channel[i] = 0;
-				probe_retries[i] = 0;
+				// BetterFxSound: the format cannot be read right now.
+				sndDevices_GetAllKeepUnreadChannelCount(cast_handle, (int)i, known_num_channel, probe_retries, b_is_probe,
+					&b_active_device_is_unprobed);
 			}
 
 			// Check ID strings to see if this is the default device.
@@ -456,6 +477,12 @@ static int sndDevices_GetAllDevices(PT_HANDLE* hp_sndDevices, int* ip_num_device
 			}
 			if (i_found_dfx_string)
 				cast_handle->dfxDeviceNum = i;
+		}
+		else
+		{
+			// BetterFxSound: a name came back empty (VT_EMPTY); the format is not read either.
+			sndDevices_GetAllKeepUnreadChannelCount(cast_handle, (int)i, known_num_channel, probe_retries, b_is_probe,
+				&b_active_device_is_unprobed);
 		}
 
 		PropVariantClear(&FriendlyName);

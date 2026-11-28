@@ -927,6 +927,25 @@ bool AudioPassthruPrivate::isDevicePresent(const std::wstring& device_id) const
 }
 
 /*
+* FUNCTION: isOutputPresent()
+* DESCRIPTION: BetterFxSound. True if the device is present (isDevicePresent()) and can be one of the outputs: its
+* channel count is known and is 2 or more. This is the test FxController::refreshActiveOutputs() makes, so a device
+* the UI shows as disconnected (a mono device, or one whose format has not been read yet) is not played to either.
+*/
+bool AudioPassthruPrivate::isOutputPresent(const std::wstring& device_id) const
+{
+	if (device_id.empty())
+		return false;
+
+	for (int index = 0; index < s_sndDevices_.totalNumDevices && index < SND_DEVICES_MAX_NUM_DEVICES; index++)
+	{
+		if (s_sndDevices_.deviceState[index] == DEVICE_STATE_ACTIVE && device_id == s_sndDevices_.pwszID[index])
+			return s_sndDevices_.deviceNumChannel[index] >= 2;
+	}
+	return false;
+}
+
+/*
 * FUNCTION: applyAdditionalOutputs()
 * DESCRIPTION: BetterFxSound. Works out, for the current carrier (the targeted real playback device):
 *  - whether the carrier plays, and with which delay, channel mode and trim (published as atomics that the
@@ -974,7 +993,7 @@ void AudioPassthruPrivate::applyAdditionalOutputs()
 				if (added.device_id == id)
 					return true;
 			}
-			return !isDevicePresent(id);
+			return !isOutputPresent(id);
 		};
 
 		// The carrier's own entry decides whether it plays. Missing or disabled: it plays silence.
@@ -1309,7 +1328,7 @@ bool AudioPassthruPrivate::startDelayCalibration()
 				if (!output.enabled || output.device_id.empty() || output.device_id == wcp_dfx_guid)
 					continue;
 				any_enabled = true;
-				if (isDevicePresent(output.device_id))
+				if (isOutputPresent(output.device_id))
 					any_connected = true;
 			}
 
