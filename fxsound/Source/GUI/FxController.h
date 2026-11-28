@@ -366,7 +366,10 @@ private:
 	bool system_sleeping_;
 	// BetterFxSound: restoreDefaultPlaybackDevice() done and processing not started since. Another hand-back
 	// (a session event while off) would set the Windows default again over the user's own choice.
-	bool engine_handed_back_ = false;
+	// True from the start: a new process has not processed yet, so starting (or logging on) with FxSound off
+	// does not make the device the engine last processed on the Windows default again over the user's choice.
+	// powerOn(false) still hands back when the virtual device is the live Windows default (left by a crash).
+	bool engine_handed_back_ = true;
 	// BetterFxSound: at logon the virtual endpoint can come up after FxSound starts. init() waits this long for
 	// it, checking every VIRTUAL_DEVICE_POLL_MS, before the device error.
 	static constexpr uint32 VIRTUAL_DEVICE_WAIT_MS = 15000;
