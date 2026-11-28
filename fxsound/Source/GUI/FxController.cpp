@@ -4297,9 +4297,9 @@ void FxController::requestCarrier(const SoundDevice& device)
 	// device when it starts. BetterFxSound: carrier_id_ is already the requested device while its switch is
 	// pending; timerCallback() asks again if no reinit takes it.
 	bool in_place = isTimerRunning() ? (id == carrier_id_) : device.isDefaultDevice;
-	// BetterFxSound: a switch to this device the engine still has pending (a device list refresh came before its
+	// BetterFxSound: while processing, a switch to this device the engine still has pending (a device list refresh came before its
 	// reinit, see updateOutputs()) is not asked for again: that would restart timerCallback()'s retry count.
-	if (!in_place && id == requested_carrier_id_ && audio_passthru_->isCarrierSwitchPending())
+	if (!in_place && isTimerRunning() && id == requested_carrier_id_ && audio_passthru_->isCarrierSwitchPending())
 		in_place = true;
 	if (!in_place)
 	{
