@@ -3,6 +3,7 @@ package mcpserver
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -55,32 +56,35 @@ func (a *App) registerWriteTools(s *mcp.Server) {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name: "fxsound_enable_output",
-		Description: "Enables one output (by exact Windows friendly name) so FxSound also plays on it, " +
-			"leaving the other outputs as they are. The device must be connected. Requires FxSound to be " +
-			"running.",
+		Description: "Enables one output (by exact Windows friendly name, or by its id from the outputs " +
+			"list in fxsound://status) so FxSound also plays on it, leaving the other outputs as they are. " +
+			"A name shared by several connected outputs enables all of them; pass the id to pick one. The " +
+			"device must be connected. Requires FxSound to be running.",
 		Annotations: &mcp.ToolAnnotations{DestructiveHint: boolPtr(false)},
 	}, a.toolEnableOutput)
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name: "fxsound_disable_output",
-		Description: "Disables one output (by exact Windows friendly name), leaving the other outputs as " +
-			"they are. With every output disabled FxSound plays silence. Requires FxSound to be running.",
+		Description: "Disables one output (by exact Windows friendly name, or by its id from the outputs " +
+			"list in fxsound://status), leaving the other outputs as they are. A name shared by several " +
+			"outputs disables all of them; pass the id to pick one. With every output disabled FxSound " +
+			"plays silence. Requires FxSound to be running.",
 		Annotations: &mcp.ToolAnnotations{DestructiveHint: boolPtr(false)},
 	}, a.toolDisableOutput)
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name: "fxsound_set_output_volume",
 		Description: "Sets one output's volume trim, 0-100 percent, on top of the Windows master volume " +
-			"(which applies to every output). Output is chosen by exact Windows friendly name. Requires " +
-			"FxSound to be running.",
+			"(which applies to every output). Output is chosen by exact Windows friendly name (every output " +
+			"with that name) or by its id from fxsound://status. Requires FxSound to be running.",
 		Annotations: &mcp.ToolAnnotations{DestructiveHint: boolPtr(false)},
 	}, a.toolSetOutputVolume)
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name: "fxsound_set_output_delay",
 		Description: "Sets one output's delay, 0-500 milliseconds, e.g. to line up speakers with " +
-			"Bluetooth headphones. Output is chosen by exact Windows friendly name. Requires FxSound to be " +
-			"running.",
+			"Bluetooth headphones. Output is chosen by exact Windows friendly name (every output with that " +
+			"name) or by its id from fxsound://status. Requires FxSound to be running.",
 		Annotations: &mcp.ToolAnnotations{DestructiveHint: boolPtr(false)},
 	}, a.toolSetOutputDelay)
 
@@ -150,7 +154,7 @@ func (a *App) toolSelectPreset(ctx context.Context, _ *mcp.CallToolRequest, in s
 }
 
 type setOutputDeviceInput struct {
-	DeviceName string `json:"device_name" jsonschema:"the output device's exact Windows friendly name"`
+	DeviceName string `json:"device_name" jsonschema:"the output device's exact Windows friendly name, or its id from fxsound://status"`
 }
 
 func (a *App) toolSetOutputDevice(ctx context.Context, _ *mcp.CallToolRequest, in setOutputDeviceInput) (*mcp.CallToolResult, applyResult, error) {
@@ -167,37 +171,42 @@ func (a *App) toolSetOutputDevice(ctx context.Context, _ *mcp.CallToolRequest, i
 }
 
 type outputNameInput struct {
-	DeviceName string `json:"device_name" jsonschema:"the output's exact Windows friendly name"`
+	DeviceName string `json:"device_name" jsonschema:"the output's exact Windows friendly name, or its id from fxsound://status"`
 }
 
 func (a *App) toolEnableOutput(ctx context.Context, _ *mcp.CallToolRequest, in outputNameInput) (*mcp.CallToolResult, applyResult, error) {
 	if err := fxsound.ValidateOutputName(in.DeviceName); err != nil {
 		return nil, applyResult{}, err
 	}
-	if err := a.checkOutput(ctx, in.DeviceName, true); err != nil {
+	targets, err := a.checkOutput(ctx, in.DeviceName, true)
+	if err != nil {
 		return nil, applyResult{}, err
 	}
 	if err := fxsound.Apply(ctx, a.Paths, map[string]string{"enable-output": in.DeviceName}, true); err != nil {
 		return nil, applyResult{}, err
 	}
-	return nil, applyResult{Applied: true, Detail: fmt.Sprintf("output enabled: %s", in.DeviceName)}, nil
+	return a.confirmOutputs(ctx, targets, fmt.Sprintf("output enabled: %s", in.DeviceName),
+		func(o *fxsound.OutputInfo) bool { return o != nil && o.Enabled })
 }
 
 func (a *App) toolDisableOutput(ctx context.Context, _ *mcp.CallToolRequest, in outputNameInput) (*mcp.CallToolResult, applyResult, error) {
 	if err := fxsound.ValidateOutputName(in.DeviceName); err != nil {
 		return nil, applyResult{}, err
 	}
-	if err := a.checkOutput(ctx, in.DeviceName, false); err != nil {
+	targets, err := a.checkOutput(ctx, in.DeviceName, false)
+	if err != nil {
 		return nil, applyResult{}, err
 	}
 	if err := fxsound.Apply(ctx, a.Paths, map[string]string{"disable-output": in.DeviceName}, true); err != nil {
 		return nil, applyResult{}, err
 	}
-	return nil, applyResult{Applied: true, Detail: fmt.Sprintf("output disabled: %s", in.DeviceName)}, nil
+	// A disabled output that is not connected leaves the outputs list.
+	return a.confirmOutputs(ctx, targets, fmt.Sprintf("output disabled: %s", in.DeviceName),
+		func(o *fxsound.OutputInfo) bool { return o == nil || !o.Enabled })
 }
 
 type setOutputVolumeInput struct {
-	DeviceName string `json:"device_name" jsonschema:"the output's exact Windows friendly name"`
+	DeviceName string `json:"device_name" jsonschema:"the output's exact Windows friendly name, or its id from fxsound://status"`
 	Volume     int    `json:"volume" jsonschema:"volume trim in percent, 0 to 100"`
 }
 
@@ -208,18 +217,20 @@ func (a *App) toolSetOutputVolume(ctx context.Context, _ *mcp.CallToolRequest, i
 	if err := fxsound.ValidateOutputVolume(in.Volume); err != nil {
 		return nil, applyResult{}, err
 	}
-	if err := a.checkOutput(ctx, in.DeviceName, false); err != nil {
+	targets, err := a.checkOutput(ctx, in.DeviceName, false)
+	if err != nil {
 		return nil, applyResult{}, err
 	}
 	flags := map[string]string{"output-volume": fxsound.FormatOutputValue(in.DeviceName, in.Volume)}
 	if err := fxsound.Apply(ctx, a.Paths, flags, true); err != nil {
 		return nil, applyResult{}, err
 	}
-	return nil, applyResult{Applied: true, Detail: fmt.Sprintf("output %s volume set to %d%%", in.DeviceName, in.Volume)}, nil
+	return a.confirmOutputs(ctx, targets, fmt.Sprintf("output %s volume set to %d%%", in.DeviceName, in.Volume),
+		func(o *fxsound.OutputInfo) bool { return o != nil && o.Volume == in.Volume })
 }
 
 type setOutputDelayInput struct {
-	DeviceName string `json:"device_name" jsonschema:"the output's exact Windows friendly name"`
+	DeviceName string `json:"device_name" jsonschema:"the output's exact Windows friendly name, or its id from fxsound://status"`
 	DelayMs    int    `json:"delay_ms" jsonschema:"delay in milliseconds, 0 to 500"`
 }
 
@@ -230,14 +241,16 @@ func (a *App) toolSetOutputDelay(ctx context.Context, _ *mcp.CallToolRequest, in
 	if err := fxsound.ValidateOutputDelay(in.DelayMs); err != nil {
 		return nil, applyResult{}, err
 	}
-	if err := a.checkOutput(ctx, in.DeviceName, false); err != nil {
+	targets, err := a.checkOutput(ctx, in.DeviceName, false)
+	if err != nil {
 		return nil, applyResult{}, err
 	}
 	flags := map[string]string{"output-delay": fxsound.FormatOutputValue(in.DeviceName, in.DelayMs)}
 	if err := fxsound.Apply(ctx, a.Paths, flags, true); err != nil {
 		return nil, applyResult{}, err
 	}
-	return nil, applyResult{Applied: true, Detail: fmt.Sprintf("output %s delay set to %d ms", in.DeviceName, in.DelayMs)}, nil
+	return a.confirmOutputs(ctx, targets, fmt.Sprintf("output %s delay set to %d ms", in.DeviceName, in.DelayMs),
+		func(o *fxsound.OutputInfo) bool { return o != nil && o.DelayMs == in.DelayMs })
 }
 
 type presetNameInput struct {
@@ -349,21 +362,54 @@ func (a *App) checkOutputIfRunning(ctx context.Context, name string) error {
 	if !running {
 		return nil
 	}
-	return a.checkOutput(ctx, name, true)
+	_, err = a.checkOutput(ctx, name, true)
+	return err
 }
 
 // checkOutput makes sure FxSound is running and knows an output with this
-// exact name, so a typo is reported (with the available outputs) instead of
-// being silently ignored by FxSound. needPresent also requires the device to
-// be connected, as enabling does.
-func (a *App) checkOutput(ctx context.Context, name string, needPresent bool) error {
+// exact name (or endpoint id), so a typo is reported (with the available
+// outputs) instead of being silently ignored by FxSound. needPresent also
+// requires the device to be connected, as enabling does. It returns the
+// outputs the option will act on.
+func (a *App) checkOutput(ctx context.Context, name string, needPresent bool) ([]fxsound.OutputInfo, error) {
 	if err := fxsound.EnsureRunning(ctx, a.Paths); err != nil {
-		return err
+		return nil, err
 	}
 	status, err := fxsound.ReadStatus(ctx, a.Paths)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	_, err = status.ResolveOutput(name, needPresent)
-	return err
+	return status.ResolveOutput(name, needPresent)
+}
+
+// confirmOutputs reads the state back after a per-output option was applied
+// and reports Applied only if every targeted output (matched by id; nil when
+// it is no longer listed) now satisfies done. FxSound handles the forwarded
+// option before the --status that follows it, so the fresh status shows its
+// effect, and a no-op is reported instead of claimed as applied.
+func (a *App) confirmOutputs(ctx context.Context, targets []fxsound.OutputInfo, detail string, done func(o *fxsound.OutputInfo) bool) (*mcp.CallToolResult, applyResult, error) {
+	status, err := fxsound.ReadStatus(ctx, a.Paths)
+	if err != nil {
+		return nil, applyResult{}, fmt.Errorf("read state after the change: %w", err)
+	}
+	var missed []string
+	for _, t := range targets {
+		var current *fxsound.OutputInfo
+		for i := range status.Outputs {
+			if status.Outputs[i].ID == t.ID {
+				current = &status.Outputs[i]
+				break
+			}
+		}
+		if !done(current) {
+			missed = append(missed, fmt.Sprintf("%q (id %s)", t.Name, t.ID))
+		}
+	}
+	if len(missed) > 0 {
+		return nil, applyResult{Applied: false, Detail: "FxSound did not apply the change to " + strings.Join(missed, ", ")}, nil
+	}
+	if len(targets) > 1 {
+		detail += fmt.Sprintf(" (%d outputs with that name)", len(targets))
+	}
+	return nil, applyResult{Applied: true, Detail: detail}, nil
 }

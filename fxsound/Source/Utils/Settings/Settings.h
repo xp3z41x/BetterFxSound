@@ -54,6 +54,10 @@ namespace FxSound
 		// Removes the key from the user settings.
 		void   removeValue(juce::StringRef key) noexcept;
 
+		// BetterFxSound: writes pending changes to disk now. A change is otherwise written by a JUCE timer
+		// 3 s later, which never fires once the message loop has ended (quit, restart, crash relaunch, logoff).
+		void   flush() noexcept;
+
 	private:
 		ApplicationProperties app_default_properties_;
 		ApplicationProperties app_user_properties_;

@@ -223,6 +223,8 @@ public:
 	static bool launchNewInstance();
 	// Saves state, launches a new instance and quits this one.
 	void restartApplication();
+	// BetterFxSound: writes pending settings changes to disk now (on quit, restart and crash relaunch).
+	void flushSettings() { settings_.flush(); }
 
 	void logMessage(const String& message)
 	{

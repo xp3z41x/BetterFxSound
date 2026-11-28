@@ -465,22 +465,31 @@ void FxController::applyConfig(const String& commandline)
 		}
 	}
 
-	// BetterFxSound outputs rework: per-output options. Outputs are matched by friendly name. Several devices
-	// can share a name (identical monitors or DACs): the option acts on every connected output with that name,
-	// or, if none is connected, on every disconnected one. Enabling needs the device to be connected; the other
-	// options also work on an enabled output that is not connected.
-	auto findOutputsByName = [this](const String& name, StringArray& ids) -> bool
+	// BetterFxSound outputs rework: per-output options. An output is named by its endpoint id (the "id" that
+	// status.json reports), which picks exactly that output, or by its friendly name. Several outputs can share
+	// a name (identical monitors or DACs, or a device back under a new endpoint id next to its old entry): a
+	// name then picks every output with that name. Enabling needs the device to be connected, so it only picks
+	// the connected ones; disabling, volume and delay pick the disconnected ones too, so disabling a name never
+	// leaves a same-named output enabled.
+	auto findOutputs = [this](const String& key, bool connected_only, StringArray& ids) -> bool
 	{
-		StringArray present_ids;
-		StringArray absent_ids;
-		for (auto& output : getOutputs())
+		ids.clear();
+		auto outputs = getOutputs();
+		for (auto& output : outputs)
 		{
-			if (output.name == name)
-				(output.present ? present_ids : absent_ids).add(output.id);
+			if (output.id == key)
+			{
+				ids.add(output.id);
+				return output.present || !connected_only;
+			}
 		}
-		ids = present_ids.isEmpty() ? absent_ids : present_ids;
+		for (auto& output : outputs)
+		{
+			if (output.name == key && (output.present || !connected_only))
+				ids.add(output.id);
+		}
 		if (ids.size() > 1)
-			logMessage("Command line: " + String(ids.size()) + " outputs are named \"" + name + "\", all of them are changed");
+			logMessage("Command line: " + String(ids.size()) + " outputs are named \"" + key + "\", all of them are changed");
 		return !ids.isEmpty();
 	};
 
@@ -489,7 +498,7 @@ void FxController::applyConfig(const String& commandline)
 		// BetterFxSound outputs rework: --output enables only this output (every connected one with that name).
 		StringArray ids;
 		// enableOnlyOutput() needs the device connected: nothing changes if only disconnected outputs match.
-		if (findOutputsByName(output_device, ids) && enableOnlyOutput(ids[0]))
+		if (findOutputs(output_device, true, ids) && enableOnlyOutput(ids[0]))
 		{
 			for (int i = 1; i < ids.size(); i++)
 				setOutputEnabled(ids[i], true);
@@ -517,13 +526,13 @@ void FxController::applyConfig(const String& commandline)
 
 	StringArray output_ids;
 	bool outputs_touched = false;
-	if (enable_output.isNotEmpty() && findOutputsByName(enable_output, output_ids))
+	if (enable_output.isNotEmpty() && findOutputs(enable_output, true, output_ids))
 	{
 		for (auto& output_id : output_ids)
 			setOutputEnabled(output_id, true);
 		outputs_touched = true;
 	}
-	if (disable_output.isNotEmpty() && findOutputsByName(disable_output, output_ids))
+	if (disable_output.isNotEmpty() && findOutputs(disable_output, false, output_ids))
 	{
 		for (auto& output_id : output_ids)
 			setOutputEnabled(output_id, false);
@@ -533,14 +542,14 @@ void FxController::applyConfig(const String& commandline)
 	String output_arg_name;
 	int output_arg_value = 0;
 	if (output_volume.isNotEmpty() && parseNameAndValue(output_volume, output_arg_name, output_arg_value) &&
-		output_arg_value <= 100 && findOutputsByName(output_arg_name, output_ids))
+		output_arg_value <= 100 && findOutputs(output_arg_name, false, output_ids))
 	{
 		for (auto& output_id : output_ids)
 			setOutputVolume(output_id, output_arg_value);
 		outputs_touched = true;
 	}
 	if (output_delay.isNotEmpty() && parseNameAndValue(output_delay, output_arg_name, output_arg_value) &&
-		output_arg_value <= 500 && findOutputsByName(output_arg_name, output_ids))
+		output_arg_value <= 500 && findOutputs(output_arg_name, false, output_ids))
 	{
 		for (auto& output_id : output_ids)
 			setOutputDelay(output_id, output_arg_value);
@@ -1631,13 +1640,14 @@ void FxController::initOutputs(std::vector<SoundDevice>& sound_devices)
 	// BetterFxSound: an output stored under an endpoint id that is gone, its device back under a new one.
 	migrateOutputEntries();
 
-	// --output on the command line: enable only this output (every connected one with that name).
+	// --output on the command line: enable only this output (every connected one with that name, or the one
+	// with that endpoint id).
 	if (startup_output_name_.isNotEmpty())
 	{
 		StringArray ids;
 		for (auto& device : active_output_devices_)
 		{
-			if (startup_output_name_ == device.deviceFriendlyName.c_str())
+			if (startup_output_name_ == device.deviceFriendlyName.c_str() || startup_output_name_ == device.pwszID.c_str())
 				ids.add(String(device.pwszID.c_str()));
 		}
 		if (!ids.isEmpty())
@@ -3024,6 +3034,8 @@ bool FxController::launchNewInstance()
 void FxController::restartApplication()
 {
 	autoSaveModifiedPreset();
+	// BetterFxSound: the new instance reads the settings file, so write the pending changes first.
+	flushSettings();
 
 	if (launchNewInstance())
 	{
@@ -3529,6 +3541,8 @@ const SoundDevice* FxController::findActiveOutput(const String& id) const
 void FxController::loadOutputSettings(const std::vector<SoundDevice>& sound_devices)
 {
 	static const char* const legacy_keys[] = { "output_device_name", "main_output_delay_ms", "main_output_channel_mode", "additional_outputs" };
+	// BetterFxSound: id of the Windows default enabled as a stand-in while the old main output was unresolved.
+	static const char* const provisional_key = "outputs_provisional_default";
 
 	output_entries_.clear();
 
@@ -3608,6 +3622,33 @@ void FxController::loadOutputSettings(const std::vector<SoundDevice>& sound_devi
 				if (has_outputs && findOutputEntry(main_id) == nullptr)
 					logMessage("Outputs migration: output \"" + main_name + "\" resolved on a later start, added");
 
+				// BetterFxSound: the stand-in enabled while the main output was unresolved gives way to it, unless
+				// the outputs were changed since (the stand-in is no longer the only enabled output).
+				if (has_outputs && settings_.containsKey(provisional_key))
+				{
+					const String provisional_id = settings_.getString(provisional_key);
+					bool only_provisional_enabled = false;
+					for (auto& existing : output_entries_)
+					{
+						if (!existing.enabled)
+							continue;
+						if (existing.id != provisional_id)
+						{
+							only_provisional_enabled = false;
+							break;
+						}
+						only_provisional_enabled = true;
+					}
+					if (only_provisional_enabled && provisional_id != main_id)
+					{
+						if (auto* provisional = findOutputEntry(provisional_id))
+						{
+							provisional->enabled = false;
+							logMessage("Outputs migration: stand-in output \"" + provisional->name + "\" disabled for \"" + main_name + "\"");
+						}
+					}
+				}
+
 				OutputEntry entry;
 				entry.id = main_id;
 				entry.name = main_name;
@@ -3675,6 +3716,10 @@ void FxController::loadOutputSettings(const std::vector<SoundDevice>& sound_devi
 			entry.name = first.deviceFriendlyName.c_str();
 			entry.enabled = true;
 			addEntry(entry);
+			// BetterFxSound: only a stand-in while the old main output is unresolved: it is replaced by that
+			// output on the start where it resolves, instead of both playing.
+			if (main_pending)
+				settings_.setString(provisional_key, entry.id);
 		}
 
 		// With no device at all, try again on the next start rather than saving an empty set (= silence).
@@ -3689,6 +3734,8 @@ void FxController::loadOutputSettings(const std::vector<SoundDevice>& sound_devi
 		if (settings_.containsKey(key))
 			settings_.removeValue(key);
 	}
+	if (!main_pending && settings_.containsKey(provisional_key))
+		settings_.removeValue(provisional_key);
 
 	if (save)
 		saveOutputSettings();

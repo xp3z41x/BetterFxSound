@@ -125,6 +125,10 @@ public:
             logRemainingDesktopComponents();
         }
 
+        // BetterFxSound: the settings timer that would write the last changes never fires once the message
+        // loop has ended, and the controller (which owns the settings) is never destroyed.
+        FxController::getInstance().flushSettings();
+
         LocalisedStrings::setCurrentMappings(nullptr);
         LookAndFeel::setDefaultLookAndFeel(nullptr);
 
@@ -137,6 +141,9 @@ public:
         // This is called when the app is being asked to quit: you can ignore this
         // request and let the app carry on running, or call quit() to allow the app to close.
         
+        // BetterFxSound: written now too, since at logoff or shutdown Windows may end the process before
+        // shutdown() runs.
+        FxController::getInstance().flushSettings();
         quit();
     }
 
@@ -192,6 +199,9 @@ private:
 
         // Capture stack based on crash context
         CaptureAndLogCallStack(exception_info->ContextRecord);
+
+        // BetterFxSound: best effort, so the relaunched instance (or the next start) gets the last settings changes.
+        controller.flushSettings();
 
         relaunchAfterCrash();
 
