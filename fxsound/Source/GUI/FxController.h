@@ -180,6 +180,9 @@ public:
 	void cancelDelayCalibration();
 	int getDelayCalibrationState(int* progress_percent); // 0 idle, 1 running, 2 done, 3 failed
 	String getDelayCalibrationError();
+	// BetterFxSound: why the running measurement was stopped by FxSound itself (turned off, sleep), empty if it was
+	// not. The engine then reports it as cancelled (state 0).
+	String getDelayCalibrationInterruption();
 	// Turns the measured latencies into delays, saves and applies them. Returns a summary for the user.
 	String applyDelayCalibrationResults();
 
@@ -404,6 +407,12 @@ private:
 	// lock_ released (setOutputs() may wait for removed outputs' render threads to stop, on the message thread).
 	std::vector< ::OutputConfig> pending_engine_outputs_;
 	bool engine_outputs_pending_ = false;
+	// BetterFxSound: the delay each output had when the running (or last) delay measurement started, by id. Those are
+	// the delays it was measured with: applyDelayCalibrationResults() removes them, whatever the delays are by then.
+	std::map<String, int> calibration_delays_;
+	// Why FxSound itself stopped the measurement (see getDelayCalibrationInterruption()), empty if it did not.
+	String calibration_interruption_;
+	void interruptDelayCalibration(const String& reason);
 	bool no_output_;				// Powered off because no real output device was present
 	String startup_output_name_;	// --output given on the command line before init
 

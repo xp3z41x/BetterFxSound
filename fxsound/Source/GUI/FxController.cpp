@@ -2139,6 +2139,9 @@ void FxController::powerOn(bool on)
 			return;
 		}
 
+		// BetterFxSound: a delay measurement would go on with nothing playing (no output, session disconnected too).
+		interruptDelayCalibration(TRANS("FxSound was turned off during the measurement. Synchronize again."));
+
 		// BetterFxSound: a sleep under way keeps its mute, onSystemResume() clears it.
 		if (hdmi_reconnect_pending_ && !system_sleeping_)
 		{
@@ -2683,6 +2686,9 @@ void FxController::onSystemSuspend()
 		system_sleeping_ = true;
 	}
 
+	// BetterFxSound: muted, the measurement would hear nothing, and the devices it plays to may go away.
+	interruptDelayCalibration(TRANS("The computer went to sleep during the measurement. Synchronize again."));
+
 	// BetterFxSound: whatever the power state, so the mute and its clearing on resume do not depend on the power
 	// being the same at both (it can be switched in between). The mute does nothing while processing is off.
 	if (audio_passthru_ != nullptr)
@@ -3184,15 +3190,56 @@ void FxController::setNewOutputPrioritized(bool prioritize)
 	settings_.setBool("prioritize_new_output", prioritize);
 }
 
+// Message thread, with lock_ not held by the caller.
 bool FxController::startDelayCalibration()
 {
-	return audio_passthru_ != nullptr && audio_passthru_->startDelayCalibration();
+	// BetterFxSound: the outputs still queued for the engine reach it first, so the delays recorded below are the
+	// ones it measures with (it applies them before the measurement starts).
+	flushOutputsToEngine();
+
+	{
+		ScopedLock auto_lock(lock_);
+
+		if (audio_passthru_ == nullptr)
+			return false;
+
+		calibration_interruption_.clear();
+		calibration_delays_.clear();
+		for (const auto& entry : output_entries_)
+		{
+			if (entry.id.isNotEmpty())
+				calibration_delays_[entry.id] = entry.delay_ms;
+		}
+	}
+
+	return audio_passthru_->startDelayCalibration();
 }
 
 void FxController::cancelDelayCalibration()
 {
 	if (audio_passthru_ != nullptr)
 		audio_passthru_->cancelDelayCalibration();
+}
+
+// BetterFxSound: FxSound stops processing (turned off, sleep): a running measurement would go on hearing nothing, or
+// end with repetitions recorded while nothing played, and keep its solo output and the engine's deferred output
+// changes until it ends. Stop it, and say why. The engine applies its deferred changes once it is no longer running.
+void FxController::interruptDelayCalibration(const String& reason)
+{
+	ScopedLock auto_lock(lock_);
+
+	if (audio_passthru_ == nullptr || audio_passthru_->getDelayCalibrationState(nullptr) != 1)
+		return;
+
+	if (calibration_interruption_.isEmpty())
+		calibration_interruption_ = reason;
+	audio_passthru_->cancelDelayCalibration();
+}
+
+String FxController::getDelayCalibrationInterruption()
+{
+	ScopedLock auto_lock(lock_);
+	return calibration_interruption_;
 }
 
 int FxController::getDelayCalibrationState(int* progress_percent)
@@ -3222,6 +3269,10 @@ String FxController::applyDelayCalibrationResults()
 
 	ScopedLock auto_lock(lock_);
 
+	// BetterFxSound: the cancel came too late to stop the measurement, but part of it was made while nothing played.
+	if (calibration_interruption_.isNotEmpty())
+		return calibration_interruption_ + " " + TRANS("No delay was changed.");
+
 	auto nameOf = [this](const String& id) -> String {
 		if (auto* device = findActiveOutput(id))
 			return String(device->deviceFriendlyName.c_str());
@@ -3233,30 +3284,55 @@ String FxController::applyDelayCalibrationResults()
 		return id;
 	};
 
-	auto currentDelay = [this](const String& id) {
-		auto* entry = findOutputEntry(id);
-		return entry != nullptr ? entry->delay_ms : 0;
+	// BetterFxSound: the delay the output was measured with, recorded when the measurement started, not the one it
+	// has now (a delay changed meanwhile was not measured: the engine holds the outputs' changes back while it runs).
+	auto measuredDelay = [this](const String& id) {
+		auto it = calibration_delays_.find(id);
+		return it != calibration_delays_.end() ? it->second : 0;
 	};
 
 	// Each measurement includes the delay the output already had. Remove it to get the output's own
 	// latency, then delay every measured output so they all match the slowest one.
 	bool any_measured = false;
+	bool any_unmeasured = false;
 	double slowest = 0.0;
+	double measured_total_sum = 0.0;
+	int measured_count = 0;
 	for (auto& result : results)
 	{
 		if (!result.measured)
+		{
+			any_unmeasured = true;
 			continue;
+		}
 
-		auto own_latency = result.latency_ms - currentDelay(String(result.device_id.c_str()));
+		auto own_latency = result.latency_ms - measuredDelay(String(result.device_id.c_str()));
 		slowest = any_measured ? jmax(slowest, own_latency) : own_latency;
 		any_measured = true;
+		measured_total_sum += result.latency_ms;
+		measured_count++;
 	}
 
 	if (!any_measured)
 		return TRANS("No output could be heard clearly, so no delay was changed. Turn the volume up, move the microphone closer and try again.");
 
+	// BetterFxSound: an output not heard keeps the total latency (own latency plus delay) it had, which is only known
+	// as what it was in step with: the measured outputs' total latencies, averaged (all the same once synchronized).
+	// Aligning the measured outputs to the slowest of them alone would move them away from it, typically when the
+	// output not heard was the slowest one (Bluetooth, HDMI). So they are aligned to that total instead, or, when
+	// one of them is now slower than it, to that slower one, and the outputs not heard follow by the same amount.
+	double reference = slowest;
+	int unmeasured_shift = 0;
+	if (any_unmeasured)
+	{
+		auto previous_total = measured_total_sum / measured_count;
+		reference = jmax(slowest, previous_total);
+		unmeasured_shift = roundToInt(reference - previous_total);
+	}
+
 	StringArray lines;
 	StringArray not_heard;
+	StringArray not_heard_moved;
 	bool clamped = false;
 
 	for (auto& result : results)
@@ -3266,13 +3342,23 @@ String FxController::applyDelayCalibrationResults()
 
 		if (!result.measured)
 		{
-			// Keeps its delay.
-			not_heard.add(name);
+			// Keeps its delay, or follows the others by the amount they moved past its total latency.
+			auto delay = jlimit(0, 500, measuredDelay(id) + unmeasured_shift);
+			if (unmeasured_shift == 0 || delay == getOutputEntry(id).delay_ms)
+			{
+				not_heard.add(name);
+				continue;
+			}
+			if (delay == 500)
+				clamped = true;
+
+			getOutputEntry(id).delay_ms = delay;
+			not_heard_moved.add(name + ": " + String(delay) + " ms");
 			continue;
 		}
 
-		auto own_latency = result.latency_ms - currentDelay(id);
-		auto delay = roundToInt(slowest - own_latency);
+		auto own_latency = result.latency_ms - measuredDelay(id);
+		auto delay = roundToInt(reference - own_latency);
 		if (delay > 500)
 		{
 			delay = 500;
@@ -3310,6 +3396,8 @@ String FxController::applyDelayCalibrationResults()
 	String summary = TRANS("Delays set:") + " " + lines.joinIntoString(", ") + ".";
 	if (not_heard.size() > 0)
 		summary += " " + TRANS("Not heard clearly, left unchanged:") + " " + not_heard.joinIntoString(", ") + ".";
+	if (not_heard_moved.size() > 0)
+		summary += " " + TRANS("Not heard clearly, moved with the others:") + " " + not_heard_moved.joinIntoString(", ") + ".";
 	if (not_connected.size() > 0)
 		summary += " " + TRANS("Not connected, not measured:") + " " + not_connected.joinIntoString(", ") + ".";
 	if (clamped)
@@ -4320,6 +4408,15 @@ void FxController::setOutputDelay(const String& id, int delay_ms)
 
 	if (findOutputEntry(id) == nullptr && findActiveOutput(id) == nullptr)
 		return;
+
+	// BetterFxSound: not while the delays are being measured (the Pro view's grid is disabled then, this stops the
+	// command line and fxmcp too). The measurement removes the delays it played with, and the carrier would take a
+	// new one at once, in the middle of its repetitions, while the other outputs only take it after the measurement.
+	if (audio_passthru_ != nullptr && audio_passthru_->getDelayCalibrationState(nullptr) == 1)
+	{
+		FxModel::getModel().pushMessage(TRANS("Output delays cannot be changed while they are being synchronized."));
+		return;
+	}
 
 	auto& entry = getOutputEntry(id);
 	delay_ms = jlimit(0, 500, delay_ms);

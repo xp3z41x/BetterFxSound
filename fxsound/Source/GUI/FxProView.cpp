@@ -249,7 +249,9 @@ void FxProView::timerCallback()
 	}
 	else
 	{
-		sync_status_ = TRANS("Sync cancelled.");
+		// BetterFxSound: stopped by FxSound itself (turned off, sleep), not by the user.
+		auto interruption = controller.getDelayCalibrationInterruption();
+		sync_status_ = interruption.isNotEmpty() ? TRANS("Sync failed:") + " " + interruption : TRANS("Sync cancelled.");
 	}
 
 	updateOutputsNotice();
