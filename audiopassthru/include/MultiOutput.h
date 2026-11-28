@@ -41,6 +41,10 @@ class SecondaryOutput;
 // own setting first, and makes sure it is never used on the FxSound virtual device.
 bool setDeviceFullVolumeById(const std::wstring& device_id, const GUID* event_context);
 
+// BetterFxSound: reads a present device's own endpoint level (0..1) and mute. False if the device or its volume control
+// is not available. Never from an audio processing or render loop.
+bool getDeviceVolumeById(const std::wstring& device_id, float* level, BOOL* mute);
+
 // BetterFxSound: puts the device's own level and mute back if the engine owes them (see OwedVolume.h), then forgets
 // them. Returns false if something is owed and the device or its volume control is not available (it stays owed), or
 // if the device was taken over again meanwhile (it is then left at 100% and stays owed).
@@ -71,7 +75,7 @@ void applyOutputChannelMode(float* buffer, UINT32 frames, UINT32 channels, Outpu
  *    thread is stuck in a driver call (a Bluetooth device going away can block WASAPI calls for seconds) is
  *    never freed under it: removal waits for the threads for a bounded time, and a thread that is still busy
  *    finishes and frees its output on its own. BetterFxSound: it then leaves the device's volume to the engine's sweep
- *    (takeLateExits()).
+ *    (takeLateExits()) while the router drives its outputs, and hands it back itself while it does not.
  */
 class MultiOutputRouter
 {
@@ -115,6 +119,11 @@ public:
 	// the devices not in use), which the caller then runs: handing it back late, on that thread, undid a newer take-over
 	// of the device. UI/timer thread.
 	bool takeLateExits();
+
+	// BetterFxSound: the outputs' device volume work: a take-over whose 100% failed is tried again, and a change of a
+	// device's own level or mute is looked at (re-asserted to 100% right after the take-over, the user's later). It was
+	// done on the outputs' render threads, between periods. UI/timer thread, called regularly while processing.
+	void serviceVolume();
 
 	// Audio thread: queues one block of processed, interleaved 32 bit float audio.
 	// solo_index >= 0: only that output gets the audio, the others get silence.

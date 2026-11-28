@@ -107,8 +107,11 @@ AudioPassthruPrivate::~AudioPassthruPrivate()
 	if (hp_sndDevices_ == NULL)
 		return;
 
-	/* BetterFxSound: stop a running delay measurement and close the additional outputs first */
+	/* BetterFxSound: stop a running delay measurement and close the additional outputs first. The router stops driving
+	   them before they are removed: an output whose render thread outlives the wait for it then hands its device back itself when it
+	   exits, after this sweep's chance (it left that to a sweep of processTimer(), which no longer runs). */
 	calibration_.cancel();
+	multi_output_.setDriven(false);
 	multi_output_.stopAll();
 
 	/* If the processing thread is running, kill it */
@@ -497,6 +500,10 @@ int AudioPassthruPrivate::processTimer()
 			apply = true;
 		if (apply)
 			applyAdditionalOutputs();
+
+		/* BetterFxSound: the additional outputs' device volume work (a failed 100% tried again, a change of the device's own
+		   level), here rather than on their render threads */
+		multi_output_.serviceVolume();
 
 		/* BetterFxSound: the carrier's device changed its own level right after the take-over, see reassertCarrierFullVolume() */
 		if (s_sndDevices_.playbackFullVolumeReassert.exchange(FALSE) != FALSE)
@@ -1483,13 +1490,39 @@ void AudioPassthruPrivate::reassertCarrierFullVolume()
 			return;
 		carrier_id = carrier_full_volume_id_;
 	}
-	if (carrier_reasserts_ >= kCarrierReasserts || s_sndDevices_.playbackLevelIsUsers.load() != FALSE)
+	if (s_sndDevices_.playbackLevelIsUsers.load() != FALSE)
 	{
-		/* The device keeps changing it: the window ends, its next change is recorded as its own setting */
 		s_sndDevices_.engineTookOverPlaybackTick = 0;
 		return;
 	}
-	if (!s_sndDevices_.playbackSettingsAreSaved || carrier_id != s_sndDevices_.savedPlaybackDeviceID)
+	const bool settings_saved = s_sndDevices_.playbackSettingsAreSaved && carrier_id == s_sndDevices_.savedPlaybackDeviceID;
+	if (carrier_reasserts_ >= kCarrierReasserts)
+	{
+		/*
+		* The device keeps changing it: the window ends. BetterFxSound: the change that raised this request was not recorded
+		* by the callback (it only asked for 100% again), so the device's setting now is recorded here as the user's, as
+		* the callback does for a later change (and as the additional outputs do): it stayed on the device unrecorded, the
+		* carrier played at that level times the app's gain, and the old setting was put back at the hand-back.
+		*/
+		s_sndDevices_.engineTookOverPlaybackTick = 0;
+		float level = 1.0f;
+		BOOL mute = FALSE;
+		if (settings_saved && getDeviceVolumeById(carrier_id, &level, &mute) && !((level >= 0.99f) && (mute == FALSE)))
+		{
+			s_sndDevices_.savedPlaybackMute = mute;
+			s_sndDevices_.savedPlaybackLevel = level;
+			s_sndDevices_.savedPlaybackLevelIsSaved = TRUE;
+			float owed_level;
+			BOOL owed_mute;
+			if (owedVolumeGet(carrier_id, &owed_level, &owed_mute))
+			{
+				owedVolumeUpdate(carrier_id, level, mute);
+				s_sndDevices_.playbackLevelIsUsers = TRUE;
+			}
+		}
+		return;
+	}
+	if (!settings_saved)
 		return;
 
 	carrier_reasserts_++;
