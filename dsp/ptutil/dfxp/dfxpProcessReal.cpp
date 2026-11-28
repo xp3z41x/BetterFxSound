@@ -109,6 +109,11 @@ int dfxpModifyRealtypeSamples(PT_HANDLE *hp_dfxp, realtype *rp_samples, int i_nu
 	if( (i_num_sample_sets > DAW_MAX_BUFFER_SIZE ) || (cast_handle->unsupported_format_flag == IS_TRUE) )
 		return(OKAY);
 
+	/* BetterFxSound: bring in a complete bass boost coefficient set staged by a setter (see
+	 * bass_boost_coeffs in u_dfxp.h) before the Play filter runs on this buffer. */
+	if (dfxp_ApplyBassBoostCoeffs(hp_dfxp) != OKAY)
+		return(NOT_OKAY);
+
 	if ((cast_handle->trace.mode) && (!cast_handle->trace.i_process_real_samples_done))
 		(cast_handle->slout1)->Message_Wide(FIRST_LINE, L"dfxpModifyRealtypeSamples(): Calling dfxp_ClearBuffersIfSongStart()");
 

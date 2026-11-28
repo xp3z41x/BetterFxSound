@@ -106,19 +106,60 @@ int DfxDspPrivate::eqUpdateFromRegistry(int *ip_eq_changed)
 	return(OKAY);
 }
 
+/*
+* BetterFxSound: applies the EQ stored in the registry to the processing memory and, if anything
+* changed, communicates it to the DSP. This replaces the old per-buffer processTimer() check that
+* a flag armed on the processing thread: it ran ~32 registry round trips on that real-time thread
+* and, landing between a setter's memory write and its registry write, copied the OLD registry
+* value back over the new gain and cleared the flag, so the band stayed wrong. It now runs on the
+* thread that changed the EQ, after its registry writes, under param_lock_, so no other setter or
+* format reinit can interleave with the memory-vs-registry comparison.
+* It deliberately does NOT call dfxpCommunicateAll() (the old processing-thread check did): that
+* re-sends the fixed quantities too, and dfxp_LexCommunicateSize() re-initializes the reverb delay
+* lines (pointers and lengths) that the processing thread is walking at the same time, since
+* processAudio() never takes param_lock_. Nothing it sends depends on the EQ anyway: the band
+* gains go straight into the GraphicEq (dfxpEqSetBandBoostCut), the on state is read from
+* eq.i_processing_on by the processing code, and the Bass Boost bypass is sent by
+* dfxpSetButtonValue() itself.
+* Never call this from the audio processing thread.
+*/
+int DfxDspPrivate::eqSyncFromRegistry()
+{
+	int i_eq_changed = IS_FALSE;
+	int result;
+
+	if (dfxp_handle_ == NULL)
+		return(OKAY);
+
+	DfxDspParamLock lock(&param_lock_);
+
+	result = eqUpdateFromRegistry(&i_eq_changed);
+
+	return(result);
+}
+
 int DfxDspPrivate::resetEQ()
 {
 	int i_band_num;
+	int result = OKAY;
 
-	update_from_registry_ = true;
+	DfxDspParamLock lock(&param_lock_);
 
 	for (i_band_num = 1; i_band_num <= DFXP_GRAPHIC_EQ_NUM_BANDS; i_band_num++)
 	{
 		if (dfxpEqSetBandBoostCut(dfxp_handle_, DFXP_STORAGE_TYPE_ALL, i_band_num, (realtype)0.0) != OKAY)
-			return(NOT_OKAY);
+		{
+			result = NOT_OKAY;
+			break;
+		}
 	}
 
-	return(OKAY);
+	// BetterFxSound: sync after the registry writes (it used to arm the processing-thread
+	// check before them). Also runs after a partial failure, as the old flag did.
+	if (eqSyncFromRegistry() != OKAY)
+		result = NOT_OKAY;
+
+	return(result);
 }
 
 /*
@@ -333,7 +374,7 @@ int DfxDspPrivate::eqGetProcessingOn(int i_storage_type, int *ip_on)
 
 void DfxDspPrivate::eqOn(bool on)
 {
-	update_from_registry_ = true;
+	DfxDspParamLock lock(&param_lock_);
 
 	if (on)
 	{
@@ -343,6 +384,10 @@ void DfxDspPrivate::eqOn(bool on)
 	{
 		eqSetProcessingOn(DFXP_STORAGE_TYPE_ALL, IS_FALSE);
 	}
+
+	// BetterFxSound: eqSetProcessingOn() stores the state in the registry; this applies it to the
+	// processing memory (and turns Bass Boost off with the EQ) on this thread, after the write.
+	eqSyncFromRegistry();
 }
 
 int DfxDspPrivate::getNumEqBands()
@@ -371,6 +416,11 @@ float DfxDspPrivate::getBalance()
 void DfxDspPrivate::setBalance(float gain_db)
 {
 	PT_HANDLE* graphic_eq_handle;
+
+	// BetterFxSound: like the other GraphicEq setters below, serialized with every other DSP
+	// parameter writer (UI and CLI threads, preset load, EQ sync) under param_lock_.
+	DfxDspParamLock lock(&param_lock_);
+
 	dfxpEqGetGraphicEqHdl(dfxp_handle_, &graphic_eq_handle);
 	GraphicEqSetBalance(graphic_eq_handle, gain_db);
 }
@@ -389,6 +439,9 @@ float DfxDspPrivate::getNormalization()
 void DfxDspPrivate::setNormalization(float gain_db)
 {
 	PT_HANDLE* graphic_eq_handle;
+
+	DfxDspParamLock lock(&param_lock_);
+
 	dfxpEqGetGraphicEqHdl(dfxp_handle_, &graphic_eq_handle);
 	GraphicEqSetNormalization(graphic_eq_handle, gain_db);
 }
@@ -407,6 +460,9 @@ float DfxDspPrivate::getVolumeLeveling()
 void DfxDspPrivate::setVolumeLeveling(float gain_db)
 {
 	PT_HANDLE* graphic_eq_handle;
+
+	DfxDspParamLock lock(&param_lock_);
+
 	dfxpEqGetGraphicEqHdl(dfxp_handle_, &graphic_eq_handle);
 	GraphicEqSetVolumeLeveling(graphic_eq_handle, gain_db);
 }
@@ -425,6 +481,9 @@ float DfxDspPrivate::getMasterGain()
 void DfxDspPrivate::setMasterGain(float gain_db)
 {
 	PT_HANDLE* graphic_eq_handle;
+
+	DfxDspParamLock lock(&param_lock_);
+
 	dfxpEqGetGraphicEqHdl(dfxp_handle_, &graphic_eq_handle);
 	GraphicEqSetMasterGain(graphic_eq_handle, gain_db);
 }
@@ -443,6 +502,9 @@ float DfxDspPrivate::getFilterQ()
 void DfxDspPrivate::setFilterQ(float q_multiplier)
 {
 	PT_HANDLE* graphic_eq_handle;
+
+	DfxDspParamLock lock(&param_lock_);
+
 	dfxpEqGetGraphicEqHdl(dfxp_handle_, &graphic_eq_handle);
 	GraphicEqSetFilterQ(graphic_eq_handle, q_multiplier);
 }
@@ -450,10 +512,13 @@ void DfxDspPrivate::setNumBands(int num_bands)
 {
 	PT_HANDLE* graphic_eq_handle;
 
-	update_from_registry_ = true;
+	DfxDspParamLock lock(&param_lock_);
 
 	dfxpEqGetGraphicEqHdl(dfxp_handle_, &graphic_eq_handle);
 	GraphicEqSetNumBands(graphic_eq_handle, num_bands);
+
+	// BetterFxSound: re-apply the stored gains here instead of on the processing thread.
+	eqSyncFromRegistry();
 }
 float DfxDspPrivate::getEqBandFrequency(int band_num)
 {
@@ -468,11 +533,14 @@ void DfxDspPrivate::setEqBandFrequency(int band_num, float freq)
 {
     PT_HANDLE* graphic_eq_handle;
 
-	update_from_registry_ = true;
+	DfxDspParamLock lock(&param_lock_);
 
     dfxpEqGetGraphicEqHdl(dfxp_handle_, &graphic_eq_handle);
 
     GraphicEqSetBandFreq(graphic_eq_handle, band_num + 1, freq);
+
+	// BetterFxSound: re-apply the stored gains here instead of on the processing thread.
+	eqSyncFromRegistry();
 }
 
 void DfxDspPrivate::getEqBandFrequencyRange(int band_num, float* min_freq, float* max_freq)
@@ -516,7 +584,11 @@ float DfxDspPrivate::getEqBandBoostCut(int band_num)
 
 void DfxDspPrivate::setEqBandBoostCut(int band_num, float boost)
 {
-	update_from_registry_ = true;
+	// BetterFxSound: STORAGE_TYPE_ALL already puts the gain in the processing memory and the
+	// registry, so no registry sync is needed (it used to arm one on the processing thread,
+	// which could revert this very gain). The lock keeps a concurrent sync or format reinit
+	// from observing the gap between the two writes.
+	DfxDspParamLock lock(&param_lock_);
 
 	dfxpEqSetBandBoostCut(dfxp_handle_, DFXP_STORAGE_TYPE_ALL, band_num + 1, boost);
 }

@@ -258,7 +258,13 @@ int PT_DECLSPEC GraphicEqSetNumBands(PT_HANDLE* hp_GraphicEq, int num_bands)
  *
  *  Note; The band_num starts at 1. (i.e. to set the first band use i_band_num = 1)								
  */
-int PT_DECLSPEC GraphicEqSetBandBoostCut(PT_HANDLE *hp_GraphicEq, int i_band_num, realtype r_boost_cut)
+/*
+ * BetterFxSound: i_force recalculates the section even when the boost is unchanged (after a band
+ * frequency, Q or sampling rate change). This replaces the old trick of zeroing the stored boost
+ * and passing the saved value back in, which briefly showed a 0 dB boost to anything reading it
+ * (GraphicEqGetBandBoostCut(), a concurrent recalculation) and could flatten the band for good.
+ */
+static int GraphicEq_SetBandBoostCut(PT_HANDLE *hp_GraphicEq, int i_band_num, realtype r_boost_cut, int i_force)
 {
 	struct GraphicEqHdlType *cast_handle;
 	realtype *rp_boost_array, *rp_freq_array;
@@ -304,8 +310,8 @@ int PT_DECLSPEC GraphicEqSetBandBoostCut(PT_HANDLE *hp_GraphicEq, int i_band_num
 	if( r_boost_cut < -GRAPHIC_EQ_DEFAULT_MAX_BOOST_OR_CUT )
 		r_boost_cut = -GRAPHIC_EQ_DEFAULT_MAX_BOOST_OR_CUT;
 
-	/* If section boost/cut has changed, recalc the section */
-	if( r_boost_cut != rp_boost_array[i_section_num] )
+	/* If section boost/cut has changed (or a recalculation is forced), recalc the section */
+	if( i_force || (r_boost_cut != rp_boost_array[i_section_num]) )
 	{
 		if( filtSosParametric((PT_HANDLE *)(cast_handle->sos_hdl), i_section_num, cast_handle->sampling_freq, 
                           rp_freq_array[i_section_num], r_boost_cut, cast_handle->Q) != OKAY )
@@ -313,6 +319,11 @@ int PT_DECLSPEC GraphicEqSetBandBoostCut(PT_HANDLE *hp_GraphicEq, int i_band_num
 	}
 
 	return(OKAY);
+}
+
+int PT_DECLSPEC GraphicEqSetBandBoostCut(PT_HANDLE *hp_GraphicEq, int i_band_num, realtype r_boost_cut)
+{
+	return(GraphicEq_SetBandBoostCut(hp_GraphicEq, i_band_num, r_boost_cut, IS_FALSE));
 }
 
 /*
@@ -343,15 +354,68 @@ int PT_DECLSPEC GraphicEqReCalcAllBandCoeffs(PT_HANDLE *hp_GraphicEq)
 
 	for(i_section_num=0; i_section_num<num_bands; i_section_num++)
 	{
-		/* Copy and zero boost value to force a refresh of filter coeffs */
+		/* Force a refresh of filter coeffs with the band's current boost */
 		r_boost_cut = rp_boost_array[i_section_num];
-		rp_boost_array[i_section_num] = (realtype)0.0;
 
-		if( GraphicEqSetBandBoostCut(hp_GraphicEq, (i_section_num + 1), r_boost_cut) != OKAY)
+		if( GraphicEq_SetBandBoostCut(hp_GraphicEq, (i_section_num + 1), r_boost_cut, IS_TRUE) != OKAY)
 			return(NOT_OKAY);
 	}
 
 	return(OKAY);
+}
+
+/*
+ * FUNCTION: GraphicEqSetSamplingFreq()
+ * DESCRIPTION:
+ *  BetterFxSound: sets the sampling frequency the band coefficients are designed for and, if it
+ *  changed, recalculates all bands. dfxpBeginProcess() calls this on a signal format change,
+ *  which is serialized with every EQ setter, so GraphicEqProcess() on the processing thread does
+ *  not find a rate mismatch and recalculate the bands itself, unsynchronized with the setters.
+ */
+int PT_DECLSPEC GraphicEqSetSamplingFreq(PT_HANDLE *hp_GraphicEq, realtype r_samp_freq)
+{
+	struct GraphicEqHdlType *cast_handle;
+
+	cast_handle = (struct GraphicEqHdlType *)(hp_GraphicEq);
+
+	if (cast_handle == NULL)
+		return(NOT_OKAY);
+
+	if (r_samp_freq <= (realtype)0.0)
+		return(NOT_OKAY);
+
+	if (r_samp_freq == cast_handle->sampling_freq)
+		return(OKAY);
+
+	cast_handle->sampling_freq = r_samp_freq;
+
+	return(GraphicEqReCalcAllBandCoeffs(hp_GraphicEq));
+}
+
+/*
+ * BetterFxSound: computes the band filter Q from the band layout and Q multiplier. It used to be
+ * computed after the bands were rebuilt, so every band was rebuilt with the PREVIOUS Q and a Q
+ * change only reached the filters if something recalculated them afterwards (a sampling rate
+ * change: never with a 44.1 kHz stream). GraphicEqReSetAllBandFreqs() now calls this once the
+ * layout's min/max frequencies are known and before any band is rebuilt. num_bands must be > 1.
+ */
+static void GraphicEq_CalcQ(struct GraphicEqHdlType *cast_handle)
+{
+	double d_min_freq, d_ratio;
+
+	// --------------------------------------------------------------------------
+	//  Corrected the Q computing -  (before version 2.0 it was wrong)
+	// --------------------------------------------------------------------------
+	d_min_freq = (double)cast_handle->min_band_freq;
+	d_ratio = (double)cast_handle->max_band_freq / d_min_freq;
+	double r = pow(d_ratio, 1.0 / (cast_handle->num_bands - 1));
+	cast_handle->Q = (realtype)(sqrt(r) / (r - 1.0));
+
+	// ------------------------------------------------- Q_MULTIPLIER
+	cast_handle->Q *= cast_handle->Q_multiplier;
+
+	/* Limit Q to a minimum of 1.0 */
+	if (cast_handle->Q < (realtype)1.0) cast_handle->Q = (realtype)1.0;
 }
 
 /*
@@ -434,6 +498,7 @@ int PT_DECLSPEC GraphicEqReSetAllBandFreqs(PT_HANDLE *hp_GraphicEq, realtype r_m
 		{
 			cast_handle->max_band_freq = 16000;
 			cast_handle->min_band_freq = 62.5;
+			GraphicEq_CalcQ(cast_handle);
 			for (int i = 0; i < cast_handle->num_bands; i++)
 			{
 				if (GraphicEqSetBandFreq(hp_GraphicEq, (i + 1), k5BandDefaultFreqs[i]) != OKAY)
@@ -448,6 +513,7 @@ int PT_DECLSPEC GraphicEqReSetAllBandFreqs(PT_HANDLE *hp_GraphicEq, realtype r_m
 			// existing presets' band frequencies line up with the rotary slider's band positions.
 			cast_handle->max_band_freq = 16000;
 			cast_handle->min_band_freq = 62.5;
+			GraphicEq_CalcQ(cast_handle);
 			for (int i = 0; i < cast_handle->num_bands; i++)
 			{
 				if (GraphicEqSetBandFreq(hp_GraphicEq, (i + 1), k10BandDefaultFreqs[i]) != OKAY)
@@ -458,6 +524,7 @@ int PT_DECLSPEC GraphicEqReSetAllBandFreqs(PT_HANDLE *hp_GraphicEq, realtype r_m
 		{
 			cast_handle->max_band_freq = 16000;
 			cast_handle->min_band_freq = 25;
+			GraphicEq_CalcQ(cast_handle);
 			realtype fCenter[] = {   25.0f,   40.0f,   63.0f,   100.0f,   160.0f, 250.0f, 400.0f, 630.0f, 1000.0f, 1600.0f, 
 				                   2500.0f, 4000.0f, 6300.0f, 10000.0f, 16000.0f };
 			for (int i = 0; i < cast_handle->num_bands; i++)
@@ -470,6 +537,7 @@ int PT_DECLSPEC GraphicEqReSetAllBandFreqs(PT_HANDLE *hp_GraphicEq, realtype r_m
 		{
 			cast_handle->max_band_freq = 16000;
 			cast_handle->min_band_freq = 20;
+			GraphicEq_CalcQ(cast_handle);
 			realtype fCenter[] = {  20.0f,   31.5f,   40.0f,   63.0f,   80.0f,  125.0f,  160.0f,  250.0f,  315.0f,  500.0f, 
 								   630.0f, 1000.0f, 1250.0f, 2000.0f, 2500.0f, 4000.0f, 5000.0f, 8000.0f, 10000.0f, 16000.0f };
 			for (int i = 0; i < cast_handle->num_bands; i++)
@@ -482,6 +550,7 @@ int PT_DECLSPEC GraphicEqReSetAllBandFreqs(PT_HANDLE *hp_GraphicEq, realtype r_m
 		{
 			cast_handle->max_band_freq = 20000;
 			cast_handle->min_band_freq = 20;
+			GraphicEq_CalcQ(cast_handle);
 			realtype fCenter[] = {   20.0f,   25.0f,   31.5f,   40.0f,   50.0f,   63.0f,   80.0f,   100.0f,   125.0f,   160.0f, 
 				                    200.0f,  250.0f,  315.0f,  400.0f,  500.0f,  630.0f,  800.0f,  1000.0f,  1250.0f,  1600.0f,
 				                   2000.0f, 2500.0f, 3150.0f, 4000.0f, 5000.0f, 6300.0f, 8000.0f, 10000.0f, 12500.0f, 16000.0f, 20000.0f };
@@ -493,6 +562,8 @@ int PT_DECLSPEC GraphicEqReSetAllBandFreqs(PT_HANDLE *hp_GraphicEq, realtype r_m
 		}
 		else
 		{
+			GraphicEq_CalcQ(cast_handle);
+
 			d_min_freq = (double)cast_handle->min_band_freq;
 			d_ratio = (double)cast_handle->max_band_freq / d_min_freq;
 
@@ -508,21 +579,6 @@ int PT_DECLSPEC GraphicEqReSetAllBandFreqs(PT_HANDLE *hp_GraphicEq, realtype r_m
 					return(NOT_OKAY);
 			}
 		}
-
-
-		// --------------------------------------------------------------------------
-		//  Corrected the Q computing -  (before version 2.0 it was wrong)
-		// --------------------------------------------------------------------------
-		d_min_freq = (double)cast_handle->min_band_freq;
-		d_ratio = (double)cast_handle->max_band_freq / d_min_freq;
-		double r = pow(d_ratio, 1.0 / (cast_handle->num_bands - 1));
-		cast_handle->Q = (realtype)(sqrt(r) / (r - 1.0));
-
-		// ------------------------------------------------- Q_MULTIPLIER
-		cast_handle->Q *= cast_handle->Q_multiplier;
-
-		/* Limit Q to a minimum of 1.0 */
-		if (cast_handle->Q < (realtype)1.0) cast_handle->Q = (realtype)1.0;
 
 	}
 	return(OKAY);
@@ -594,11 +650,10 @@ int PT_DECLSPEC GraphicEqSetBandFreq(PT_HANDLE *hp_GraphicEq, int i_band_num, re
 
 	rp_freq_array[i_section_num] = r_band_freq;
 	
-	/* Copy and zero original boost setting to force a refresh of filter coeffs */
+	/* Force a refresh of filter coeffs with the band's current boost */
 	original_boost = rp_boost_array[i_section_num];
-	rp_boost_array[i_section_num] = (realtype)0.0;
 
-	if( GraphicEqSetBandBoostCut(hp_GraphicEq, i_band_num, original_boost) != OKAY )
+	if( GraphicEq_SetBandBoostCut(hp_GraphicEq, i_band_num, original_boost, IS_TRUE) != OKAY )
 		return(NOT_OKAY);
 
 	return(OKAY);

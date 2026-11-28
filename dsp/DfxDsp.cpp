@@ -103,6 +103,18 @@ int DfxDsp::setSignalFormat(int i_bps, int i_nch, int i_srate, int i_valid_bits)
 	}
 }
 
+int DfxDsp::prepareSignalFormat(int i_bps, int i_nch, int i_srate, int i_valid_bits)
+{
+	if (data_->being_destroyed_)
+	{
+		return OKAY;
+	}
+	else
+	{
+		return data_->prepareSignalFormat(i_bps, i_nch, i_srate, i_valid_bits);
+	}
+}
+
 int DfxDsp::processAudio(short int *si_input_samples, short int *si_output_samples, int i_num_sample_sets, int i_check_for_duplicate_buffers)
 {
 	if (data_->being_destroyed_)

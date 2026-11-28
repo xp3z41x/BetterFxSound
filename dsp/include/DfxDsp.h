@@ -41,6 +41,9 @@ public:
 	~DfxDsp();
 
 	int setSignalFormat(int i_bps, int i_nch, int i_srate, int i_valid_bits);
+	// BetterFxSound: applies a format before the processing thread starts (waits for the
+	// parameter lock; never call it from, or while, a processing thread runs). See DfxDspPrivate.
+	int prepareSignalFormat(int i_bps, int i_nch, int i_srate, int i_valid_bits);
 	int processAudio(short int *si_input_samples, short int *si_output_samples, int i_num_sample_sets, int i_check_for_duplicate_buffers);
 	int loadPreset(std::wstring preset_file_full_path);
 	int savePreset(std::wstring preset_name, std::wstring preset_file_full_path);

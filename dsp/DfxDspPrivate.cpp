@@ -26,6 +26,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "file.h"
 #include "qnt.h"
 #include <string>
+#include <string.h>
 
 #include "BinauralSyn.h"
 #include "ptutil\dfxp\u_dfxp.h"
@@ -52,6 +53,9 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 DfxDspPrivate::DfxDspPrivate()
 {
+	// BetterFxSound: must exist before any setter can run (see param_lock_).
+	InitializeCriticalSection(&param_lock_);
+
 	dfxp_handle_ = NULL;
 	slout1_ = NULL;
 	midi_to_rval_qnt_handle_ = NULL;
@@ -111,6 +115,11 @@ DfxDspPrivate::DfxDspPrivate()
 	{
 	}
 
+	// BetterFxSound: load the EQ band gains (and on state) stored in the registry here, on the
+	// constructing thread, instead of on the first processed buffer: the processing thread no
+	// longer reads the registry for the EQ (see eqSyncFromRegistry()).
+	eqSyncFromRegistry();
+
 	//return(OKAY);
 }
 
@@ -149,38 +158,26 @@ DfxDspPrivate::~DfxDspPrivate()
 	// Free the slout handle
 	if (slout1_ != NULL)
 		delete slout1_;
-}
 
-/**
-dfxg_UpdateFromRegistryAllSettings()
-**/
-void DfxDspPrivate::processTimer()
-{
-	bool anything_changed = false;
-	int i_eq_changed = IS_FALSE;
-
-	if (update_from_registry_)
-	{
-		eqUpdateFromRegistry(&i_eq_changed);
-		update_from_registry_ = false;
-	}
-
-	if (i_eq_changed)
-	{
-		anything_changed = true;
-	}
-
-	/* If any settings have been changed, communicate all the changes to the DSP module */
-	// NOTE: I find that without this if condition and call dfxpCOmmunicateAll() repeatedly will mess up the audio.
-	if (anything_changed)
-	{
-		dfxpCommunicateAll(dfxp_handle_);
-	}
+	DeleteCriticalSection(&param_lock_);
 }
 
 int DfxDspPrivate::processAudio(short int *si_input_samples, short int *si_output_samples, int i_num_sample_sets, int i_check_for_duplicate_buffers)
 {
-	processTimer();
+	// BetterFxSound: this used to run processTimer() first, which on every EQ edit or preset
+	// load made this real-time thread do ~32 registry open/query/close round trips and could
+	// copy a stale registry gain back over one the UI had just set (or communicate stale
+	// effect values over newer ones). The EQ sync now runs on the thread that changes the
+	// EQ (eqSyncFromRegistry()), so nothing here touches the registry or takes a lock.
+	// BetterFxSound: a format change setSignalFormat() could not apply yet (lock busy) leaves
+	// the DSP set up for the old format, so pass this block through untouched until it is.
+	if (format_pending_)
+	{
+		if ((si_output_samples != si_input_samples) && (i_num_sample_sets > 0) && (pending_frame_bytes_ > 0))
+			memmove(si_output_samples, si_input_samples, (size_t)i_num_sample_sets * (size_t)pending_frame_bytes_);
+		return OKAY;
+	}
+
 	// Apply DFX processing here using data and format vars above. Format will always be 32 bit floating point.
 	if (dfxpUniversalModifySamples(dfxp_handle_, si_input_samples, si_output_samples, i_num_sample_sets, i_check_for_duplicate_buffers) != OKAY)
 		return(NOT_OKAY);
@@ -190,6 +187,73 @@ int DfxDspPrivate::processAudio(short int *si_input_samples, short int *si_outpu
 
 int DfxDspPrivate::setSignalFormat(int i_bps, int i_nch, int i_srate, int i_valid_bits)
 {
+	// BetterFxSound: this is called for every buffer but only does work when the format
+	// changes. That reinit (dfxpBeginProcess -> dfxpCommunicateAll) re-reads every setting from
+	// the registry and writes it to the DSP, so it must not interleave with a setter on another
+	// thread or it could communicate a value older than the one that setter just applied. Take
+	// the parameter lock only for a real format change, so the steady state stays lock-free.
+	// This runs on the time-critical processing thread and the UI can hold the lock for a long
+	// time (a preset load reads a file and writes/reads dozens of registry values under it), so
+	// only try it: if it is busy, keep the old last_signal_* so the next buffer retries, and let
+	// processAudio() pass the blocks through unprocessed meanwhile. If the format returns to
+	// the applied one before a retry wins the lock, the DSP is already set up for it, so drop
+	// the pending change here or processing would stay bypassed until some later change.
+	if ((i_bps == last_signal_bps_) && (i_nch == last_signal_nch_) &&
+		(i_srate == last_signal_srate_) && (i_valid_bits == last_signal_valid_bits_))
+	{
+		format_pending_ = false;
+		return OKAY;
+	}
+
+	if (!TryEnterCriticalSection(&param_lock_))
+	{
+		format_pending_ = true;
+		pending_frame_bytes_ = (i_bps / 8) * i_nch;
+		return(NOT_OKAY);
+	}
+	DfxDspParamLock lock(&param_lock_, true);
+
+	return applySignalFormatLocked(i_bps, i_nch, i_srate, i_valid_bits);
+}
+
+/*
+* BetterFxSound: applies a signal format ahead of processing, waiting for the parameter lock.
+* A format change (dfxpBeginProcess) frees and reallocates the effect quantization tables and
+* re-initializes the DSP memory; done by setSignalFormat() it runs on the time-critical
+* processing thread. A caller that knows the format before it starts the processing thread
+* (e.g. a reinit after a device switch) can apply it here instead, so the processing thread's
+* first setSignalFormat() call finds it unchanged and does nothing. Only call this while no
+* processing thread is running for this instance (last_signal_* belong to that thread
+* otherwise), and never from the processing thread itself.
+* Not wired yet: until AudioPassthruPrivate's reinit calls it (after the old processing thread
+* is joined, before CreateThread, with the wfxDfxProcessing bps/nch/rate and valid_bits = bps,
+* exactly what threadWorker passes to setSignalFormat()), a format change still reinitializes
+* on the processing thread, under setSignalFormat()'s try-lock.
+*/
+int DfxDspPrivate::prepareSignalFormat(int i_bps, int i_nch, int i_srate, int i_valid_bits)
+{
+	DfxDspParamLock lock(&param_lock_);
+
+	if ((i_bps == last_signal_bps_) && (i_nch == last_signal_nch_) &&
+		(i_srate == last_signal_srate_) && (i_valid_bits == last_signal_valid_bits_))
+	{
+		format_pending_ = false;
+		return OKAY;
+	}
+
+	return applySignalFormatLocked(i_bps, i_nch, i_srate, i_valid_bits);
+}
+
+// BetterFxSound: shared tail of setSignalFormat()/prepareSignalFormat(); param_lock_ is held.
+int DfxDspPrivate::applySignalFormatLocked(int i_bps, int i_nch, int i_srate, int i_valid_bits)
+{
+	format_pending_ = false;
+
+	last_signal_bps_ = i_bps;
+	last_signal_nch_ = i_nch;
+	last_signal_srate_ = i_srate;
+	last_signal_valid_bits_ = i_valid_bits;
+
 	if (dfxpUniversalSetSignalFormat(dfxp_handle_, i_bps, i_nch, i_srate, i_valid_bits) != OKAY)
 		return(NOT_OKAY);
 
@@ -199,6 +263,8 @@ int DfxDspPrivate::setSignalFormat(int i_bps, int i_nch, int i_srate, int i_vali
 
 void DfxDspPrivate::powerOn(bool on)
 {
+	DfxDspParamLock lock(&param_lock_);
+
 	if (on)
 	{
 		if (dfxpSetButtonValue(dfxp_handle_, DFX_UI_BUTTON_BYPASS, 0) != OKAY)
@@ -255,6 +321,8 @@ void DfxDspPrivate::setEffectValue(DfxDsp::Effect effect, float value)
 {
 	int button;
 	int knob;
+
+	DfxDspParamLock lock(&param_lock_);
 
 	switch (effect)
 	{

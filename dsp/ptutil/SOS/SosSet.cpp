@@ -51,7 +51,11 @@ int PT_DECLSPEC sosSetSection(PT_HANDLE *hp_sos, int i_section_num, int i_set_fr
 	/* Make sure parameters are legal */
 	if (i_section_num >= cast_handle->num_allocated_sections)
 	   return(NOT_OKAY);
-	   
+
+	/* BetterFxSound: open the sequence lock (odd) so the processing thread never copies a
+	 * half-written section (see run_coeffs in u_sos.h). Interlocked ops are full barriers. */
+	InterlockedIncrement(&(cast_handle->coeff_seq));
+
 	/* Update old values */
  	((cast_handle->sections)[i_section_num]).a1_old = ((cast_handle->sections)[i_section_num]).a1; 
  	((cast_handle->sections)[i_section_num]).a2_old = ((cast_handle->sections)[i_section_num]).a2; 
@@ -76,7 +80,10 @@ int PT_DECLSPEC sosSetSection(PT_HANDLE *hp_sos, int i_section_num, int i_set_fr
    cast_handle->sos_center_freq_response[i_section_num] = filt->boost;
 
 	cast_handle->section_on_flag[i_section_num] = filt->section_on_flag;
-    
+
+	/* BetterFxSound: section complete, close the sequence lock (even again) */
+	InterlockedIncrement(&(cast_handle->coeff_seq));
+
 	return(OKAY);
 }
 
@@ -289,48 +296,16 @@ int PT_DECLSPEC sosSetVolumeLeveling(PT_HANDLE* hp_sos, realtype r_target_rms)
 
 	cast_handle->volume_leveling_target_rms = r_target_rms;
 
+	/* BetterFxSound: turning leveling off used to zero the leveling history here, on the
+	 * setter's thread, while the processing thread could be in the middle of its
+	 * read-modify-write of the same history (power_sum -= history[i]; history[i] = p;
+	 * power_sum += p). An interleaving left power_sum biased or negative for good, since
+	 * nothing rebuilds it, so re-enabling leveling later pumped quiet passages to the maximum
+	 * gain (or leveled too weakly). Only request the reset here; the processing thread does
+	 * it at the start of its next buffer (see applyVolumeLeveling()). */
 	if (r_target_rms <= (realtype)0.0)
 	{
-		cast_handle->volume_leveling_gain = (realtype)1.0;
-		cast_handle->volume_leveling_power_sum = (realtype)0.0;
-		cast_handle->volume_leveling_power_index = 0;
-		cast_handle->volume_leveling_power_count = 0;
-		cast_handle->volume_leveling_previous_average_rms = (realtype)0.0;
-		cast_handle->volume_leveling_previous_predicted_rms = (realtype)0.0;
-		cast_handle->volume_leveling_alpha_sample_rate = (realtype)0.0;
-		cast_handle->volume_leveling_sc_hpf_alpha = (realtype)0.0;
-		cast_handle->volume_leveling_tone_low_alpha = (realtype)0.0;
-		cast_handle->volume_leveling_tone_body_alpha = (realtype)0.0;
-		cast_handle->volume_leveling_tone_presence_alpha = (realtype)0.0;
-		cast_handle->volume_leveling_tonality_score = (realtype)0.0;
-		cast_handle->volume_leveling_headroom_score = (realtype)0.0;
-		cast_handle->volume_leveling_quiet_duration_seconds = (realtype)0.0;
-		cast_handle->volume_leveling_quiet_gain_floor = (realtype)1.0;
-		cast_handle->volume_leveling_quiet_peak_bucket_max = (realtype)0.0;
-		cast_handle->volume_leveling_quiet_peak_bucket_seconds = (realtype)0.0;
-		cast_handle->volume_leveling_quiet_peak_history_index = 0;
-		cast_handle->volume_leveling_quiet_peak_history_count = 0;
-
-		for (int i = 0; i < SOS_VOLUME_LEVELING_HISTORY_SIZE; i++)
-		{
-			cast_handle->volume_leveling_power_history[i] = (realtype)0.0;
-		}
-
-		for (int i = 0; i < SOS_VOLUME_LEVELING_PEAK_WINDOW_SIZE; i++)
-		{
-			cast_handle->volume_leveling_quiet_peak_history[i] = (realtype)0.0;
-		}
-
-		for (int i = 0; i < 8; i++)
-		{
-			cast_handle->volume_leveling_sc_prev_in[i] = (realtype)0.0;
-			cast_handle->volume_leveling_sc_prev_out[i] = (realtype)0.0;
-
-			for (int tone_index = 0; tone_index < 3; tone_index++)
-			{
-				cast_handle->volume_leveling_tone_lp_state[i][tone_index] = (realtype)0.0;
-			}
-		}
+		InterlockedExchange(&(cast_handle->volume_leveling_reset_request), 1);
 	}
 
 	return(OKAY);

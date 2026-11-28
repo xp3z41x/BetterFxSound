@@ -75,6 +75,20 @@ public:
 	PT_HANDLE *hp_dfxg;
 };
 
+// BetterFxSound: scoped holder for DfxDspPrivate::param_lock_ (see there).
+class DfxDspParamLock
+{
+public:
+	explicit DfxDspParamLock(CRITICAL_SECTION *cs) : cs_(cs) { EnterCriticalSection(cs_); }
+	// Adopts a lock the caller already holds (e.g. from TryEnterCriticalSection).
+	DfxDspParamLock(CRITICAL_SECTION *cs, bool /*already_held*/) : cs_(cs) {}
+	~DfxDspParamLock() { LeaveCriticalSection(cs_); }
+	DfxDspParamLock(const DfxDspParamLock&) = delete;
+	DfxDspParamLock& operator=(const DfxDspParamLock&) = delete;
+private:
+	CRITICAL_SECTION *cs_;
+};
+
 class DfxDspPrivate
 {
 public:
@@ -82,6 +96,7 @@ public:
 	~DfxDspPrivate();
 	int processAudio(short int *si_input_samples, short int *si_output_samples, int i_num_sample_sets, int i_check_for_duplicate_buffers);
 	int setSignalFormat(int i_bps, int i_nch, int i_srate, int i_valid_bits);
+	int prepareSignalFormat(int i_bps, int i_nch, int i_srate, int i_valid_bits);
 	int loadPreset(std::wstring preset_file_full_path);
 	int savePreset(std::wstring preset_name, std::wstring preset_file_full_path);
 	int exportPreset(std::wstring preset_source_file_full_path, std::wstring preset_name, std::wstring preset_export_path);
@@ -116,8 +131,9 @@ public:
 
 	bool being_destroyed_ = false;
 private:
-	void processTimer();
 	int eqUpdateFromRegistry(int *ip_eq_changed);
+	int eqSyncFromRegistry();
+	int applySignalFormatLocked(int i_bps, int i_nch, int i_srate, int i_valid_bits);
 	int getStateInfoFromVals(PT_HANDLE *hp_vals, bool b_include_eq = true);
 	int getGraphicEqInfoFromVals(PT_HANDLE *hp_vals);
 	int createValsFromStateInfo(wchar_t *preset_name, PT_HANDLE **hpp_vals);
@@ -147,7 +163,31 @@ private:
 	struct dfxg_section_type dynamic_boost_;
 	struct dfxg_section_type bass_boost_;
 
-	bool update_from_registry_ = true;
+	// BetterFxSound: serializes everything that writes DSP parameters or the registry state
+	// dfxpCommunicateAll() re-reads (effect/bypass setters, EQ setters, preset load, the EQ
+	// registry sync, and a signal format change). Without it a writer could read a value from
+	// the registry before another thread stored the newer one and then communicate the stale
+	// value last. processAudio() never takes it; the processing thread only takes it in
+	// setSignalFormat() when the format really changes, a rare reinit that already re-reads
+	// every setting. Recursive, so a locked method may call another locked method. The
+	// processing thread only ever try-locks it (see setSignalFormat()), so a setter or a
+	// preset load holding it never stalls the audio.
+	CRITICAL_SECTION param_lock_;
+
+	// BetterFxSound: last format handed to setSignalFormat() (processing thread only, or
+	// prepareSignalFormat() while no processing thread runs), so the per-buffer call can skip
+	// the lock when nothing changed.
+	int last_signal_bps_ = -1;
+	int last_signal_nch_ = -1;
+	int last_signal_srate_ = -1;
+	int last_signal_valid_bits_ = -1;
+
+	// BetterFxSound: set (processing thread only) while a new format could not be applied
+	// because param_lock_ was busy. processAudio() then passes the block through unprocessed,
+	// since the DSP is still set up for the old format, and setSignalFormat() retries on the
+	// next buffer. pending_frame_bytes_ is the size of one sample set in the new format.
+	bool format_pending_ = false;
+	int pending_frame_bytes_ = 0;
 	int headphone_on_;
 	int music_mode_;     /* DFXP_MUSIC_MODE_MUSIC1, DFXP_MUSIC_MODE_MUSIC2, DFXP_MUSIC_MODE_SPEECH */
 

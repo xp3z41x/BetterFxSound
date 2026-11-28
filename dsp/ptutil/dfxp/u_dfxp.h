@@ -292,6 +292,16 @@ struct dfxpHdlType {
 
 	/* Settings when using the universal ui */
 	struct dfxp_universal_type universal;
+
+	/* BetterFxSound: the bass boost biquad (b0, b1, b2, a1, a2) waiting to be written to the Play
+	 * DSP memory. dfxp_CommunicateBassBoost() runs on the setters' threads and used to write the
+	 * five coefficients one by one while the processing thread ran the filter, which could run
+	 * (and, for the low shelf, destabilize) a mix of old and new values. It now only stages them
+	 * here under a sequence lock (odd while being written), and the processing thread copies a
+	 * complete set into the DSP memory at the start of a buffer (dfxp_ApplyBassBoostCoeffs()). */
+	realtype bass_boost_coeffs[5];
+	volatile long bass_boost_coeffs_seq;
+	long bass_boost_coeffs_applied_seq;
 };
 
 /************************ 
@@ -308,6 +318,7 @@ int dfxp_CommunicateAmbience(PT_HANDLE *);
 int dfxp_CommunicateDynamicBoost(PT_HANDLE *);
 int dfxp_CommunicateSpaciousness(PT_HANDLE *);
 int dfxp_CommunicateBassBoost(PT_HANDLE *);
+int dfxp_ApplyBassBoostCoeffs(PT_HANDLE *);
 int dfxp_CommunicateVocalReduction(PT_HANDLE *);
 int dfxp_CommunicateFixedQnts_Aural(PT_HANDLE *);
 int dfxp_CommunicateFixedQnts_Lex(PT_HANDLE *);

@@ -136,6 +136,107 @@ namespace
         return rolling_peak_max;
     }
 
+    // BetterFxSound: clears the volume leveling state. Runs on the processing thread only, when
+    // sosSetVolumeLeveling() asked for it (leveling turned off), so it can no longer interleave
+    // with the history update below. Same values the setter used to write.
+    static void resetVolumeLevelingState(struct sosHdlType* cast_handle)
+    {
+        cast_handle->volume_leveling_gain = (realtype)1.0;
+        cast_handle->volume_leveling_power_sum = (realtype)0.0;
+        cast_handle->volume_leveling_power_index = 0;
+        cast_handle->volume_leveling_power_count = 0;
+        cast_handle->volume_leveling_previous_average_rms = (realtype)0.0;
+        cast_handle->volume_leveling_previous_predicted_rms = (realtype)0.0;
+        cast_handle->volume_leveling_alpha_sample_rate = (realtype)0.0;
+        cast_handle->volume_leveling_sc_hpf_alpha = (realtype)0.0;
+        cast_handle->volume_leveling_tone_low_alpha = (realtype)0.0;
+        cast_handle->volume_leveling_tone_body_alpha = (realtype)0.0;
+        cast_handle->volume_leveling_tone_presence_alpha = (realtype)0.0;
+        cast_handle->volume_leveling_tonality_score = (realtype)0.0;
+        cast_handle->volume_leveling_headroom_score = (realtype)0.0;
+        cast_handle->volume_leveling_quiet_duration_seconds = (realtype)0.0;
+        cast_handle->volume_leveling_quiet_gain_floor = (realtype)1.0;
+        cast_handle->volume_leveling_quiet_peak_bucket_max = (realtype)0.0;
+        cast_handle->volume_leveling_quiet_peak_bucket_seconds = (realtype)0.0;
+        cast_handle->volume_leveling_quiet_peak_history_index = 0;
+        cast_handle->volume_leveling_quiet_peak_history_count = 0;
+
+        for (int i = 0; i < SOS_VOLUME_LEVELING_HISTORY_SIZE; i++)
+        {
+            cast_handle->volume_leveling_power_history[i] = (realtype)0.0;
+        }
+
+        for (int i = 0; i < SOS_VOLUME_LEVELING_PEAK_WINDOW_SIZE; i++)
+        {
+            cast_handle->volume_leveling_quiet_peak_history[i] = (realtype)0.0;
+        }
+
+        for (int i = 0; i < 8; i++)
+        {
+            cast_handle->volume_leveling_sc_prev_in[i] = (realtype)0.0;
+            cast_handle->volume_leveling_sc_prev_out[i] = (realtype)0.0;
+
+            for (int tone_index = 0; tone_index < 3; tone_index++)
+            {
+                cast_handle->volume_leveling_tone_lp_state[i][tone_index] = (realtype)0.0;
+            }
+        }
+    }
+
+    // BetterFxSound: refreshes run_coeffs (the coefficient copy the processing loops use) from
+    // the sections the setters write, once per buffer, through the sequence lock described in
+    // u_sos.h. Lock-free: if a setter is mid-write (odd sequence) or wrote while we copied
+    // (sequence moved), the previous complete set stays in use for this buffer and the copy is
+    // retried on the next one. A section that turns on starts from a cleared filter state rather
+    // than whatever it held when it was last turned off.
+    static void syncRunCoeffs(struct sosHdlType* cast_handle)
+    {
+        struct sosRunCoeffType new_coeffs[SOS_MAX_NUM_SOS_SECTIONS];
+        int num_sections = cast_handle->num_allocated_sections;
+        long seq_start, seq_end;
+
+        if (num_sections > SOS_MAX_NUM_SOS_SECTIONS)
+            num_sections = SOS_MAX_NUM_SOS_SECTIONS;
+
+        seq_start = InterlockedCompareExchange(&(cast_handle->coeff_seq), 0, 0);
+        if ((seq_start == cast_handle->run_coeff_seq) || (seq_start & 1))
+            return;
+
+        for (int i = 0; i < num_sections; i++)
+        {
+            const struct sosSectionType* s = &((cast_handle->sections)[i]);
+            new_coeffs[i].b0 = s->b0;
+            new_coeffs[i].b1 = s->b1;
+            new_coeffs[i].b2 = s->b2;
+            new_coeffs[i].a2 = s->a2;
+            new_coeffs[i].on = cast_handle->section_on_flag[i];
+        }
+
+        seq_end = InterlockedCompareExchange(&(cast_handle->coeff_seq), 0, 0);
+        if (seq_end != seq_start)
+            return;
+
+        for (int i = 0; i < num_sections; i++)
+        {
+            if (new_coeffs[i].on && !cast_handle->run_coeffs[i].on)
+            {
+                struct sosSectionType* s = &((cast_handle->sections)[i]);
+                s->state1 = (realtype)0.0;
+                s->state2 = (realtype)0.0;
+                s->state3 = (realtype)0.0;
+                s->state4 = (realtype)0.0;
+                for (int k = 0; k < 8; k++)
+                {
+                    s->state_1[k] = (realtype)0.0;
+                    s->state_2[k] = (realtype)0.0;
+                }
+            }
+            cast_handle->run_coeffs[i] = new_coeffs[i];
+        }
+
+        cast_handle->run_coeff_seq = seq_start;
+    }
+
     static void applyVolumeLeveling(struct sosHdlType* cast_handle,
                                     realtype* rp_out_buf,
                                     int i_num_sample_sets,
@@ -143,7 +244,15 @@ namespace
                                     realtype r_samp_freq,
                                     int excluded_channel)
     {
-        if ((cast_handle->volume_leveling_target_rms <= 0.0f) || (i_num_sample_sets <= 0) || (i_num_channels <= 0))
+        // BetterFxSound: a reset requested by sosSetVolumeLeveling() (leveling turned off) is
+        // done here, before the state is used, so it never races the history update below.
+        if (InterlockedExchange(&(cast_handle->volume_leveling_reset_request), 0) != 0)
+            resetVolumeLevelingState(cast_handle);
+
+        // Read once: the setter may change it while this buffer is being leveled.
+        const realtype target_rms = cast_handle->volume_leveling_target_rms;
+
+        if ((target_rms <= 0.0f) || (i_num_sample_sets <= 0) || (i_num_channels <= 0))
         {
             cast_handle->volume_leveling_gain = 1.0f;
             return;
@@ -231,7 +340,7 @@ namespace
             1.0f);
         realtype guarded_muffled_score = muffled_score * tonal_upward_authority;
         realtype guarded_clear_score = clear_score * tonal_downward_authority;
-        realtype effective_target_rms = cast_handle->volume_leveling_target_rms *
+        realtype effective_target_rms = target_rms *
             (1.0f
                 + guarded_muffled_score * kVolumeLevelingMuffledTargetBoost
                 - guarded_clear_score * kVolumeLevelingClearTargetReduction
@@ -255,6 +364,10 @@ namespace
 
         cast_handle->volume_leveling_power_history[cast_handle->volume_leveling_power_index] = current_power;
         cast_handle->volume_leveling_power_sum += current_power;
+        // BetterFxSound: the running sum can drift a hair below zero through float rounding once
+        // only silent buffers remain in the history; sqrtf() of that would be NaN.
+        if (cast_handle->volume_leveling_power_sum < 0.0f)
+            cast_handle->volume_leveling_power_sum = 0.0f;
         cast_handle->volume_leveling_power_index =
             (cast_handle->volume_leveling_power_index + 1) % SOS_VOLUME_LEVELING_HISTORY_SIZE;
 
@@ -530,6 +643,7 @@ int PT_DECLSPEC sosProcessBuffer(PT_HANDLE* hp_sos, realtype* rp_in_buf, realtyp
     struct sosHdlType* cast_handle;
 
     struct sosSectionType* s;
+    const struct sosRunCoeffType* c;
     int i, j, k;
 
     realtype sum_squares = 0.0f;
@@ -538,6 +652,9 @@ int PT_DECLSPEC sosProcessBuffer(PT_HANDLE* hp_sos, realtype* rp_in_buf, realtyp
 
     if (cast_handle == NULL)
         return(NOT_OKAY);
+
+    /* BetterFxSound: pick up complete coefficient sets only (see syncRunCoeffs()) */
+    syncRunCoeffs(cast_handle);
 
     /* Currently only handles mono or stereo cases */
     if ((i_num_channels != 1) && (i_num_channels != 2))
@@ -566,16 +683,17 @@ int PT_DECLSPEC sosProcessBuffer(PT_HANDLE* hp_sos, realtype* rp_in_buf, realtyp
             out1 = in1;
             for (i = 0; i < cast_handle->num_active_sections; i++)
             {
-                active_flag = cast_handle->section_on_flag[i];
+                active_flag = cast_handle->run_coeffs[i].on;
 
                 if (active_flag)
                 {
                     s = &((cast_handle->sections)[i]);
+                    c = &(cast_handle->run_coeffs[i]);
 
                     /* Processing derived from macro kerSosFiltDirectForm2TransParaExtState */
-                    out1 = s->state1 + s->b0 * in1 + (realtype)SOS_FLOAT_BIAS;
-                    s->state1 = (in1 - out1) * s->b1 + s->state2;
-                    s->state2 = s->b2 * in1 - s->a2 * out1;
+                    out1 = s->state1 + c->b0 * in1 + (realtype)SOS_FLOAT_BIAS;
+                    s->state1 = (in1 - out1) * c->b1 + s->state2;
+                    s->state2 = c->b2 * in1 - c->a2 * out1;
 
                     in1 = out1;
                 }
@@ -607,22 +725,23 @@ int PT_DECLSPEC sosProcessBuffer(PT_HANDLE* hp_sos, realtype* rp_in_buf, realtyp
 
             for (i = 0; i < cast_handle->num_active_sections; i++)
             {
-                active_flag = cast_handle->section_on_flag[i];
+                active_flag = cast_handle->run_coeffs[i].on;
 
                 if (active_flag)
                 {
                     s = &((cast_handle->sections)[i]);
+                    c = &(cast_handle->run_coeffs[i]);
 
                     /* Processing derived from macro kerSosFiltDirectForm2TransParaExtState */
-                    out1 = s->state1 + s->b0 * in1 + (realtype)SOS_FLOAT_BIAS;
-                    s->state1 = (in1 - out1) * s->b1 + s->state2;
-                    s->state2 = s->b2 * in1 - s->a2 * out1;
+                    out1 = s->state1 + c->b0 * in1 + (realtype)SOS_FLOAT_BIAS;
+                    s->state1 = (in1 - out1) * c->b1 + s->state2;
+                    s->state2 = c->b2 * in1 - c->a2 * out1;
 
                     in1 = out1;
 
-                    out2 = s->state3 + s->b0 * in2 + (realtype)SOS_FLOAT_BIAS;
-                    s->state3 = (in2 - out2) * s->b1 + s->state4;
-                    s->state4 = s->b2 * in2 - s->a2 * out2;
+                    out2 = s->state3 + c->b0 * in2 + (realtype)SOS_FLOAT_BIAS;
+                    s->state3 = (in2 - out2) * c->b1 + s->state4;
+                    s->state4 = c->b2 * in2 - c->a2 * out2;
 
                     in2 = out2;
                 }
@@ -848,12 +967,16 @@ int PT_DECLSPEC sosProcessSurroundBuffer(PT_HANDLE* hp_sos, realtype* rp_in_buf,
     struct sosHdlType* cast_handle;
 
     struct sosSectionType* s;
+    const struct sosRunCoeffType* c;
     int i, j, k;
 
     cast_handle = (struct sosHdlType*)(hp_sos);
 
     if (cast_handle == NULL)
         return(NOT_OKAY);
+
+    /* BetterFxSound: pick up complete coefficient sets only (see syncRunCoeffs()) */
+    syncRunCoeffs(cast_handle);
 
     /* Currently only handles 6 or 8 channel surround */
     if ((i_num_channels != 6) && (i_num_channels != 8))
@@ -887,16 +1010,17 @@ int PT_DECLSPEC sosProcessSurroundBuffer(PT_HANDLE* hp_sos, realtype* rp_in_buf,
             out = in;
             for (i = start; i < end; i++)
             {
-                active_flag = cast_handle->section_on_flag[i];
+                active_flag = cast_handle->run_coeffs[i].on;
 
                 if (active_flag)
                 {
                     s = &((cast_handle->sections)[i]);
+                    c = &(cast_handle->run_coeffs[i]);
 
                     /* Processing derived from macro kerSosFiltDirectForm2TransParaExtState */
-                    out = s->state_1[k] + s->b0 * in + (realtype)SOS_FLOAT_BIAS;
-                    s->state_1[k] = (in - out) * s->b1 + s->state_2[k];
-                    s->state_2[k] = s->b2 * in - s->a2 * out;
+                    out = s->state_1[k] + c->b0 * in + (realtype)SOS_FLOAT_BIAS;
+                    s->state_1[k] = (in - out) * c->b1 + s->state_2[k];
+                    s->state_2[k] = c->b2 * in - c->a2 * out;
 
                     in = out;
                 }
