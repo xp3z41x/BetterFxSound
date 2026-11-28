@@ -200,10 +200,12 @@ private:
         // Capture stack based on crash context
         CaptureAndLogCallStack(exception_info->ContextRecord);
 
-        // BetterFxSound: best effort, so the relaunched instance (or the next start) gets the last settings changes.
-        controller.flushSettings();
-
         relaunchAfterCrash();
+
+        // BetterFxSound: best effort, so the relaunched instance (or the next start) gets the last settings changes.
+        // After the relaunch, so a fault or a held settings lock here can't cost it: the new instance starts about
+        // 3 s later (launchNewInstance), after this flush.
+        controller.flushSettings();
 
         return EXCEPTION_EXECUTE_HANDLER;
     }

@@ -3619,14 +3619,15 @@ void FxController::loadOutputSettings(const std::vector<SoundDevice>& sound_devi
 
 			if (main_id.isNotEmpty())
 			{
-				if (has_outputs && findOutputEntry(main_id) == nullptr)
-					logMessage("Outputs migration: output \"" + main_name + "\" resolved on a later start, added");
-
 				// BetterFxSound: the stand-in enabled while the main output was unresolved gives way to it, unless
-				// the outputs were changed since (the stand-in is no longer the only enabled output).
-				if (has_outputs && settings_.containsKey(provisional_key))
+				// the outputs were changed since: the main output has an entry already (the user's choice stands,
+				// enabled or not) or the stand-in is no longer the only enabled output.
+				const bool main_known = findOutputEntry(main_id) != nullptr;
+				String provisional_id;
+				bool replace_provisional = false;
+				if (has_outputs && !main_known && settings_.containsKey(provisional_key))
 				{
-					const String provisional_id = settings_.getString(provisional_key);
+					provisional_id = settings_.getString(provisional_key);
 					bool only_provisional_enabled = false;
 					for (auto& existing : output_entries_)
 					{
@@ -3639,24 +3640,38 @@ void FxController::loadOutputSettings(const std::vector<SoundDevice>& sound_devi
 						}
 						only_provisional_enabled = true;
 					}
-					if (only_provisional_enabled && provisional_id != main_id)
-					{
-						if (auto* provisional = findOutputEntry(provisional_id))
-						{
-							provisional->enabled = false;
-							logMessage("Outputs migration: stand-in output \"" + provisional->name + "\" disabled for \"" + main_name + "\"");
-						}
-					}
+					replace_provisional = only_provisional_enabled && provisional_id != main_id
+						&& findOutputEntry(provisional_id) != nullptr;
 				}
 
-				OutputEntry entry;
-				entry.id = main_id;
-				entry.name = main_name;
-				entry.enabled = true;
-				entry.delay_ms = jlimit(0, 500, settings_.getInt("main_output_delay_ms", 0));
-				entry.channel_mode = toOutputChannelMode(settings_.getInt("main_output_channel_mode", 0));
-				addEntry(entry);
-				save = true;
+				if (replace_provisional && findActiveOutput(main_id) == nullptr)
+				{
+					// BetterFxSound: resolved but not connected (an unplugged endpoint, or only its device config):
+					// the stand-in keeps playing and the swap waits for a start where the main output is connected.
+					main_pending = true;
+					logMessage("Outputs migration: output \"" + main_name + "\" is not connected, stand-in kept until it is");
+				}
+				else
+				{
+					if (has_outputs && !main_known)
+						logMessage("Outputs migration: output \"" + main_name + "\" resolved on a later start, added");
+
+					if (replace_provisional)
+					{
+						auto* provisional = findOutputEntry(provisional_id);
+						provisional->enabled = false;
+						logMessage("Outputs migration: stand-in output \"" + provisional->name + "\" disabled for \"" + main_name + "\"");
+					}
+
+					OutputEntry entry;
+					entry.id = main_id;
+					entry.name = main_name;
+					entry.enabled = true;
+					entry.delay_ms = jlimit(0, 500, settings_.getInt("main_output_delay_ms", 0));
+					entry.channel_mode = toOutputChannelMode(settings_.getInt("main_output_channel_mode", 0));
+					addEntry(entry);
+					save = true;
+				}
 			}
 			else
 			{
