@@ -263,6 +263,7 @@ public:
 	static constexpr DWORD kIdleStopMs = 2000;                // Stop the stream after this much silence
 	static constexpr int kRealignMs = 3;                      // Delay changes from this size on are applied at once
 	static constexpr double kRealignErrorSecs = 0.020;        // A lasting offset from the target this big is too
+	static constexpr DWORD kFlushMs = 30;                     // Less than the target queued and nothing more for this long: play it
 
 	// Creates the output and starts its render thread. The thread holds its own reference to the output, so the
 	// output is freed only once the thread no longer uses it (see requestStop()).
@@ -392,6 +393,7 @@ public:
 				std::memcpy(dst, src, channels * sizeof(float));
 		}
 		write_pos_.store(w + n, std::memory_order_release);
+		last_write_tick_.store(GetTickCount(), std::memory_order_relaxed);
 	}
 
 private:
@@ -687,12 +689,29 @@ private:
 
 		if (!primed_)
 		{
-			if (fill >= target && fill > 0)
+			// BetterFxSound: a sound shorter than the target after silence (nothing more came for kFlushMs) is played
+			// too, at the moment more audio would have filled the queue to the target, as the carrier does
+			// (sndDevicesDoCapture()). It used to wait for the next sound to fill the rest, and then play late.
+			const DWORD since_write = now - last_write_tick_.load(std::memory_order_relaxed);
+			const bool flush = fill > 0 && fill < target && since_write >= kFlushMs;
+			if ((fill >= target && fill > 0) || flush)
 			{
 				primed_ = true;
 				resetResampler();
 				aligned_target_ = target;
 				realign_pending_ = false;
+
+				// BetterFxSound: a flush plays silence first, for what is missing to the target less the time already
+				// waited since the last write.
+				const UINT32 queued = write_pos_.load(std::memory_order_acquire) - read_pos_.load(std::memory_order_relaxed);
+				if (queued < target)
+				{
+					const double waited = static_cast<double>(since_write) * rate / 1000.0;
+					const double missing = static_cast<double>(target - queued) - waited;
+					hold_frames_ = missing > 0.0 ? static_cast<UINT32>(missing) : 0;
+				}
+				fill = queued + hold_frames_;
+
 				if (!running_)
 				{
 					if (FAILED(client_->Start()))
@@ -883,6 +902,7 @@ private:
 	std::atomic<UINT32> read_pos_{ 0 };    // Written by the render thread only
 	std::atomic<UINT32> active_format_{ 0 };  // Format the ring and the device are set up for, 0 = none
 	std::atomic<UINT32> pending_format_{ 0 }; // Format the audio thread is producing
+	std::atomic<DWORD> last_write_tick_{ 0 }; // GetTickCount() of the last block queued by the audio thread
 
 	HANDLE stop_event_ = NULL;
 	HANDLE audio_event_ = NULL;

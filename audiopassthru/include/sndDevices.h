@@ -48,6 +48,9 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 /* Limit settings */
 #define SND_DEVICES_MAX_NUM_DEVICES 64
 
+/* BetterFxSound: the most channels the carrier's resampler handles (sndDevicesDoPlayback()), a carrier with more is silent */
+#define SND_DEVICES_CARRIER_MAX_CHANNELS 32
+
 /* BetterFxSound: reading again an active device's channel count that could not be read (sndDevicesGetChannelProbeIsDue()) */
 #define SND_DEVICES_MAX_CHANNEL_PROBE_RETRIES		10
 #define SND_DEVICES_CHANNEL_PROBE_INTERVAL_MS		500
@@ -469,6 +472,19 @@ struct sndDevicesHdlType {
 	int playbackIsActive;		// Will be either SND_DEVICES_PLAYBACK_IS_STOPPED or SND_DEVICES_PLAYBACK_IS_ACTIVE.
 	int playbackStreamIsTemporarilyPaused;	// Used to turn off playback stream when no capture or playback is occuring.
 
+	// BetterFxSound: carrier pacing (sndDevicesDoCapture(), sndDevicesDoPlayback()). Processing thread only, reset by
+	// sndDevicesStartStopCapture() when a processing thread starts, carrierStallCount excepted.
+	DWORD processingStartTick;			// GetTickCount() when this processing thread started.
+	LONGLONG lastCapturePacketQpc;		// QueryPerformanceCounter() when the last loopback packet was read.
+	LONGLONG qpcFrequency;				// QueryPerformanceFrequency().
+	DWORD carrierLastConsumedTick;		// When the running carrier was last seen playing out of its queue.
+	UINT32 carrierLastPadding;			// The carrier's queue (playback frames) as last read, or right after the last write.
+	UINT32 carrierStallCapturedFrames;	// Frames captured since the running carrier last played out of its queue.
+	int carrierStallCount;				// Consecutive reinits for a stalled carrier, each waits longer.
+	double carrierErrorAvg;				// Averaged offset of the queue from its setpoint right after a write, seconds.
+	double carrierReadPos;				// Resampler: input position of the next output frame, from -2 (see carrierHistory).
+	float carrierHistory[3][SND_DEVICES_CARRIER_MAX_CHANNELS];	// Resampler: the last 3 frames of the previous block.
+
 	// The mute setting that belongs to the real playback device FxSound is currently rendering to, ie
 	// the setting the device had before FxSound applied its own to it, plus any the user has since made
 	// on the device itself. It is put back on that device when FxSound stops driving it, so a device we
@@ -565,7 +581,7 @@ int PT_DECLSPEC sndDevicesFinalSetupPlaybackDevice(PT_HANDLE *, int *);
 int PT_DECLSPEC sndDevicesRestoreDefaultDevice(PT_HANDLE *, int *);
 
 /* sndDevicesDoCapture.cpp */
-int PT_DECLSPEC sndDevicesDoCapture(PT_HANDLE *, float **, int *, WAVEFORMATEX **, int *);
+int PT_DECLSPEC sndDevicesDoCapture(PT_HANDLE *, float **, int *, WAVEFORMATEX **, int *, HANDLE);
 int PT_DECLSPEC sndDevicesStartStopCapture(PT_HANDLE *, int);
 
 /* sndDevicesDoPlayback.cpp */

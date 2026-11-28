@@ -51,7 +51,7 @@ public:
 	int processTimer();
 	void setDspProcessingModule(DfxDsp* p_dfx_dsp);
 	static DWORD WINAPI processingThread(LPVOID lpParam);
-	DWORD threadWorker(void); // Needs to be public to be called from static thread starter function
+	DWORD threadWorker(HANDLE h_wait_timer); // Needs to be public to be called from static thread starter function
 	int setTargetedRealPlaybackDevice(const std::wstring sound_device_guid);
 	void registerCallback(AudioPassthruCallback *callback);
     bool isPlaybackDeviceAvailable();

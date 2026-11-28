@@ -23,6 +23,14 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "OwedVolume.h"
 #include <algorithm>
 #include <cstring>
+#include <mmsystem.h>
+#include <avrt.h>
+
+#pragma comment(lib, "winmm.lib")
+#pragma comment(lib, "avrt.lib")
+
+// BetterFxSound: CreateWaitableTimerExW() flag, Windows 10 1803 and later (older versions refuse it, see processingThread()).
+static const DWORD kCreateWaitableTimerHighResolution = 0x00000002;
 
 #define DFXG_SND_SERVER_KILL_THREAD_TIMEOUT_MSECS		  3000
 #define DFXG_SND_SERVER_KILL_THREAD_WAIT_PER_LOOP_MSECS   50
@@ -673,7 +681,7 @@ int AudioPassthruPrivate::processTimer()
 * FUNCTION: threadWorker()
 * DESCRIPTION:
 */
-DWORD AudioPassthruPrivate::threadWorker(void)
+DWORD AudioPassthruPrivate::threadWorker(HANDLE h_wait_timer)
 {
 	float *fp_buffer;
 	int numSampleSets;
@@ -706,7 +714,7 @@ DWORD AudioPassthruPrivate::threadWorker(void)
 		// NOT_OKAY is only returned for catastrophic errors but if resultFlag != SND_DEVICES_CAPTURE_PLAYBACK_SUCCESS
 		// then typically a change in a device property has caused the capture or playback operation to fail, in this
 		// case we need to exit this thread so a reinitialization can be done.
-		if (sndDevicesDoCapture(hp_sndDevices_, &fp_buffer, &numSampleSets, &pwfx, &resultFlag) != OKAY)
+		if (sndDevicesDoCapture(hp_sndDevices_, &fp_buffer, &numSampleSets, &pwfx, &resultFlag, h_wait_timer) != OKAY)
 			return(NOT_OKAY);
 
 		// A non-successful flag will typically be due to a change in the playback devices properties.
@@ -829,7 +837,29 @@ DWORD WINAPI AudioPassthruPrivate::processingThread(LPVOID lpParam)
 	hr = CoInitialize(NULL);
 
 	AudioPassthruPrivate * callerClass = (AudioPassthruPrivate*)lpParam;
-	auto ret = callerClass->threadWorker();
+
+	/*
+	* BetterFxSound: the capture loop polls every millisecond (sndDevicesDoCapture()). A high resolution waitable timer
+	* (Windows 10 1803 and later) keeps that interval whatever the process timer resolution, which Windows 11 may
+	* ignore for a hidden window. Without one (Windows 7, older Windows 10) the timer resolution is raised to 1 ms for
+	* this thread's lifetime, instead of relying on JUCE having done it. The thread is also registered with MMCSS (Pro
+	* Audio), so other work holds it off less often; if that service is not available it keeps its own priority.
+	*/
+	HANDLE wait_timer = CreateWaitableTimerExW(NULL, NULL, kCreateWaitableTimerHighResolution, TIMER_ALL_ACCESS);
+	bool timer_period_raised = false;
+	if (wait_timer == NULL)
+		timer_period_raised = (timeBeginPeriod(1) == TIMERR_NOERROR);
+	DWORD mmcss_task_index = 0;
+	HANDLE mmcss_handle = AvSetMmThreadCharacteristicsW(L"Pro Audio", &mmcss_task_index);
+
+	auto ret = callerClass->threadWorker(wait_timer);
+
+	if (mmcss_handle != NULL)
+		AvRevertMmThreadCharacteristics(mmcss_handle);
+	if (timer_period_raised)
+		timeEndPeriod(1);
+	if (wait_timer != NULL)
+		CloseHandle(wait_timer);
 
 	/* BetterFxSound: the audio of every output was interrupted, see stream_generation_ */
 	callerClass->stream_generation_.fetch_add(1);

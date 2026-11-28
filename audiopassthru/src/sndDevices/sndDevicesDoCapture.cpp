@@ -23,6 +23,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include <windows.h>
 #include <stdio.h>
 #include <math.h>
+#include <string.h>
 
 #include <mmreg.h>
 #include <Mmdeviceapi.h>
@@ -38,13 +39,41 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "sndDevices.h"
 
 /*
+ * BetterFxSound: carrier pacing.
+ * - SND_DEVICES_CARRIER_STALL_MS: a running carrier that plays nothing out of its queue for this long while audio keeps
+ *   coming ends the processing thread, so a reinit opens it again. Doubled for each consecutive one, up to 16 times.
+ */
+#define SND_DEVICES_CARRIER_STALL_MS		2000
+#define SND_DEVICES_CARRIER_STALL_MAX_SHIFT	4
+#define SND_DEVICES_CARRIER_STALL_RESET_MS	10000
+
+/*
+ * FUNCTION: sndDevicesResetCarrierResampler()
+ * DESCRIPTION: BetterFxSound. Starts the carrier's resampler (sndDevicesDoPlayback()) over from silence.
+ */
+static void sndDevicesResetCarrierResampler(struct sndDevicesHdlType *cast_handle)
+{
+	memset(cast_handle->carrierHistory, 0, sizeof(cast_handle->carrierHistory));
+	cast_handle->carrierReadPos = -2.0;
+	cast_handle->carrierErrorAvg = 0.0;
+}
+
+/*
  * FUNCTION: sndDevicesDoCapture()
  * DESCRIPTION: Captures audio buffers from specified capture device.
  * Returns fp_buffer to use to do audio processing in place.
  * *ip_numSampleSets will contain the number of sample sets in the buffer
  * and **pp_wfxDfx contains the format of the buffer.
+ * BetterFxSound: h_waitTimer is a waitable timer the calling thread owns, used to wait 1 ms between polls; NULL
+ * waits with Sleep(1).
+ * Every loopback packet there is is read on each poll and handed over at once, whatever the carrier has queued. The
+ * carrier used to pace the capture: only what it needed to get back to half the buffer was read, so the additional
+ * outputs (fed with the same blocks) got nothing while it refilled from empty or stalled, a sound shorter than half
+ * the buffer after silence was held until the next one, and a backlog left in the loopback by a late processing
+ * thread stayed there for good. The carrier now keeps its own queue at its setpoint (sndDevicesDoPlayback()): it is
+ * stopped when it runs empty and started again once the setpoint is queued.
  */
-int PT_DECLSPEC sndDevicesDoCapture(PT_HANDLE *hp_sndDevices, float **fpp_buffer, int *ip_numSampleSets, WAVEFORMATEX **pp_wfxDfx, int *ip_resultFlag)
+int PT_DECLSPEC sndDevicesDoCapture(PT_HANDLE *hp_sndDevices, float **fpp_buffer, int *ip_numSampleSets, WAVEFORMATEX **pp_wfxDfx, int *ip_resultFlag, HANDLE h_waitTimer)
 {
 	struct sndDevicesHdlType *cast_handle;
 	HRESULT hr;
@@ -58,9 +87,10 @@ int PT_DECLSPEC sndDevicesDoCapture(PT_HANDLE *hp_sndDevices, float **fpp_buffer
 	UINT32 i;
 	int numCaptureChannels;
 	int numPlaybackChannels;
-	UINT32 numDesiredCaptureFrames;
 	UINT32 halfCaptureBufferSize;
-	UINT32 quarterCaptureBufferSize;
+	UINT32 maxCaptureFrames;
+	UINT32 packetFrames;
+	DWORD now;
 	int i_playback_index;
 #ifdef _DEBUG
 	UINT64 DevicePosition;
@@ -84,7 +114,23 @@ int PT_DECLSPEC sndDevicesDoCapture(PT_HANDLE *hp_sndDevices, float **fpp_buffer
 	*ip_numSampleSets = 0;
 	*pp_wfxDfx = NULL;
 
-	// Repeat this loop until we have enough frames to fill the specified playback buffer space.
+	// BetterFxSound: the most frames one call can hand over: what the capture buffer holds, and what the processing
+	// buffer holds at the playback channel count. A larger backlog is read by the next call.
+	maxCaptureFrames = 0;
+	if( (numCaptureChannels > 0) && (numPlaybackChannels > 0) && (cast_handle->captureBufAllocSize > 0) && (cast_handle->playbackBufAllocSize > 0) )
+	{
+		UINT32 maxPlaybackFrames = (UINT32)(cast_handle->playbackBufAllocSize / numPlaybackChannels);
+		maxCaptureFrames = (UINT32)(cast_handle->captureBufAllocSize / numCaptureChannels);
+		if( maxPlaybackFrames < maxCaptureFrames )
+			maxCaptureFrames = maxPlaybackFrames;
+	}
+	if( maxCaptureFrames == 0 )
+	{
+		hr = E_FAIL;
+		goto Exit;
+	}
+
+	// Repeat this loop until there are captured frames to hand over.
 	do
 	{
 		// If the device callbacks or an external call has thrown the stop flag, exit this thread.
@@ -95,8 +141,21 @@ int PT_DECLSPEC sndDevicesDoCapture(PT_HANDLE *hp_sndDevices, float **fpp_buffer
 			return(OKAY);
 		}
 
-		// With the looping now used to build playback buffer we can sleep for very short time.
-		Sleep(1);
+		// BetterFxSound: poll every millisecond. Sleep(1) lasts a whole timer tick (up to 15.6 ms) unless the
+		// process raised the timer resolution, which Windows 11 may ignore for a hidden window, so how soon a
+		// packet was seen depended on the environment. A high resolution timer (Windows 10 1803 and later) does
+		// not; without it the processing thread raised the timer resolution (AudioPassthruPrivate::processingThread()).
+		if( h_waitTimer != NULL )
+		{
+			LARGE_INTEGER dueTime;
+			dueTime.QuadPart = -10000LL; // 1 ms, relative, in 100 ns units
+			if( SetWaitableTimer(h_waitTimer, &dueTime, 0, NULL, NULL, FALSE) )
+				WaitForSingleObject(h_waitTimer, 20);
+			else
+				Sleep(1);
+		}
+		else
+			Sleep(1);
 
 		// Check for bad value to upsample ratio, was happening when some Bluetooth devices were added or removed (11/25/15).
 		if( (cast_handle->upsampleRatio <= 0) || (cast_handle->upsampleRatio > 16) )
@@ -119,152 +178,187 @@ int PT_DECLSPEC sndDevicesDoCapture(PT_HANDLE *hp_sndDevices, float **fpp_buffer
 
 		numFramesQueuedUpToPlayReferencedToCapture = numFramesQueuedUpToPlay/cast_handle->upsampleRatio;
 
-		// Calculate the number of playback frames to fill, compensated for samp rate differences.
-		cast_handle->numPlaybackFramesAvailableToFill = cast_handle->bufferFrameSizeCapture - numFramesQueuedUpToPlayReferencedToCapture;
-
 		halfCaptureBufferSize = cast_handle->bufferFrameSizeCapture/2;
-		quarterCaptureBufferSize = cast_handle->bufferFrameSizeCapture/4;
+		now = GetTickCount();
 
-		// If playback buffer is totally empty, don't send more buffers to playback until we fill 1/2 the capture buffer.
-		if( numFramesQueuedUpToPlayReferencedToCapture == 0 )
+		// If playback buffer is totally empty, stop it until it has 1/2 the capture buffer queued again.
+		if( numFramesQueuedUpToPlay == 0 )
 		{
-			numDesiredCaptureFrames = halfCaptureBufferSize;
 			cast_handle->playbackIsActive = SND_DEVICES_PLAYBACK_IS_STOPPED;
-			
+
 			if( cast_handle->playbackStreamIsTemporarilyPaused == 0 )
 			{
 				cast_handle->playbackStreamIsTemporarilyPaused = 1;
 				hr = cast_handle->pAudioClientPlayback->Stop(); // Stop playback to allow PC to sleep if no audio is playing.
 				if (FAILED(hr)) goto Exit;
+
+				// BetterFxSound: everything was played, the next audio starts from silence.
+				sndDevicesResetCarrierResampler(cast_handle);
+			}
+		}
+		else if( cast_handle->playbackStreamIsTemporarilyPaused )
+		{
+			// BetterFxSound: the blocks handed over meanwhile were queued on the stopped carrier
+			// (sndDevicesDoPlayback()). It starts once its setpoint is queued, or, when no more audio came, at the
+			// moment more audio would have brought it there: a sound shorter than the setpoint after silence is
+			// played with the usual latency, instead of being held until the next sound fills the rest.
+			LARGE_INTEGER qpcNow;
+			double waitedFrames = 0.0;
+			QueryPerformanceCounter(&qpcNow);
+			if( (cast_handle->qpcFrequency > 0) && (qpcNow.QuadPart > cast_handle->lastCapturePacketQpc) )
+				waitedFrames = (double)(qpcNow.QuadPart - cast_handle->lastCapturePacketQpc) * (double)cast_handle->wfxCapture.nSamplesPerSec / (double)cast_handle->qpcFrequency;
+
+			if( (double)numFramesQueuedUpToPlayReferencedToCapture + waitedFrames >= (double)halfCaptureBufferSize )
+			{
+				cast_handle->playbackStreamIsTemporarilyPaused = 0;
+				hr = cast_handle->pAudioClientPlayback->Start(); // Restart playback.
+				if (FAILED(hr)) goto Exit;
+
+				cast_handle->playbackIsActive = SND_DEVICES_PLAYBACK_IS_ACTIVE;
+				cast_handle->carrierErrorAvg = 0.0;
+				cast_handle->carrierLastConsumedTick = now;
+				cast_handle->carrierStallCapturedFrames = 0;
 			}
 		}
 		else
 		{
 			cast_handle->playbackIsActive = SND_DEVICES_PLAYBACK_IS_ACTIVE;
 
-			if( cast_handle->playbackStreamIsTemporarilyPaused )
+			// BetterFxSound: watchdog. The additional outputs no longer depend on the carrier, but a carrier that stays
+			// active without playing anything out of its queue and without an error (a display sink in power save, a
+			// device half awake after a resume) would stay silent until some device notification. When audio keeps
+			// coming and the queue has not gone down for a while, the processing thread ends and a reinit opens the
+			// carrier again; a carrier that keeps stalling is given longer each time.
+			if( numFramesQueuedUpToPlay < cast_handle->carrierLastPadding )
 			{
-				cast_handle->playbackStreamIsTemporarilyPaused = 0;
-				hr = cast_handle->pAudioClientPlayback->Start(); // Restart playback.
+				cast_handle->carrierLastConsumedTick = now;
+				cast_handle->carrierStallCapturedFrames = 0;
+				if( (now - cast_handle->processingStartTick) >= SND_DEVICES_CARRIER_STALL_RESET_MS )
+					cast_handle->carrierStallCount = 0;
 			}
-
-			// If the playback buffer is already at least 1/2 full, don't grab anymore capture buffers.
-			if( cast_handle->numPlaybackFramesAvailableToFill < halfCaptureBufferSize )
-				numDesiredCaptureFrames = 0;
-			else
-				// If the playback buffer is less than 1/2 full, get what we need to make 1/2 full.
-				numDesiredCaptureFrames = cast_handle->numPlaybackFramesAvailableToFill - halfCaptureBufferSize;
+			else if( cast_handle->carrierStallCapturedFrames > 0 )
+			{
+				int shift = cast_handle->carrierStallCount;
+				if( shift > SND_DEVICES_CARRIER_STALL_MAX_SHIFT )
+					shift = SND_DEVICES_CARRIER_STALL_MAX_SHIFT;
+				if( (now - cast_handle->carrierLastConsumedTick) >= ((DWORD)SND_DEVICES_CARRIER_STALL_MS << shift) )
+				{
+					SLOUT_FIRST_LINE(L"sndDevicesDoCapture():: the playback device stopped playing, reinitializing");
+					cast_handle->carrierStallCount++;
+					hr = E_FAIL;
+					goto Exit;
+				}
+			}
 		}
-
-		if( numDesiredCaptureFrames == 0 )
-			goto DoneGrabbingFrames;
+		cast_handle->carrierLastPadding = numFramesQueuedUpToPlay;
 
 		// The audio is streamed in small "packets", a number of frames (sample sets). So far it appears that
 		// packets are always 10ms in duration, independent of sampling freq, so at 44.1k we get 441 sample sets/packet.
 		hr = cast_handle->pAudioCaptureLoopback->GetNextPacketSize(&packetLength); // The number of frames in the next packet.
 		if (FAILED(hr)) goto Exit;
 
-		do // Loop to read the small data packets to fill capture buffer up to available playback size.
+		// BetterFxSound: every packet there is, up to what the buffers hold. A backlog (the processing thread came
+		// late) is read at once too; the carrier keeps only the newest of it (sndDevicesDoPlayback()), the additional
+		// outputs line themselves up again. The loopback buffer is never left to overflow, so a discontinuity
+		// (AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) needs nothing more.
+		while( (packetLength > 0) && ((cast_handle->capturedFramesCount == 0) || (cast_handle->capturedFramesCount + packetLength <= maxCaptureFrames)) )
 		{
-			if( packetLength > 0 )
-			{
-				// Get the data in this packet.
-				hr = cast_handle->pAudioCaptureLoopback->GetBuffer(&(cast_handle->pDataPacketCapture), &(cast_handle->numCaptureFramesAvailable), &flags,
+			// Get the data in this packet.
+			hr = cast_handle->pAudioCaptureLoopback->GetBuffer(&(cast_handle->pDataPacketCapture), &(cast_handle->numCaptureFramesAvailable), &flags,
 #ifdef _DEBUG
-					&DevicePosition, &QPCPosition);
+				&DevicePosition, &QPCPosition);
 #else
-					NULL, NULL);
+				NULL, NULL);
 #endif
-				if (FAILED(hr)) goto Exit;
+			if (FAILED(hr)) goto Exit;
 
-				fptr = (float *)(cast_handle->pDataPacketCapture);
+			fptr = (float *)(cast_handle->pDataPacketCapture);
 
-				loopsize = cast_handle->numCaptureFramesAvailable * numCaptureChannels;
-				offset = cast_handle->capturedFramesCount * numCaptureChannels;
+			// BetterFxSound: never more than the buffer holds (a first packet larger than that is cut, the rest dropped).
+			packetFrames = cast_handle->numCaptureFramesAvailable;
+			if( packetFrames > maxCaptureFrames - cast_handle->capturedFramesCount )
+				packetFrames = maxCaptureFrames - cast_handle->capturedFramesCount;
 
-				// Silent flag means to treat packet as containing all zeros, even though it may not.
-				if( flags & AUDCLNT_BUFFERFLAGS_SILENT )
-				{
-					cast_handle->playbackIsActive = SND_DEVICES_PLAYBACK_IS_STOPPED;
-					for(i=0; i<loopsize; i++)
-						cast_handle->fCaptureBuf[ offset + i ] = (float)0.0;
-				}
-				else
-				{
-					for(i=0; i<loopsize; i++)
-						cast_handle->fCaptureBuf[ offset + i ] = fptr[i];
-				}
+			loopsize = packetFrames * numCaptureChannels;
+			offset = cast_handle->capturedFramesCount * numCaptureChannels;
+
+			// Silent flag means to treat packet as containing all zeros, even though it may not.
+			if( flags & AUDCLNT_BUFFERFLAGS_SILENT )
+			{
+				cast_handle->playbackIsActive = SND_DEVICES_PLAYBACK_IS_STOPPED;
+				for(i=0; i<loopsize; i++)
+					cast_handle->fCaptureBuf[ offset + i ] = (float)0.0;
+			}
+			else
+			{
+				for(i=0; i<loopsize; i++)
+					cast_handle->fCaptureBuf[ offset + i ] = fptr[i];
+			}
 
 // #define DO_BEEPS_ON_SONG_CHANGES
 #ifdef DO_BEEPS_ON_SONG_CHANGES
-				// The discontinuity flag gets set by WMP when clicking on different song selections but not on start/stop.
-				// In youtube the flag doesn't get set by start/stop or playing songs but does get set when capture
-				// buffer overflows, as does WMP.
-				static int discontinuity_count = 0;
-				static int silent_count = 0;
-				static int timestamp_error_count = 0;
-				int event_flag;
+			// The discontinuity flag gets set by WMP when clicking on different song selections but not on start/stop.
+			// In youtube the flag doesn't get set by start/stop or playing songs but does get set when capture
+			// buffer overflows, as does WMP.
+			static int discontinuity_count = 0;
+			static int silent_count = 0;
+			static int timestamp_error_count = 0;
+			int event_flag;
 
+			event_flag = 1;
+
+			for(i=0; i<loopsize; i++ )
+				if( fabs(cast_handle->fCaptureBuf[ offset + i ]) > 0.001 )
+					event_flag = 0;
+
+			if( flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY )
+			{
+ 				discontinuity_count++;
 				event_flag = 1;
-
-				for(i=0; i<loopsize; i++ )
-					if( fabs(cast_handle->fCaptureBuf[ offset + i ]) > 0.001 )
-						event_flag = 0;
-
-				if( flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY )
-				{
- 					discontinuity_count++;
-					event_flag = 1;
-				}
-				if( flags & AUDCLNT_BUFFERFLAGS_SILENT )
-				{
-					silent_count++;
-					event_flag = 1;
-				}
-				if( flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR )
-				{
-					timestamp_error_count++;
-					event_flag = 1;
-				}
-
-				if( event_flag )
-					for(i=0; i<loopsize; i++)
-						if( (i % 100) == 0 )
-							cast_handle->fCaptureBuf[ offset + i ] = (float)0.95;
-						else
-							cast_handle->fCaptureBuf[ offset + i ] = (float)0.0;
-#endif
-
-				// This release call is to be called as soon as possible following the GetBuffer call.
-				hr = cast_handle->pAudioCaptureLoopback->ReleaseBuffer(cast_handle->numCaptureFramesAvailable);
-				if (FAILED(hr)) goto Exit;
-
-				cast_handle->capturedFramesCount += cast_handle->numCaptureFramesAvailable;
-
-				hr = cast_handle->pAudioCaptureLoopback->GetNextPacketSize(&packetLength);
-				if (FAILED(hr)) goto Exit;
+			}
+			if( flags & AUDCLNT_BUFFERFLAGS_SILENT )
+			{
+				silent_count++;
+				event_flag = 1;
+			}
+			if( flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR )
+			{
+				timestamp_error_count++;
+				event_flag = 1;
 			}
 
-			// The audio is streamed in small "packets", a number of frames (sample sets). So far it appears that
-			// packets are always 10ms in duration, independent of sampling freq, so at 44.1k we get 441 sample sets/packet.
-			hr = cast_handle->pAudioCaptureLoopback->GetNextPacketSize(&packetLength); // The number of frames in the next packet.
+			if( event_flag )
+				for(i=0; i<loopsize; i++)
+					if( (i % 100) == 0 )
+						cast_handle->fCaptureBuf[ offset + i ] = (float)0.95;
+					else
+						cast_handle->fCaptureBuf[ offset + i ] = (float)0.0;
+#endif
+
+			// This release call is to be called as soon as possible following the GetBuffer call.
+			hr = cast_handle->pAudioCaptureLoopback->ReleaseBuffer(cast_handle->numCaptureFramesAvailable);
 			if (FAILED(hr)) goto Exit;
 
-		} while( (cast_handle->capturedFramesCount < numDesiredCaptureFrames ) // No sleep in this loop.
-			      && (packetLength > 0) );
+			cast_handle->capturedFramesCount += packetFrames;
 
-		// Check to see if we are in the case where no more capture frames are coming in and we need to playout the rest of the playback buffer.
-		hr = cast_handle->pAudioClientPlayback->GetCurrentPadding(&numFramesQueuedUpToPlay);
-		if (FAILED(hr)) goto Exit;
+			hr = cast_handle->pAudioCaptureLoopback->GetNextPacketSize(&packetLength);
+			if (FAILED(hr)) goto Exit;
+		}
 
-		// If we are not in startup mode (numFramesQueuedUpToPlay !=  0) and  playback buffer has shrunk to 1/4 or less desired size
-		// and no more capture buffers are coming in, transfer remaining capture buffers to playback.
-		if( (numFramesQueuedUpToPlay != 0) && (cast_handle->capturedFramesCount > 0) && (numFramesQueuedUpToPlay/cast_handle->upsampleRatio) <= quarterCaptureBufferSize )
-			goto DoneGrabbingFrames;
+		if( cast_handle->capturedFramesCount > 0 )
+		{
+			LARGE_INTEGER qpcPacket;
+			QueryPerformanceCounter(&qpcPacket);
+			cast_handle->lastCapturePacketQpc = qpcPacket.QuadPart;
 
-	} while( cast_handle->capturedFramesCount < numDesiredCaptureFrames ); // This loop has a sleep to allow capture buffers to build up.
+			// BetterFxSound: audio the running carrier was given since it last played something (see the watchdog above).
+			if( cast_handle->playbackStreamIsTemporarilyPaused == 0 )
+				cast_handle->carrierStallCapturedFrames += cast_handle->capturedFramesCount;
+		}
 
-DoneGrabbingFrames :
+	} while( cast_handle->capturedFramesCount == 0 ); // This loop has a sleep to allow capture buffers to build up.
+
+	hr = S_OK;
 
 	// Correct number of playback frame for sample rate difference.
 	cast_handle->playbackFrameCount = cast_handle->upsampleRatio * cast_handle->capturedFramesCount;
@@ -418,6 +512,19 @@ int PT_DECLSPEC sndDevicesStartStopCapture(PT_HANDLE *hp_sndDevices, int i_start
 		// BetterFxSound: the stop flag is not cleared here. sndDevicesReInit() cleared it before it enumerated the
 		// devices, and a stop requested since then (a device change, a carrier switch) must make this new
 		// processing thread exit at once so another reinit picks it up. Clearing it here lost those requests.
+
+		// BetterFxSound: the carrier pacing starts over with this processing thread (see sndDevicesDoCapture()).
+		LARGE_INTEGER qpc;
+		cast_handle->processingStartTick = GetTickCount();
+		QueryPerformanceFrequency(&qpc);
+		cast_handle->qpcFrequency = qpc.QuadPart;
+		QueryPerformanceCounter(&qpc);
+		cast_handle->lastCapturePacketQpc = qpc.QuadPart;
+		cast_handle->carrierLastConsumedTick = cast_handle->processingStartTick;
+		cast_handle->carrierLastPadding = 0;
+		cast_handle->carrierStallCapturedFrames = 0;
+		sndDevicesResetCarrierResampler(cast_handle);
+
 		hr = cast_handle->pAudioClientCapture->Start(); // Start capturing, this starts filling of the internal capture buffers.
 		hr = cast_handle->pAudioClientPlayback->Start(); // Start playback, this starts filling of the internal playback buffers.
 	}
