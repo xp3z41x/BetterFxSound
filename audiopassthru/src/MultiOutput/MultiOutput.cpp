@@ -394,6 +394,7 @@ public:
 	static constexpr int kRetriesBeforeBackoff = 5;
 	static constexpr DWORD kStallMs = 2000;                   // BetterFxSound: a running stream that makes no progress this long is reopened
 	                                                          // (long enough for a Bluetooth stream that starts consuming late)
+	static constexpr DWORD kHealthyMs = 10000;                // BetterFxSound: a stream open this long without failing clears the retry backoff
 	static constexpr DWORD kIdleStopMs = 2000;                // Stop the stream after this much silence
 	static constexpr int kRealignMs = 3;                      // Delay changes from this size on are applied at once
 	static constexpr double kRealignErrorSecs = 0.020;        // A lasting offset from the target this big is too
@@ -477,11 +478,20 @@ public:
 	// Router, UI thread: the engine starts or stops driving the outputs. Starting takes over a device
 	// whose stream is already open (the others are taken over when their stream opens). Stopping
 	// puts the device's own level and mute back.
-	// BetterFxSound: never waits for the render thread. While it is opening its stream it holds volume_mutex_ across
-	// the device volume calls (seconds on a Bluetooth device that is connecting), and the UI thread waited for it. Then
-	// the render thread applies the change itself, with the router's flag as it is then, once it is done.
+	// BetterFxSound: starting never waits for the render thread. While it is opening its stream it holds volume_mutex_
+	// across the device volume calls (seconds on a Bluetooth device that is connecting), and the UI thread waited for
+	// it. Then the render thread applies the change itself, with the router's flag as it is then, once it is done.
+	// Stopping still waits: the callers sweep the owed volumes right after (handBackUnusedDevices(), without this
+	// mutex), and a take-over still running then would set the device to 100% after the sweep put its level back and
+	// erased the record, losing the user's level. The router cleared its flag first, so no take-over starts after it.
 	void setDriven(bool driven)
 	{
+		if (!driven)
+		{
+			std::lock_guard<std::mutex> lock(volume_mutex_);
+			applyDrivenLocked(false);
+			return;
+		}
 		std::unique_lock<std::mutex> lock(volume_mutex_, std::try_to_lock);
 		if (!lock.owns_lock())
 		{
@@ -683,6 +693,7 @@ private:
 
 		DWORD next_retry = GetTickCount();
 		int failures = 0;	// BetterFxSound: opens or streams that failed in a row (retry backoff)
+		DWORD opened_tick = next_retry;	// BetterFxSound: when the stream was last opened
 		HANDLE handles[2] = { stop_event_, audio_event_ };
 
 		for (;;)
@@ -724,6 +735,7 @@ private:
 					continue;
 				}
 				last_error_.store(S_OK);
+				opened_tick = now;
 				ring_rate_ = pending;
 				ring_reset_pending_ = true;
 			}
@@ -747,9 +759,12 @@ private:
 				failures++;
 				next_retry = now + (failures > kRetriesBeforeBackoff ? kRetryLongMs : kRetryMs);
 			}
-			else if (running_)
+			else if (running_ && failures != 0 && now - opened_tick > kHealthyMs)
 			{
-				failures = 0;	// Playing again
+				// Playing again. BetterFxSound: only once the stream kept going for a while: one that fails again a
+				// few seconds after each open (stalls, is invalidated again) used to reset the count on its first
+				// period and was reopened every few seconds forever, never backing off.
+				failures = 0;
 			}
 		}
 

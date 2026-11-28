@@ -2916,8 +2916,21 @@ String FxController::applyDelayCalibrationResults()
 		any_measured = true;
 	}
 
+	// BetterFxSound: outputs whose device could not be opened (held by another app, a failing driver) got no test
+	// sound. They used to be reported as not heard clearly.
+	StringArray not_opened;
+	for (auto& result : results)
+	{
+		if (result.unavailable)
+			not_opened.add(nameOf(String(result.device_id.c_str())));
+	}
+
 	if (!any_measured)
+	{
+		if (not_opened.size() > 0)
+			return TRANS("No output was measured, so no delay was changed.") + " " + TRANS("Could not be opened (in use by another app?), not measured:") + " " + not_opened.joinIntoString(", ") + ".";
 		return TRANS("No output could be heard clearly, so no delay was changed. Turn the volume up, move the microphone closer and try again.");
+	}
 
 	StringArray lines;
 	StringArray not_heard;
@@ -2930,8 +2943,9 @@ String FxController::applyDelayCalibrationResults()
 
 		if (!result.measured)
 		{
-			// Keeps its delay.
-			not_heard.add(name);
+			// Keeps its delay. BetterFxSound: one that could not be opened is in not_opened.
+			if (!result.unavailable)
+				not_heard.add(name);
 			continue;
 		}
 
@@ -2974,6 +2988,8 @@ String FxController::applyDelayCalibrationResults()
 	String summary = TRANS("Delays set:") + " " + lines.joinIntoString(", ") + ".";
 	if (not_heard.size() > 0)
 		summary += " " + TRANS("Not heard clearly, left unchanged:") + " " + not_heard.joinIntoString(", ") + ".";
+	if (not_opened.size() > 0)
+		summary += " " + TRANS("Could not be opened (in use by another app?), not measured:") + " " + not_opened.joinIntoString(", ") + ".";
 	if (not_connected.size() > 0)
 		summary += " " + TRANS("Not connected, not measured:") + " " + not_connected.joinIntoString(", ") + ".";
 	if (clamped)
