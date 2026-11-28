@@ -84,7 +84,7 @@ struct AdditionalOutputStatus {
 struct OutputConfig {
 	std::wstring device_id;      // SoundDevice::pwszID
 	bool enabled = false;
-	int delay_ms = 0;            // 0..500
+	int delay_ms = 0;            // 0..500, on top of the path alignment (AudioPassthru::kDelayModelVersion)
 	int volume_percent = 100;    // 0..100, trim on top of the master volume
 	OutputChannelMode channel_mode = OutputChannelMode::Both;
 };
@@ -108,6 +108,13 @@ class AudioPassthruPrivate;
 class AudioPassthru
 {
 public:
+	// BetterFxSound: what OutputConfig::delay_ms is relative to. Bumped whenever the engine changes the latency it adds
+	// around those delays, so delays measured or tuned under an older value no longer line the outputs up and the
+	// controller can store this with the saved delays and ask for a new sync when it differs.
+	// 1: v1.0.0 and v1.0.1, the carrier and the additional outputs each played with their own path latency.
+	// 2: every path (carrier included) is padded to a common latency (MultiOutputRouter::alignPaths()).
+	static constexpr int kDelayModelVersion = 2;
+
 	AudioPassthru();
 	~AudioPassthru();
 	int init();
