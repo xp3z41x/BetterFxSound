@@ -555,11 +555,15 @@ int AudioPassthruPrivate::processTimer()
 			/* BetterFxSound: the devices could be set up, a later failure retries quickly again */
 			park_retry_timed_ = false;
 			park_retry_delay_ms_ = 0;
+			carrier_failure_id_.clear();
+			carrier_failure_count_ = 0;
 
 			/* BetterFxSound: processing runs again, the real devices are FxSound's again */
 			{
 				std::lock_guard<std::mutex> lock(config_mutex_);
 				handed_back_ = false;
+				parked_ = false;
+				failed_carrier_id_.clear();
 			}
 			multi_output_.setDriven(true);
 
@@ -587,22 +591,69 @@ int AudioPassthruPrivate::processTimer()
 			* BetterFxSound: parking used to wait for a notification only, which may never come: every output stayed
 			* silent. A notification since the reinit started still wakes it (see the INVALID_HANDLE_VALUE case above).
 			* When the real and the virtual devices are there but a later step failed (the device rules, opening the
-			* carrier or the capture: statusFlag says why), it is also retried after 0.5, 1, 2, 4 then every 5 s. With no
-			* real device or no virtual device (statusFlag left completed) only a notification can help, and retrying
-			* would block this thread for a second each time while the reinit waits for the virtual device.
+			* carrier or the capture: statusFlag says why), it is also retried after 0.5, 1, 2, 4 then every 5 s.
+			* With real devices but the virtual device's name unreadable for a second (statusFlag left completed: its
+			* property store not ready yet, after a resume, and no notification follows once it is), it is retried
+			* too, up to every 30 s, as each attempt blocks this thread for that second. With no real device only a
+			* notification can help.
 			*/
 			parked_change_count_ = change_count_before_reinit;
-			park_retry_timed_ = (numRealDevices > 0) && (statusFlag != SND_DEVICES_DEVICE_OPERATION_COMPLETED);
+			const bool virtual_not_ready = (numRealDevices > 0) && (statusFlag == SND_DEVICES_DEVICE_OPERATION_COMPLETED);
+			const DWORD retry_max_ms = virtual_not_ready ? kParkRetryVirtualMaxMs : kParkRetryMaxMs;
+			park_retry_timed_ = (numRealDevices > 0);
 			if (park_retry_timed_)
 			{
 				if (park_retry_delay_ms_ == 0)
 					park_retry_delay_ms_ = kParkRetryFirstMs;
-				else if (park_retry_delay_ms_ * 2 > kParkRetryMaxMs)
-					park_retry_delay_ms_ = kParkRetryMaxMs;
+				else if (park_retry_delay_ms_ * 2 > retry_max_ms)
+					park_retry_delay_ms_ = retry_max_ms;
 				else
 					park_retry_delay_ms_ = park_retry_delay_ms_ * 2;
 				park_start_tick_ = GetTickCount();
 			}
+
+			/*
+			* BetterFxSound: retrying alone kept a carrier that cannot be opened (held by an exclusive-mode app, a
+			* format it does not take) silent for as long as that lasts, with every secondary output silent too: no
+			* processing thread feeds them. After a few consecutive failures on the carrier itself, it is reported
+			* (getFailedCarrierId()), and the controller elects the next enabled output, through a carrier request
+			* that wakes this parked engine at once. Failures of the virtual device or the capture are not the
+			* carrier's: another carrier would not help.
+			*/
+			std::wstring failed_carrier;
+			if ((numRealDevices > 0) && s_sndDevices_.playbackSetupFailed)
+			{
+				wchar_t wcp_targeted_guid[PT_MAX_GENERIC_STRLEN];
+				int i_resultFlag;
+				if ((sndDevicesGetID(hp_sndDevices_, SND_DEVICES_TARGETED_REAL_PLAYBACK, wcp_targeted_guid, &i_resultFlag) == OKAY) &&
+					(i_resultFlag == SND_DEVICES_DEVICE_OPERATION_COMPLETED))
+					failed_carrier = wcp_targeted_guid;
+			}
+			if (!failed_carrier.empty() && failed_carrier == carrier_failure_id_)
+			{
+				carrier_failure_count_++;
+			}
+			else
+			{
+				carrier_failure_id_ = failed_carrier;
+				carrier_failure_count_ = failed_carrier.empty() ? 0 : 1;
+			}
+
+			/*
+			* BetterFxSound: while parked nothing is captured, so the devices are not FxSound's: the carrier and the
+			* additional outputs get their own level and mute back (applyAdditionalOutputs() leaves the carrier out of
+			* the devices in use). Keeping them at 100% let apps play to them directly at that level once Windows made
+			* one of them the default (the virtual device gone, or a reinit that failed before taking the default).
+			* The next reinit that succeeds takes them over again.
+			*/
+			{
+				std::lock_guard<std::mutex> lock(config_mutex_);
+				parked_ = true;
+				if (carrier_failure_count_ >= kCarrierFailuresToReport)
+					failed_carrier_id_ = carrier_failure_id_;
+			}
+			multi_output_.setDriven(false);
+			applyAdditionalOutputs();
 		}
 
 		if (s_callback_ != nullptr)
@@ -832,6 +883,12 @@ bool AudioPassthruPrivate::isCarrierSwitchPending()
 	return !pending_carrier_id_.empty();
 }
 
+std::wstring AudioPassthruPrivate::getFailedCarrierId()
+{
+	std::lock_guard<std::mutex> lock(config_mutex_);
+	return failed_carrier_id_;
+}
+
 void AudioPassthruPrivate::restoreDefaultPlaybackDevice()
 {
 	int i_resultFlag;
@@ -847,6 +904,8 @@ void AudioPassthruPrivate::restoreDefaultPlaybackDevice()
 	killProcessingThread(&i_timed_out);
 	park_retry_timed_ = false;
 	park_retry_delay_ms_ = 0;
+	carrier_failure_id_.clear();
+	carrier_failure_count_ = 0;
 
 	/*
 	* BetterFxSound: the real device becomes the Windows default again and plays the apps' sound directly at
@@ -855,6 +914,8 @@ void AudioPassthruPrivate::restoreDefaultPlaybackDevice()
 	{
 		std::lock_guard<std::mutex> lock(config_mutex_);
 		handed_back_ = true;
+		parked_ = false;
+		failed_carrier_id_.clear();
 	}
 	multi_output_.setDriven(false);
 
@@ -899,8 +960,8 @@ int AudioPassthruPrivate::setTargetedRealPlaybackDevice(const std::wstring sound
 		virtual_is_default = FALSE;
 	/*
 	* BetterFxSound: not only while the processing thread runs. When the last reinit failed (the carrier went away) the
-	* engine is parked, but still drives the additional outputs at 100%: making a real device the Windows default then
-	* let the apps play to it unprocessed at that level. The request also lets the parked engine retry at once.
+	* engine is parked: making a real device the Windows default then let the apps play to it unprocessed until the
+	* next reinit. The request also lets the parked engine retry at once.
 	*/
 	if (!handed_back && virtual_is_default)
 	{
@@ -1193,8 +1254,9 @@ void AudioPassthruPrivate::applyAdditionalOutputs()
 		   back here, for example to Bluetooth headphones that left while in use and came back while FxSound is off. */
 		/* BetterFxSound: the carrier stays FxSound's whenever FxSound is on, also between two reinits (the thread
 		   stopped for a carrier switch or a device change): handing it back there only to take it over again at the
-		   reinit made its own volume jump. */
-		if (carrier_plays && !handed_back_)
+		   reinit made its own volume jump. Not while parked (the last reinit failed): nothing is captured, and the
+		   carrier may well be the Windows default then, playing the apps directly. */
+		if (carrier_plays && !handed_back_ && !parked_)
 			in_use.push_back(carrier_id);
 		if (multi_output_.isDriven())
 		{

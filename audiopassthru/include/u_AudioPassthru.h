@@ -57,6 +57,7 @@ public:
     bool isPlaybackDeviceAvailable();
 	bool checkDeviceChanges();
 	bool isCarrierSwitchPending();
+	std::wstring getFailedCarrierId();
 	void restoreDefaultPlaybackDevice();
 	void setOutputs(const std::vector<OutputConfig>& outputs);
 	bool startDelayCalibration();
@@ -88,14 +89,24 @@ private:
 	// reinit is not lost.
 	static std::atomic<LONG> s_device_change_count_;
 	LONG parked_change_count_ = 0;			// Counter read before the reinit that parked the engine
-	// BetterFxSound: a reinit that failed with the real and virtual devices present (device in use by an exclusive-mode
-	// app, not ready after a connect or a resume, format being changed) is retried after a growing delay, as no
-	// notification may follow. UI/timer thread only.
+	// BetterFxSound: a reinit that failed with real devices present (device in use by an exclusive-mode app, not ready
+	// after a connect or a resume, format being changed, virtual device not readable yet) is retried after a growing
+	// delay, as no notification may follow. UI/timer thread only.
 	bool park_retry_timed_ = false;
-	DWORD park_retry_delay_ms_ = 0;			// 0 until a reinit fails, then 500 ms doubling up to 5 s; reset by a success
+	DWORD park_retry_delay_ms_ = 0;			// 0 until a reinit fails, then 500 ms doubling up to the cap; reset by a success
 	DWORD park_start_tick_ = 0;
 	static constexpr DWORD kParkRetryFirstMs = 500;
 	static constexpr DWORD kParkRetryMaxMs = 5000;
+	// BetterFxSound: the FxSound virtual device is listed but its name could not be read for a second (its property
+	// store not ready yet, after a resume): no notification may follow either. Each attempt blocks for that second,
+	// so these retries are capped at 30 s.
+	static constexpr DWORD kParkRetryVirtualMaxMs = 30000;
+	// BetterFxSound: consecutive reinits that failed on the carrier itself (sndDevicesHdlType::playbackSetupFailed),
+	// and which carrier. After kCarrierFailuresToReport of them (about 3.5 s with the delays above) the carrier is
+	// reported as failed (getFailedCarrierId()), so the controller elects another enabled output. UI/timer thread only.
+	std::wstring carrier_failure_id_;
+	int carrier_failure_count_ = 0;
+	static constexpr int kCarrierFailuresToReport = 4;
 
 	PT_HANDLE *hp_sndDevices_;
 	static sndDevicesHdlType s_sndDevices_;
@@ -120,6 +131,8 @@ private:
 	bool apply_pending_ = false;				// A change arrived during a measurement, apply it afterwards
 	std::wstring carrier_full_volume_id_;		// Carrier whose device was set to 100% and unmuted since the last reinit
 	bool handed_back_ = false;					// restoreDefaultPlaybackDevice() called, until processing starts again
+	bool parked_ = false;						// The last reinit failed, until one succeeds or power off
+	std::wstring failed_carrier_id_;			// Carrier reported as failed (getFailedCarrierId()), until a reinit succeeds
 
 	MultiOutputRouter multi_output_;
 

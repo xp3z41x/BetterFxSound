@@ -114,6 +114,10 @@ public:
 	// BetterFxSound: true while a carrier switch asked for with setAsPlaybackDevice() waits for the
 	// reinit that takes it. Until then the carrier reported by getSoundDevices() is still the old one.
 	bool isCarrierSwitchPending();
+	// BetterFxSound: the carrier the engine could not open at its last reinits (held by an exclusive-mode app, its
+	// format not supported or not readable), while it keeps retrying it. Empty when none: once a reinit succeeds, at
+	// power off, or before a few attempts failed. The controller elects another enabled output instead.
+	std::wstring getFailedCarrierId();
 	void restoreDefaultPlaybackDevice();
 	// BetterFxSound: the whole desired set of outputs, carrier included. The carrier is still
 	// chosen with setAsPlaybackDevice(). If the carrier is missing from the list or is disabled,

@@ -496,6 +496,10 @@ struct sndDevicesHdlType {
 	int MeasuredVirtualSilentBufferCount;	// This is buffer of measured all very low values, essentially silence.
 	int MeasuredTrueSilentBufferCount;		// This is buffer of measured all true zero values.
     BOOL playbackDeviceIsUnavailable;
+	// BetterFxSound: the last reinit failed on the carrier itself (its format could not be read, or its stream could not
+	// be set up or opened), not on the FxSound virtual device. Written by sndDevicesReInit(), read after it; UI/timer
+	// thread only.
+	BOOL playbackSetupFailed;
 
 	// Module common status flag, set by functions that can't complete their requestion operation
 	int function_status;

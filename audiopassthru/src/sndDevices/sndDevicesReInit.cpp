@@ -64,6 +64,7 @@ int PT_DECLSPEC sndDevicesReInit(PT_HANDLE *hp_sndDevices, int i_initType, int *
 	*ipNumRealDevices = 0;
 	*ipDfxDeviceEnabledFlag = IS_FALSE;
 	cast_handle->function_status = SND_DEVICES_DEVICE_OPERATION_COMPLETED;	// Clear function error status code.
+	cast_handle->playbackSetupFailed = FALSE;	// BetterFxSound: set below when the carrier itself fails
 
 	//cast_handle->ignoreDeviceCallbacks = TRUE;
 	//cast_handle->ignoreVolumeCallbacks = TRUE;
@@ -170,6 +171,7 @@ int PT_DECLSPEC sndDevicesReInit(PT_HANDLE *hp_sndDevices, int i_initType, int *
 
 			if (resultFlag != SND_DEVICES_DEVICE_OPERATION_COMPLETED)
 			{
+				cast_handle->playbackSetupFailed = TRUE;
 				*ipDfxDeviceEnabledFlag = IS_FALSE;
 				*ip_status = resultFlag;
 				SND_DEVICES_SET_STATUS_AND_RETURN_OK(SND_DEVICES_RULES_NOT_POSSIBLE);
@@ -294,6 +296,7 @@ int PT_DECLSPEC sndDevicesReInit(PT_HANDLE *hp_sndDevices, int i_initType, int *
 
 			if (resultFlag != SND_DEVICES_DEVICE_OPERATION_COMPLETED)
 			{
+				cast_handle->playbackSetupFailed = TRUE;
 				*ipDfxDeviceEnabledFlag = IS_FALSE;
 				*ip_status = resultFlag;
 				SND_DEVICES_SET_STATUS_AND_RETURN_OK(SND_DEVICES_SET_MUTE_FAILED);

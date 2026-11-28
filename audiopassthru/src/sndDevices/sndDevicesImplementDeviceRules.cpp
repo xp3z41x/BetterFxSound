@@ -450,6 +450,8 @@ PlaybackDeviceIsSelected:  // Label to jump to when the playback device num has 
 
 	if( resultFlag != SND_DEVICES_DEVICE_OPERATION_COMPLETED )
 	{
+		// BetterFxSound: the carrier itself failed, see playbackSetupFailed
+		cast_handle->playbackSetupFailed = TRUE;
 		*ip_resultFlag = SND_DEVICES_DEVICE_GET_FORMAT_FAILED;
 		SND_DEVICES_SET_STATUS_AND_RETURN_OK(SND_DEVICES_DEVICE_GET_FORMAT_FAILED);
 	}

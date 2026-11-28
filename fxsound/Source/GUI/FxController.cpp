@@ -1627,6 +1627,15 @@ void FxController::updateOutputs(std::vector<SoundDevice>& sound_devices, const 
 		failed_carrier_ids_.clear();
 	}
 
+	// BetterFxSound: the engine could not open this carrier at its last reinits (held by an exclusive-mode app, a
+	// format it does not take) and keeps retrying it: another enabled output is elected below instead.
+	String engine_failed_carrier_id(audio_passthru_->getFailedCarrierId().c_str());
+	if (engine_failed_carrier_id.isNotEmpty() && !failed_carrier_ids_.contains(engine_failed_carrier_id))
+	{
+		logMessage("Output could not be opened by the audio engine: " + engine_failed_carrier_id);
+		failed_carrier_ids_.add(engine_failed_carrier_id);
+	}
+
 	// The carrier the engine is using after this reinit.
 	String engine_carrier_id;
 	for (auto& sound_device : sound_devices)

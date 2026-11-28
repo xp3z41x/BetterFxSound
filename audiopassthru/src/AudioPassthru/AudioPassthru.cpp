@@ -113,6 +113,11 @@ bool AudioPassthru::isCarrierSwitchPending()
     return data_->isCarrierSwitchPending();
 }
 
+std::wstring AudioPassthru::getFailedCarrierId()
+{
+    return data_->getFailedCarrierId();
+}
+
 void AudioPassthru::restoreDefaultPlaybackDevice()
 {
     data_->restoreDefaultPlaybackDevice();
