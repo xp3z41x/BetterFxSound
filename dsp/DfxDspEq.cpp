@@ -114,6 +114,13 @@ int DfxDspPrivate::eqUpdateFromRegistry(int *ip_eq_changed)
 * value back over the new gain and cleared the flag, so the band stayed wrong. It now runs on the
 * thread that changed the EQ, after its registry writes, under param_lock_, so no other setter or
 * format reinit can interleave with the memory-vs-registry comparison.
+* It deliberately does NOT call dfxpCommunicateAll() (the old processing-thread check did): that
+* re-sends the fixed quantities too, and dfxp_LexCommunicateSize() re-initializes the reverb delay
+* lines (pointers and lengths) that the processing thread is walking at the same time, since
+* processAudio() never takes param_lock_. Nothing it sends depends on the EQ anyway: the band
+* gains go straight into the GraphicEq (dfxpEqSetBandBoostCut), the on state is read from
+* eq.i_processing_on by the processing code, and the Bass Boost bypass is sent by
+* dfxpSetButtonValue() itself.
 * Never call this from the audio processing thread.
 */
 int DfxDspPrivate::eqSyncFromRegistry()
@@ -127,14 +134,6 @@ int DfxDspPrivate::eqSyncFromRegistry()
 	DfxDspParamLock lock(&param_lock_);
 
 	result = eqUpdateFromRegistry(&i_eq_changed);
-
-	/* If any settings have been changed, communicate all the changes to the DSP module */
-	// NOTE: I find that without this if condition and call dfxpCOmmunicateAll() repeatedly will mess up the audio.
-	if (i_eq_changed)
-	{
-		if (dfxpCommunicateAll(dfxp_handle_) != OKAY)
-			result = NOT_OKAY;
-	}
 
 	return(result);
 }
@@ -417,6 +416,11 @@ float DfxDspPrivate::getBalance()
 void DfxDspPrivate::setBalance(float gain_db)
 {
 	PT_HANDLE* graphic_eq_handle;
+
+	// BetterFxSound: like the other GraphicEq setters below, serialized with every other DSP
+	// parameter writer (UI and CLI threads, preset load, EQ sync) under param_lock_.
+	DfxDspParamLock lock(&param_lock_);
+
 	dfxpEqGetGraphicEqHdl(dfxp_handle_, &graphic_eq_handle);
 	GraphicEqSetBalance(graphic_eq_handle, gain_db);
 }
@@ -435,6 +439,9 @@ float DfxDspPrivate::getNormalization()
 void DfxDspPrivate::setNormalization(float gain_db)
 {
 	PT_HANDLE* graphic_eq_handle;
+
+	DfxDspParamLock lock(&param_lock_);
+
 	dfxpEqGetGraphicEqHdl(dfxp_handle_, &graphic_eq_handle);
 	GraphicEqSetNormalization(graphic_eq_handle, gain_db);
 }
@@ -453,6 +460,9 @@ float DfxDspPrivate::getVolumeLeveling()
 void DfxDspPrivate::setVolumeLeveling(float gain_db)
 {
 	PT_HANDLE* graphic_eq_handle;
+
+	DfxDspParamLock lock(&param_lock_);
+
 	dfxpEqGetGraphicEqHdl(dfxp_handle_, &graphic_eq_handle);
 	GraphicEqSetVolumeLeveling(graphic_eq_handle, gain_db);
 }
@@ -471,6 +481,9 @@ float DfxDspPrivate::getMasterGain()
 void DfxDspPrivate::setMasterGain(float gain_db)
 {
 	PT_HANDLE* graphic_eq_handle;
+
+	DfxDspParamLock lock(&param_lock_);
+
 	dfxpEqGetGraphicEqHdl(dfxp_handle_, &graphic_eq_handle);
 	GraphicEqSetMasterGain(graphic_eq_handle, gain_db);
 }
@@ -489,6 +502,9 @@ float DfxDspPrivate::getFilterQ()
 void DfxDspPrivate::setFilterQ(float q_multiplier)
 {
 	PT_HANDLE* graphic_eq_handle;
+
+	DfxDspParamLock lock(&param_lock_);
+
 	dfxpEqGetGraphicEqHdl(dfxp_handle_, &graphic_eq_handle);
 	GraphicEqSetFilterQ(graphic_eq_handle, q_multiplier);
 }
