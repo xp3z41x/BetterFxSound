@@ -464,8 +464,9 @@ int AudioPassthruPrivate::processTimer()
 		}
 	}
 
-	/* BetterFxSound: an output change that arrived during a delay measurement is applied once it is over */
-	if (!b_need_to_start_thread && calibration_.getState(NULL) != DelayCalibration::State::Running)
+	/* BetterFxSound: an output change that arrived during a delay measurement is applied once its sweeps are recorded
+	   (its analysis no longer needs the outputs, see DelayCalibration::holdsOutputs()) */
+	if (!b_need_to_start_thread && !calibration_.holdsOutputs())
 	{
 		bool apply_pending;
 		{
@@ -555,9 +556,10 @@ int AudioPassthruPrivate::processTimer()
 		/*
 		* BetterFxSound: the processing stopped, so the capture and every output were interrupted (and restart muted,
 		* then faded in). A delay measurement that spans it records gaps or partial sweeps, whether or not the carrier
-		* changes: it is stopped, and applyAdditionalOutputs() below then applies the outputs at once.
+		* changes: it is stopped, and applyAdditionalOutputs() below then applies the outputs at once. Not once its sweeps are
+		* recorded (holdsOutputs() false): its analysis stays valid, unless the carrier changes (applyAdditionalOutputs()).
 		*/
-		if (calibration_.getState(NULL) == DelayCalibration::State::Running)
+		if (calibration_.holdsOutputs())
 			calibration_.abort(L"The audio devices changed during the measurement. Synchronize again.");
 
 		/* Initialize flag which can be set by the outside telling thread to end */
@@ -872,6 +874,19 @@ DWORD AudioPassthruPrivate::threadWorker(HANDLE h_wait_timer)
 			* the buffer for upsampling.
 			*/
 			const int solo = solo_.load(std::memory_order_relaxed);
+
+			/*
+			* BetterFxSound: the carrier and the additional outputs get the same latency from here to their device, so an
+			* output's delay (set by hand or synchronized) holds whichever device is the carrier. The carrier holds its queue
+			* at half the capture buffer (sndDevicesDoPlayback()); MultiOutputRouter::alignPaths() delays the shorter path(s).
+			*/
+			{
+				int carrier_latency_ms = 0;
+				if (s_sndDevices_.wfxCapture.nSamplesPerSec > 0)
+					carrier_latency_ms = (int)((UINT64)(s_sndDevices_.bufferFrameSizeCapture / 2) * 1000 / s_sndDevices_.wfxCapture.nSamplesPerSec);
+				carrier_path_offset_ms_ = multi_output_.alignPaths(carrier_latency_ms);
+			}
+
 			if (!mute_ && !silence_fill)
 			{
 				multi_output_.write(fp_buffer, (UINT32)numSampleSets, pwfx->nChannels, pwfx->nSamplesPerSec, solo);
@@ -1366,14 +1381,19 @@ void AudioPassthruPrivate::applyAdditionalOutputs()
 		// reported for the old one, which stays silent because it cannot join the router before the end.
 		if (measuring && carrier_id != calibration_carrier_id_)
 			calibration_.abort(L"The outputs changed during the measurement. Synchronize again.");
+		// BetterFxSound: also once it has ended, while its results were not taken yet: the switch came during its analysis
+		// (after its last look at the abort) or before the view picked the results up, which then applied them as valid.
+		if (carrier_id != calibration_carrier_id_)
+			calibration_.invalidate(L"The outputs changed during the measurement. Synchronize again.");
 
 		/*
 		* BetterFxSound: a measurement that is being stopped (aborted or cancelled) stays Running until its thread
 		* notices, a few ms later. Its results are thrown away, so the order no longer matters: the change is applied
 		* now. Waiting left a new carrier that was a router output playing twice (as the carrier and through the
-		* router) and the previous carrier silent until a later timer tick.
+		* router) and the previous carrier silent until a later timer tick. BetterFxSound: once the sweeps are recorded
+		* (the analysis, holdsOutputs() false) the order no longer matters either, and the outputs are all back on.
 		*/
-		if (measuring && !calibration_.isStopping())
+		if (calibration_.holdsOutputs() && !calibration_.isStopping())
 		{
 			apply_pending_ = true;
 		}
@@ -1702,7 +1722,9 @@ void AudioPassthruPrivate::applyMainDelay(float* buffer, UINT32 frames, UINT32 c
 		return;
 	}
 
-	UINT32 delay_frames = (UINT32)((UINT64)main_delay_ms_.load(std::memory_order_relaxed) * sample_rate / 1000);
+	// BetterFxSound: plus the offset that lines the carrier's path up with the additional outputs' (threadWorker()).
+	const int delay_ms = main_delay_ms_.load(std::memory_order_relaxed) + (carrier_path_offset_ms_ > 0 ? carrier_path_offset_ms_ : 0);
+	UINT32 delay_frames = (UINT32)((UINT64)(delay_ms > 0 ? delay_ms : 0) * sample_rate / 1000);
 	if (delay_frames >= kMainDelayFrames)
 		delay_frames = kMainDelayFrames - 1;
 
@@ -1897,9 +1919,11 @@ bool AudioPassthruPrivate::startDelayCalibration()
 	if (!targets.empty() && wcp_dfx_guid[0] == L'\0')
 		return false;
 
+	// solo_ and multi_output_ are declared before calibration_, whose destructor waits for the measurement thread.
 	std::atomic<int>* solo = &solo_;
+	MultiOutputRouter* router = &multi_output_;
 	return calibration_.start(std::wstring(wcp_dfx_guid), targets, [solo](int index) { solo->store(index, std::memory_order_relaxed); },
-		no_targets_error, &stream_generation_, stream_generation);
+		[router]() { router->requestExactAlignment(); }, no_targets_error, &stream_generation_, stream_generation);
 }
 
 void AudioPassthruPrivate::cancelDelayCalibration()

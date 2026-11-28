@@ -165,6 +165,7 @@ private:
 	static constexpr UINT32 kMainDelayFrames = 1u << 16;	// ~1.36 s at 48 kHz
 	static constexpr UINT32 kMainDelayChannels = 8;
 	std::atomic<int> main_delay_ms_{ 0 };
+	int carrier_path_offset_ms_ = 0;			// BetterFxSound: added to main_delay_ms_, see MultiOutputRouter::alignPaths()
 	std::vector<float> main_delay_buffer_;
 	UINT32 main_delay_write_ = 0;
 	UINT32 main_delay_format_ = 0;

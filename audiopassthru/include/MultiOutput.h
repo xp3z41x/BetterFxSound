@@ -127,6 +127,23 @@ public:
 	// done on the outputs' render threads, between periods. UI/timer thread, called regularly while processing.
 	void serviceVolume();
 
+	// BetterFxSound: every output lines itself up once exactly on its latency target (by the offset of its averaged level),
+	// however small that offset: a start leaves up to ~20 ms of it to the drift correction, which takes ~10 s to remove
+	// it. Within a few hundred ms (an output that is not playing yet does it once it plays, for a few seconds). For the
+	// delay measurement, before its first sweep. Not the audio thread (it takes the list's lock).
+	void requestExactAlignment();
+
+	/*
+	* BetterFxSound: audio thread, once per block; never blocks. Gives the carrier and the outputs here the same latency
+	* from the processed block to the device, so an output's delay (and a measured one) means the same whether its device
+	* is the carrier or plays here. The carrier holds its queue at carrier_latency_ms (half the capture buffer); an output
+	* here holds its level at its own nominal latency (SecondaryOutput::pathLatencyMs()). Each path is delayed up to the
+	* largest of them: the outputs here by themselves, the carrier by the value returned (ms, 0 when there is no output
+	* here, so the carrier alone keeps its own latency). They differed by up to tens of ms, so delays synchronized with
+	* one carrier were wrong once another device became the carrier.
+	*/
+	int alignPaths(int carrier_latency_ms);
+
 	// Audio thread: queues one block of processed, interleaved 32 bit float audio.
 	// solo_index >= 0: only that output gets the audio, the others get silence.
 	// solo_index == -1: every output here gets silence (the carrier output is being measured).
@@ -151,6 +168,7 @@ private:
 	UINT32 skipped_frames_ = 0;
 	UINT32 skipped_rate_ = 0;
 	DWORD skipped_tick_ = 0;
+	int carrier_path_offset_ms_ = 0;	// BetterFxSound, audio thread only: the last alignPaths() result
 	// Read by the outputs' render threads, which may outlive the router (see above), hence shared.
 	std::shared_ptr<std::atomic<bool>> driven_;
 	// BetterFxSound: set by an output freed late on its render thread (takeLateExits()). Shared for the same reason.

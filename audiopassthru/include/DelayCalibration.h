@@ -62,6 +62,9 @@ public:
 	// solo(-1) = carrier only, solo(k) = additional output k only, solo(INT_MIN) = everything back on.
 	// Targets may be in any order and the carrier may be absent; results follow the order of the targets.
 	typedef std::function<void(int)> SoloFunction;
+	// BetterFxSound: lines every additional output up exactly on its latency target, whatever its offset (a fresh start
+	// leaves up to ~20 ms to the slow drift correction). Called once the warm-up has started them, before the first sweep.
+	typedef std::function<void()> AlignFunction;
 
 	DelayCalibration();
 	~DelayCalibration();
@@ -71,15 +74,22 @@ public:
 	// or a generic one if that is empty. Callers also use this to report why a measurement cannot run.
 	// BetterFxSound: stream_generation, if given, must outlive the measurement. It changes whenever the audio of the
 	// outputs is interrupted (a processing thread ended); if it no longer equals start_generation while the sweeps
-	// play, the measurement fails, as it recorded gaps or partial sweeps.
+	// play, the measurement fails, as it recorded gaps or partial sweeps. solo and align, and what they use, must
+	// outlive this object: its destructor waits for the measurement thread.
 	bool start(const std::wstring& virtual_device_id, const std::vector<Target>& targets, SoloFunction solo,
-		const std::wstring& no_targets_error = std::wstring(),
+		AlignFunction align, const std::wstring& no_targets_error = std::wstring(),
 		const std::atomic<unsigned int>* stream_generation = nullptr, unsigned int start_generation = 0);
 	void cancel();
 	// Stops a running measurement because it can no longer be valid; it fails with this reason.
 	void abort(const std::wstring& reason);
 	// BetterFxSound: Running, but cancelled or aborted: the thread ends within a few ms and its results are discarded.
 	bool isStopping() const;
+	// BetterFxSound: the sweeps are being played and recorded, with an output soloed: the outputs must keep their order.
+	// Running but false: the measurement is being analysed (the outputs are all back on, the streams closed).
+	bool holdsOutputs() const;
+	// BetterFxSound: results that are no longer valid (the carrier changed after the measurement ended) are dropped: a
+	// Done measurement whose results were not taken yet (getResults()) becomes Failed with this reason. Nothing otherwise.
+	void invalidate(const std::wstring& reason);
 
 	State getState(int* progress_percent) const;
 	std::vector<DelayCalibrationResult> getResults() const;
@@ -91,10 +101,14 @@ private:
 	static DWORD WINAPI threadProc(LPVOID param);
 	void run();
 	void fail(const std::wstring& message);
+	// BetterFxSound: publishes why the measurement stopped early: a cancel (Idle), an abort (Failed with its reason), or
+	// a device error (cancelled false). Only once the streams are closed and the outputs are all back on.
+	void publishStopped(bool cancelled);
 
 	std::wstring virtual_device_id_;
 	std::vector<Target> targets_;
 	SoloFunction solo_;
+	AlignFunction align_;
 	const std::atomic<unsigned int>* stream_generation_ = nullptr;
 	unsigned int start_generation_ = 0;
 
@@ -102,9 +116,11 @@ private:
 	std::atomic<int> state_{ 0 };
 	std::atomic<int> progress_{ 0 };
 	std::atomic<bool> cancel_{ false };
+	std::atomic<bool> holds_outputs_{ false };	// BetterFxSound: see holdsOutputs()
 
 	mutable std::mutex mutex_;
 	std::vector<DelayCalibrationResult> results_;
 	std::wstring error_;
 	std::wstring abort_reason_;		// Set by abort(), under mutex_
+	mutable bool results_taken_ = false;	// BetterFxSound: getResults() was called since the last Done, under mutex_
 };

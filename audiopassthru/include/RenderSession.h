@@ -47,7 +47,12 @@ const DWORD kRenderSessionFlags = AUDCLNT_SESSIONFLAGS_DISPLAY_HIDE | AUDCLNT_ST
 // them for the call ("reduce other sounds") lowered the call itself. The other apps' sounds are still ducked, on the
 // virtual device, before FxSound captures them. IAudioSessionControl2::SetDuckingPreference() is Windows 7 and later;
 // where it is missing the session is left as it is.
-inline void resetRenderSessionVolume(IAudioClient* client)
+inline void resetRenderSessionVolume(IAudioClient* client);
+
+// BetterFxSound: the ducking opt-out alone (see resetRenderSessionVolume()), for an initialized client of any direction. The
+// delay measurement's microphone stream uses it too (DelayCalibration.cpp): opened on the default communications
+// microphone, it counted as a call, and the default ducking lowered the test sounds while they were being measured.
+inline void optOutOfCommunicationsDucking(IAudioClient* client)
 {
 	if (client == nullptr)
 		return;
@@ -63,6 +68,14 @@ inline void resetRenderSessionVolume(IAudioClient* client)
 		}
 		control->Release();
 	}
+}
+
+inline void resetRenderSessionVolume(IAudioClient* client)
+{
+	if (client == nullptr)
+		return;
+
+	optOutOfCommunicationsDucking(client);
 
 	ISimpleAudioVolume* volume = nullptr;
 	if (SUCCEEDED(client->GetService(__uuidof(ISimpleAudioVolume), reinterpret_cast<void**>(&volume))) && volume != nullptr)

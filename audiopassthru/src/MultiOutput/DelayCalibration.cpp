@@ -26,6 +26,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <utility>
 #include <vector>
 
 #include "DelayCalibration.h"
@@ -56,6 +57,8 @@ namespace
 	constexpr DWORD kWarmUpMs = 1500;		// Silence played to every output before the first sweep: streams that were
 											// idle start again, outputs fill their delay, devices that wake up slowly
 											// (HDMI, Bluetooth) do not swallow the first sweep
+	constexpr DWORD kAlignMs = 500;			// BetterFxSound: after the warm-up, the outputs are lined up exactly on their
+											// latency target (AlignFunction) and given this long to do it, before the first sweep
 	constexpr DWORD kSettleMs = 300;		// Silence before the sweep, lets the previous one die out
 	constexpr DWORD kListenMs = 1300;		// Recording after the sweep is queued (it plays ~100 ms later), plus the output's delay
 	constexpr DWORD kTailMs = 200;			// Extra recording after the last sweep, so its whole search window is recorded
@@ -282,6 +285,12 @@ namespace
 				{
 					error = L"The microphone could not be opened. Check that apps are allowed to use it in the Windows privacy settings.";
 				}
+				else
+				{
+					// BetterFxSound: on the default communications microphone (most often the only one) this stream counted
+					// as a call, so Windows' default ducking lowered the other sounds, the test sweeps included, by 80%.
+					optOutOfCommunicationsDucking(capture_client_);
+				}
 			}
 
 			safeRelease(render_device);
@@ -347,7 +356,8 @@ namespace
 			return true;
 		}
 
-		const std::vector<float>& recording() const { return recording_; }
+		// BetterFxSound: the recording is moved out, so it outlives the streams (the analysis runs once they are closed).
+		std::vector<float> takeRecording() { return std::move(recording_); }
 
 	private:
 		bool pumpRender()
@@ -443,9 +453,9 @@ namespace
 
 	// Finds the sweep in the recording, within 'max_lag' samples after 'start'. Returns the delay in
 	// samples and the confidence of that arrival (its correlation / RMS of the correlation), or false
-	// if the recording does not cover the whole window.
+	// if the recording does not cover the whole window. BetterFxSound: or once 'cancel' is set (checked every few ms).
 	bool findArrival(const std::vector<float>& recording, const std::vector<float>& chirp, size_t start, size_t max_lag,
-		size_t* lag_out, double* confidence_out)
+		const std::atomic<bool>& cancel, size_t* lag_out, double* confidence_out)
 	{
 		if (max_lag == 0 || start + max_lag + chirp.size() > recording.size())
 			return false;
@@ -457,6 +467,9 @@ namespace
 
 		for (size_t lag = 0; lag < max_lag; lag++)
 		{
+			if ((lag & 1023) == 0 && cancel.load())
+				return false;
+
 			const float* x = &recording[start + lag];
 			double acc = 0.0;
 			for (size_t j = 0; j < chirp.size(); j++)
@@ -546,20 +559,28 @@ DelayCalibration::~DelayCalibration()
 	cancel();
 	if (thread_ != NULL)
 	{
-		WaitForSingleObject(thread_, 10000);
+		/* BetterFxSound: until the thread has ended. It used to give up after 10 s and free the members (and the solo
+		   function's target) under a thread still analysing, which did not look at the cancel: a crash at exit right
+		   after a sync. Every phase now ends within a few ms of the cancel (the streams' calls aside, which a device
+		   going away can hold for a few seconds). */
+		WaitForSingleObject(thread_, INFINITE);
 		CloseHandle(thread_);
 	}
 }
 
 bool DelayCalibration::start(const std::wstring& virtual_device_id, const std::vector<Target>& targets, SoloFunction solo,
-	const std::wstring& no_targets_error, const std::atomic<unsigned int>* stream_generation, unsigned int start_generation)
+	AlignFunction align, const std::wstring& no_targets_error, const std::atomic<unsigned int>* stream_generation,
+	unsigned int start_generation)
 {
 	if (state_.load() == static_cast<int>(State::Running))
 		return false;
 
 	if (thread_ != NULL)
 	{
-		WaitForSingleObject(thread_, INFINITE); // Already finished, state is not Running
+		// BetterFxSound: the state is published once the streams are closed, so the thread has (nearly) ended. Not waited
+		// for without bound on the UI thread all the same: a thread still in a driver call refuses the new measurement.
+		if (WaitForSingleObject(thread_, 2000) == WAIT_TIMEOUT)
+			return false;
 		CloseHandle(thread_);
 		thread_ = NULL;
 	}
@@ -567,6 +588,7 @@ bool DelayCalibration::start(const std::wstring& virtual_device_id, const std::v
 	virtual_device_id_ = virtual_device_id;
 	targets_ = targets;
 	solo_ = solo;
+	align_ = align;
 	stream_generation_ = stream_generation;
 	start_generation_ = start_generation;
 	cancel_.store(false);
@@ -585,14 +607,31 @@ bool DelayCalibration::start(const std::wstring& virtual_device_id, const std::v
 		return true;
 	}
 
+	holds_outputs_.store(true);
 	state_.store(static_cast<int>(State::Running));
 	thread_ = CreateThread(NULL, 0, threadProc, this, 0, NULL);
 	if (thread_ == NULL)
 	{
+		holds_outputs_.store(false);
 		state_.store(static_cast<int>(State::Failed));
 		return false;
 	}
 	return true;
+}
+
+bool DelayCalibration::holdsOutputs() const
+{
+	return holds_outputs_.load() && state_.load() == static_cast<int>(State::Running);
+}
+
+void DelayCalibration::invalidate(const std::wstring& reason)
+{
+	std::lock_guard<std::mutex> lock(mutex_);
+	if (state_.load() != static_cast<int>(State::Done) || results_taken_)
+		return;
+	results_.clear();
+	error_ = reason;
+	state_.store(static_cast<int>(State::Failed));
 }
 
 void DelayCalibration::cancel()
@@ -627,6 +666,7 @@ DelayCalibration::State DelayCalibration::getState(int* progress_percent) const
 std::vector<DelayCalibrationResult> DelayCalibration::getResults() const
 {
 	std::lock_guard<std::mutex> lock(mutex_);
+	results_taken_ = true;
 	return results_;
 }
 
@@ -654,201 +694,255 @@ void DelayCalibration::fail(const std::wstring& message)
 	state_.store(static_cast<int>(State::Failed));
 }
 
+void DelayCalibration::publishStopped(bool cancelled)
+{
+	std::wstring reason;
+	if (cancelled)
+	{
+		std::lock_guard<std::mutex> lock(mutex_);
+		if (abort_reason_.empty())
+		{
+			error_ = L"Cancelled.";
+			state_.store(static_cast<int>(State::Idle));
+			return;
+		}
+		reason = abort_reason_;
+	}
+	else
+	{
+		reason = L"An audio device stopped working during the measurement.";
+	}
+	fail(reason);
+}
+
 void DelayCalibration::run()
 {
 	if (targets_.empty())
 	{
+		holds_outputs_.store(false);
 		fail(kNoOutputsError);
 		return;
 	}
 
 	const std::vector<float> chirp = makeChirp();
 
+	// One sweep: the output it was played on, and where its search window starts in the recording (< 0: not known).
 	struct Measurement
 	{
 		size_t target;
 		UINT64 chirp_frame;
+		double start_index;
 	};
 	std::vector<Measurement> measurements;
+	std::vector<float> recording;
+
+	/*
+	* BetterFxSound: how the recording ended. It is published only after the block below, once the streams are closed
+	* and every output is back on (~Streams, then ~SoloGuard). A terminal state published inside it let processTimer()
+	* renumber the outputs while one of them was still soloed: the audio went to whichever output then had that index,
+	* with the carrier silenced. The analysis runs after that block too: it kept the last output soloed (every other
+	* output silent) and the streams open for seconds, and did not look at a cancel or an abort.
+	*/
+	enum class Recorded { Ok, Error, Stopped };
+	Recorded recorded = Recorded::Ok;
+	std::wstring error;
+	bool stopped_by_cancel = false;
 
 	{
 		SoloGuard guard = { solo_ };
 		Streams streams;
 
-		std::vector<std::wstring> output_ids;
-		for (const auto& target : targets_)
-			output_ids.push_back(target.device_id);
-
-		std::wstring error = streams.open(virtual_device_id_, output_ids);
-		if (!error.empty())
+		auto recordAll = [&]() -> Recorded
 		{
-			fail(error);
-			return;
-		}
+			std::vector<std::wstring> output_ids;
+			for (const auto& target : targets_)
+				output_ids.push_back(target.device_id);
 
-		const size_t total = targets_.size() * kRepetitions;
+			error = streams.open(virtual_device_id_, output_ids);
+			if (!error.empty())
+				return Recorded::Error;
 
-		// Runs the streams for 'ms' milliseconds. Returns false on error or cancel.
-		auto pumpFor = [&](DWORD ms) -> bool
-		{
-			const DWORD begin = GetTickCount();
-			while (GetTickCount() - begin < ms)
+			const size_t total = targets_.size() * kRepetitions;
+
+			// Runs the streams for 'ms' milliseconds. Returns false on error or cancel.
+			auto pumpFor = [&](DWORD ms) -> bool
 			{
-				if (cancel_.load())
-					return false;
-				// BetterFxSound: the processing stopped (a reinit), so the capture and every output were interrupted
-				// and restart muted: the sweeps around it are lost or partial, with or without a carrier change.
-				if (stream_generation_ != nullptr && stream_generation_->load() != start_generation_)
+				const DWORD begin = GetTickCount();
+				while (GetTickCount() - begin < ms)
 				{
-					this->abort(L"The audio devices changed during the measurement. Synchronize again.");
-					return false;
+					if (cancel_.load())
+						return false;
+					// BetterFxSound: the processing stopped (a reinit), so the capture and every output were interrupted
+					// and restart muted: the sweeps around it are lost or partial, with or without a carrier change.
+					if (stream_generation_ != nullptr && stream_generation_->load() != start_generation_)
+					{
+						this->abort(L"The audio devices changed during the measurement. Synchronize again.");
+						return false;
+					}
+					if (!streams.pump())
+						return false;
+					Sleep(5);
 				}
-				if (!streams.pump())
-					return false;
-				Sleep(5);
+				return true;
+			};
+
+			// How much later an output's sweep arrives because of its own delay (0 to 500 ms).
+			auto extraMs = [](const Target& target) -> DWORD
+			{
+				return static_cast<DWORD>((std::max)(0, (std::min)(target.delay_ms, 500)));
+			};
+
+			// The sweep follows the Windows volume like any other sound. Make it louder at low volume, see kChirpBoostBelowGain.
+			const float master_gain = masterVolumeGain();
+			float boost = 1.0f;
+			if (master_gain < kChirpBoostBelowGain)
+				boost = (master_gain > 0.0f) ? (std::min)(kChirpMaxBoost, std::sqrt(kChirpBoostBelowGain / master_gain)) : kChirpMaxBoost;
+			const float chirp_level = kChirpLevel * boost;
+
+			// Wake every output before the first sweep (they all get silence, the first target is soloed).
+			if (solo_)
+				solo_(targets_.front().solo_index);
+			if (!pumpFor(kWarmUpMs))
+				return Recorded::Stopped;
+
+			/* BetterFxSound: the outputs that have just started are lined up exactly on their latency target. A start
+			   leaves them up to ~20 ms off it, which only the drift correction takes back, over ~10 s: each sweep was
+			   measured with a different part of that offset, and the delays kept it once it was gone. */
+			if (align_)
+			{
+				align_();
+				if (!pumpFor(kAlignMs))
+					return Recorded::Stopped;
 			}
-			return true;
+
+			for (int repetition = 0; repetition < kRepetitions; repetition++)
+			{
+				for (size_t t = 0; t < targets_.size(); t++)
+				{
+					if (solo_)
+						solo_(targets_[t].solo_index);
+
+					if (!pumpFor(kSettleMs))
+						return Recorded::Stopped;
+
+					streams.scheduleChirp(&chirp, chirp_level);
+					Measurement measurement = { t, streams.lastChirpStart(), -1.0 };
+					measurements.push_back(measurement);
+
+					if (!pumpFor(kListenMs + extraMs(targets_[t])))
+						return Recorded::Stopped;
+
+					progress_.store(static_cast<int>(90 * measurements.size() / total));
+				}
+			}
+
+			// The last sweep's search window ends a little after its listening time.
+			if (!pumpFor(kTailMs))
+				return Recorded::Stopped;
+
+			// Where each sweep's search window starts in the recording, from the streams' timing anchors, which are
+			// released with the streams.
+			for (auto& measurement : measurements)
+			{
+				double emit_time = 0.0;
+				double start_index = -1.0;
+				if (!streams.renderFrameTime(measurement.chirp_frame, &emit_time) ||
+					!streams.captureIndexAt(emit_time, &start_index))
+					start_index = -1.0;
+				measurement.start_index = start_index;
+			}
+			recording = streams.takeRecording();
+			return Recorded::Ok;
 		};
 
-		// Why the streams stopped: a cancel by the user (back to Idle), an abort with its reason, or a device error.
-		auto stopped = [&]()
-		{
-			std::wstring reason;
-			if (cancel_.load())
-			{
-				std::lock_guard<std::mutex> lock(mutex_);
-				if (abort_reason_.empty())
-				{
-					error_ = L"Cancelled.";
-					state_.store(static_cast<int>(State::Idle));
-					return;
-				}
-				reason = abort_reason_;
-			}
-			else
-			{
-				reason = L"An audio device stopped working during the measurement.";
-			}
-			fail(reason);
-		};
+		recorded = recordAll();
+		if (recorded == Recorded::Stopped)
+			stopped_by_cancel = cancel_.load();
+	}
 
-		// How much later an output's sweep arrives because of its own delay (0 to 500 ms).
-		auto extraMs = [](const Target& target) -> DWORD
-		{
-			return static_cast<DWORD>((std::max)(0, (std::min)(target.delay_ms, 500)));
-		};
+	// The streams are closed and every output is back on: the outputs may change from here on (processTimer()).
+	holds_outputs_.store(false);
 
-		// The sweep follows the Windows volume like any other sound. Make it louder at low volume, see kChirpBoostBelowGain.
-		const float master_gain = masterVolumeGain();
-		float boost = 1.0f;
-		if (master_gain < kChirpBoostBelowGain)
-			boost = (master_gain > 0.0f) ? (std::min)(kChirpMaxBoost, std::sqrt(kChirpBoostBelowGain / master_gain)) : kChirpMaxBoost;
-		const float chirp_level = kChirpLevel * boost;
+	if (recorded == Recorded::Error)
+	{
+		fail(error);
+		return;
+	}
+	if (recorded == Recorded::Stopped)
+	{
+		publishStopped(stopped_by_cancel);
+		return;
+	}
 
-		// Wake every output before the first sweep (they all get silence, the first target is soloed).
-		if (solo_)
-			solo_(targets_.front().solo_index);
-		if (!pumpFor(kWarmUpMs))
+	// Analysis. BetterFxSound: a cancel or an abort is looked at between the measurements and within each (findArrival()).
+	double level = 0.0;
+	for (float sample : recording)
+		level = (std::max)(level, static_cast<double>(std::fabs(sample)));
+	if (level < 1e-4)
+	{
+		fail(L"The microphone recorded only silence. Check that it is on, not muted and set as the default recording device.");
+		return;
+	}
+
+	std::vector<std::vector<double>> latencies(targets_.size());
+	std::vector<std::vector<double>> confidences(targets_.size());
+
+	for (const auto& measurement : measurements)
+	{
+		if (cancel_.load())
 		{
-			stopped();
+			publishStopped(true);
 			return;
 		}
 
-		for (int repetition = 0; repetition < kRepetitions; repetition++)
+		if (measurement.start_index < 0.0)
+			continue;
+
+		const DWORD extra_ms = static_cast<DWORD>((std::max)(0, (std::min)(targets_[measurement.target].delay_ms, 500)));
+		const double window_seconds = kMaxLatencySeconds + extra_ms / 1000.0;
+		const size_t max_lag = static_cast<size_t>(window_seconds * kRate);
+
+		size_t lag = 0;
+		double confidence = 0.0;
+		if (!findArrival(recording, chirp, static_cast<size_t>(measurement.start_index), max_lag, cancel_, &lag, &confidence))
+			continue;
+
+		if (confidence >= kMinConfidence)
 		{
-			for (size_t t = 0; t < targets_.size(); t++)
-			{
-				if (solo_)
-					solo_(targets_[t].solo_index);
-
-				if (!pumpFor(kSettleMs))
-				{
-					stopped();
-					return;
-				}
-
-				streams.scheduleChirp(&chirp, chirp_level);
-				Measurement measurement = { t, streams.lastChirpStart() };
-				measurements.push_back(measurement);
-
-				if (!pumpFor(kListenMs + extraMs(targets_[t])))
-				{
-					stopped();
-					return;
-				}
-
-				progress_.store(static_cast<int>(90 * measurements.size() / total));
-			}
-		}
-
-		// The last sweep's search window ends a little after its listening time.
-		if (!pumpFor(kTailMs))
-		{
-			stopped();
-			return;
-		}
-
-		// Analysis. The streams object still holds the recording and the timing anchors.
-		const std::vector<float>& recording = streams.recording();
-
-		double level = 0.0;
-		for (float sample : recording)
-			level = (std::max)(level, static_cast<double>(std::fabs(sample)));
-		if (level < 1e-4)
-		{
-			fail(L"The microphone recorded only silence. Check that it is on, not muted and set as the default recording device.");
-			return;
-		}
-
-		std::vector<std::vector<double>> latencies(targets_.size());
-		std::vector<std::vector<double>> confidences(targets_.size());
-
-		for (const auto& measurement : measurements)
-		{
-			double emit_time = 0.0;
-			double start_index = 0.0;
-			if (!streams.renderFrameTime(measurement.chirp_frame, &emit_time) ||
-				!streams.captureIndexAt(emit_time, &start_index) || start_index < 0.0)
-				continue;
-
-			const double window_seconds = kMaxLatencySeconds + extraMs(targets_[measurement.target]) / 1000.0;
-			const size_t max_lag = static_cast<size_t>(window_seconds * kRate);
-
-			size_t lag = 0;
-			double confidence = 0.0;
-			if (!findArrival(recording, chirp, static_cast<size_t>(start_index), max_lag, &lag, &confidence))
-				continue;
-
-			if (confidence >= kMinConfidence)
-			{
-				latencies[measurement.target].push_back(1000.0 * lag / kRate);
-				confidences[measurement.target].push_back(confidence);
-			}
-		}
-
-		std::vector<DelayCalibrationResult> results;
-		for (size_t t = 0; t < targets_.size(); t++)
-		{
-			DelayCalibrationResult result;
-			result.device_id = targets_[t].device_id;
-			// Need at least two of the three measurements to agree to trust the result.
-			double latency = 0.0;
-			double confidence = 0.0;
-			if (combineRepetitions(latencies[t], confidences[t], &latency, &confidence))
-			{
-				result.measured = true;
-				result.latency_ms = latency;
-				result.confidence = confidence;
-			}
-			results.push_back(result);
-		}
-
-		{
-			std::lock_guard<std::mutex> lock(mutex_);
-			results_ = results;
+			latencies[measurement.target].push_back(1000.0 * lag / kRate);
+			confidences[measurement.target].push_back(confidence);
 		}
 	}
 
-	progress_.store(100);
-	state_.store(static_cast<int>(State::Done));
+	std::vector<DelayCalibrationResult> results;
+	for (size_t t = 0; t < targets_.size(); t++)
+	{
+		DelayCalibrationResult result;
+		result.device_id = targets_[t].device_id;
+		// Need at least two of the three measurements to agree to trust the result.
+		double latency = 0.0;
+		double confidence = 0.0;
+		if (combineRepetitions(latencies[t], confidences[t], &latency, &confidence))
+		{
+			result.measured = true;
+			result.latency_ms = latency;
+			result.confidence = confidence;
+		}
+		results.push_back(result);
+	}
+
+	// BetterFxSound: a cancel or an abort (a carrier switch) that came during the analysis is reported, not Done with results
+	// that are no longer valid. Checked under mutex_: abort() records its reason before it sets cancel_.
+	{
+		std::lock_guard<std::mutex> lock(mutex_);
+		if (!cancel_.load())
+		{
+			results_ = results;
+			results_taken_ = false;
+			progress_.store(100);
+			state_.store(static_cast<int>(State::Done));
+			return;
+		}
+	}
+	publishStopped(true);
 }

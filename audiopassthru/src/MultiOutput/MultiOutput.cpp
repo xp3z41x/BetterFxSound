@@ -676,6 +676,11 @@ public:
 	static constexpr int kFullVolumeAttempts = 5;             // BetterFxSound: that many times at most
 	static constexpr DWORD kReassertMs = 5000;                // BetterFxSound: a device's own level change this soon after the take-over is not the user's
 	static constexpr int kMaxReasserts = 3;                   // BetterFxSound: 100% set again that many times at most per take-over
+	static constexpr int kWritePhaseMs = 5;                   // BetterFxSound: half the usual write spacing (one 10 ms loopback packet), see pathLatencyMs()
+	static constexpr int kMaxPathOffsetMs = 200;              // BetterFxSound: alignPaths() delays an output by this much at most
+	static constexpr DWORD kExactAlignWindowMs = 3000;        // BetterFxSound: requestExactAlignment() is carried out within this long, or dropped
+	static constexpr UINT32 kExactAlignPeriods = 20;          // BetterFxSound: periods the averaged level is followed before it is trusted for that
+	static constexpr double kExactAlignMinSecs = 0.0005;      // BetterFxSound: an offset smaller than this is left as it is
 
 	// Creates the output and starts its render thread. The thread holds its own reference to the output, so the
 	// output is freed only once the thread no longer uses it (see requestStop()).
@@ -926,6 +931,33 @@ public:
 		if (delay_ms < 0) delay_ms = 0;
 		if (delay_ms > kMaxDelayMs) delay_ms = kMaxDelayMs;
 		delay_ms_.store(delay_ms, std::memory_order_relaxed);
+	}
+
+	/*
+	* BetterFxSound: this output's nominal latency from a processed block to its device (ms), -1 until its stream has opened
+	* once: the level render() holds (kBaseLatencyMs plus the device allowance), plus half the write spacing, as render()
+	* holds the level averaged over the writes while the carrier holds its queue as it is right after a write.
+	* MultiOutputRouter::alignPaths() lines the carrier and the outputs up with it. Any thread.
+	*/
+	int pathLatencyMs() const
+	{
+		return path_latency_ms_.load(std::memory_order_relaxed);
+	}
+
+	// BetterFxSound: extra latency that lines this output up with the other paths (alignPaths()), on top of its delay.
+	// Changed like the delay (render()). Audio thread.
+	void setPathOffsetMs(int offset_ms)
+	{
+		if (offset_ms < 0) offset_ms = 0;
+		if (offset_ms > kMaxPathOffsetMs) offset_ms = kMaxPathOffsetMs;
+		if (path_offset_ms_.load(std::memory_order_relaxed) != offset_ms)
+			path_offset_ms_.store(offset_ms, std::memory_order_relaxed);
+	}
+
+	// BetterFxSound: see MultiOutputRouter::requestExactAlignment(). Any thread. 0 means no request, so the tick is made odd.
+	void requestExactAlignment()
+	{
+		exact_align_tick_.store(GetTickCount() | 1u);
 	}
 
 	void setChannelMode(OutputChannelMode mode)
@@ -1360,6 +1392,9 @@ private:
 			const double allowance = static_cast<double>(kDeviceAllowanceMs) / 1000.0;
 			device_allowance_secs_ = (device_queue > allowance + headroom_use) ? device_queue - headroom_use : allowance;
 		}
+		// BetterFxSound: this output's nominal latency, for MultiOutputRouter::alignPaths(). Fixed with the allowance.
+		path_latency_ms_.store(kBaseLatencyMs + static_cast<int>(device_allowance_secs_ * 1000.0 + 0.5) + kWritePhaseMs,
+			std::memory_order_relaxed);
 
 		hr = client_->GetService(__uuidof(IAudioRenderClient), (void**)&render_);
 		if (FAILED(hr) || render_ == nullptr)
@@ -1588,7 +1623,9 @@ private:
 		const double device_rate = static_cast<double>(sample_rate_);
 		const double nominal = rate / device_rate;	// Ring frames per device frame, before the drift correction
 		auto holdQueued = [this, nominal]() -> UINT32 { return static_cast<UINT32>(hold_frames_ * nominal + 0.5); };
-		const UINT32 target = static_cast<UINT32>((kBaseLatencyMs + delay_ms_.load(std::memory_order_relaxed)) * rate / 1000.0);
+		// BetterFxSound: plus the offset that lines this path up with the carrier's (MultiOutputRouter::alignPaths()).
+		const UINT32 target = static_cast<UINT32>((kBaseLatencyMs + delay_ms_.load(std::memory_order_relaxed) +
+			path_offset_ms_.load(std::memory_order_relaxed)) * rate / 1000.0);
 		const UINT32 slack = static_cast<UINT32>(rate * 0.15); // 150 ms
 
 		// BetterFxSound: the level held at the target is the latency of the newest queued frame, in ring frames: the queue
@@ -1748,10 +1785,33 @@ private:
 		{
 			fill_avg_ = level;
 			fill_avg_valid_ = true;
+			fill_avg_periods_ = 0;
 		}
 		else
 		{
 			fill_avg_ += (level - fill_avg_) * 0.25;
+			if (fill_avg_periods_ < kExactAlignPeriods)
+				fill_avg_periods_++;
+		}
+		// BetterFxSound: an exact alignment was asked for (requestExactAlignment()): once the averaged level has settled,
+		// the output moves by its offset, however small, as for a lasting offset below. Below kRealignErrorSecs the offset
+		// a start leaves was only taken back by the drift correction, over ~10 s.
+		DWORD exact_tick = exact_align_tick_.load(std::memory_order_relaxed);
+		if (exact_tick != 0 && now - exact_tick > kExactAlignWindowMs)
+		{
+			exact_align_tick_.compare_exchange_strong(exact_tick, 0);
+		}
+		else if (exact_tick != 0 && !realign_pending_ && fill_avg_periods_ >= kExactAlignPeriods)
+		{
+			if (exact_align_tick_.compare_exchange_strong(exact_tick, 0))
+			{
+				const double offset = fill_avg_ - level_target;
+				if (offset >= kExactAlignMinSecs * rate || offset <= -kExactAlignMinSecs * rate)
+				{
+					realign_pending_ = true;
+					realign_reason_ = kRealignOffset;
+				}
+			}
 		}
 		// A lasting offset is lined up at once too: typically a Bluetooth stream that was idle and took ~0.1 s
 		// to start consuming after Start() while the queue kept filling. Left to the drift correction, the
@@ -1979,6 +2039,9 @@ private:
 	DWORD took_over_tick_ = 0;		// When the device was last set to 100% by a take-over, 0 = not held there now
 	int reasserts_ = 0;				// 100% set again since then (handleVolumeNoticeLocked())
 	std::atomic<int> delay_ms_{ 0 };
+	std::atomic<int> path_offset_ms_{ 0 };		// BetterFxSound: setPathOffsetMs(), added to the delay
+	std::atomic<int> path_latency_ms_{ -1 };	// BetterFxSound: pathLatencyMs(), set by the render thread
+	std::atomic<DWORD> exact_align_tick_{ 0 };	// BetterFxSound: requestExactAlignment() tick, 0 = none
 	std::atomic<int> channel_mode_{ 0 };
 	std::atomic<float> target_gain_{ 1.0f };
 
@@ -2030,6 +2093,7 @@ private:
 	UINT32 hold_frames_ = 0;		// Silence to play before pulling from the queue again (a raised delay)
 	double fill_avg_ = 0.0;			// Short average of the level (render()), silence to play included (ring frames)
 	bool fill_avg_valid_ = false;
+	UINT32 fill_avg_periods_ = 0;	// BetterFxSound: periods fill_avg_ has followed the level since it was seeded (up to kExactAlignPeriods)
 	bool realign_pending_ = false;	// Fading out before the output is moved (realign_reason_)
 	RealignReason realign_reason_ = kRealignDelay;	// Why realign_pending_ was set: what the output moves by
 	double device_allowance_secs_ = -1.0;	// Device queue counted in the latency target (seconds, first openClient()), < 0 = not set
@@ -2407,4 +2471,46 @@ void MultiOutputRouter::write(const float* data, UINT32 frames, UINT32 channels,
 	}
 
 	ReleaseSRWLockShared(&lock_);
+}
+
+void MultiOutputRouter::requestExactAlignment()
+{
+	AcquireSRWLockShared(&lock_);
+	for (const auto& output : outputs_)
+	{
+		if (output != nullptr)
+			output->requestExactAlignment();
+	}
+	ReleaseSRWLockShared(&lock_);
+}
+
+int MultiOutputRouter::alignPaths(int carrier_latency_ms)
+{
+	// Never wait on the audio thread: while the list is being changed, the last offsets stay.
+	if (!TryAcquireSRWLockShared(&lock_))
+		return carrier_path_offset_ms_;
+
+	// The common latency: the largest of the carrier's and the outputs' (those not opened yet are lined up once they are).
+	int reference = carrier_latency_ms > 0 ? carrier_latency_ms : 0;
+	bool any_output = false;
+	for (const auto& output : outputs_)
+	{
+		if (output == nullptr)
+			continue;
+		any_output = true;
+		const int latency = output->pathLatencyMs();
+		if (latency > reference)
+			reference = latency;
+	}
+	for (const auto& output : outputs_)
+	{
+		if (output == nullptr)
+			continue;
+		const int latency = output->pathLatencyMs();
+		output->setPathOffsetMs(latency >= 0 ? reference - latency : 0);
+	}
+	carrier_path_offset_ms_ = (any_output && carrier_latency_ms > 0) ? reference - carrier_latency_ms : 0;
+
+	ReleaseSRWLockShared(&lock_);
+	return carrier_path_offset_ms_;
 }
