@@ -25,6 +25,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include <windows.h>
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -60,7 +61,9 @@ void applyOutputChannelMode(float* buffer, UINT32 frames, UINT32 channels, Outpu
  * output compensates its own clock drift with an adaptive resampler.
  *
  * Threading:
- *  - configure() and stopAll() are called from the UI/timer thread.
+ *  - configure() and stopAll() are called from the UI/timer thread. BetterFxSound: new outputs are created (ring,
+ *    events, render thread) before the list is changed, which only swaps it, so the audio thread is held off for
+ *    that swap alone. A block it could not hand over meanwhile is queued later as that much silence.
  *  - write() is called from the audio processing thread. It never blocks, never
  *    allocates and never calls into COM.
  *  - Each output's render thread holds a reference to its output, so an output that is removed while its
@@ -81,12 +84,21 @@ public:
 	// Closes every secondary output.
 	void stopAll();
 
+	// BetterFxSound: an output whose render thread could not be created (handles or memory exhausted) never plays; it
+	// is created again here, at most once a second, with the settings of the last configure(). UI/timer thread.
+	void retryFailedOutputs();
+
+	// BetterFxSound: the state of each output, in the order of the last configure() (empty device IDs and duplicates
+	// left out). Any thread.
+	std::vector<AdditionalOutputStatus> getStatus() const;
+
 	// Whether the engine drives the outputs: FxSound is on and processing, with the FxSound virtual
 	// device as the Windows default. Each output saves its device's own level and mute and sets it to
 	// 100% and unmuted while driven (at stream open, or here when driving starts), and puts the saved
 	// setting back when driving stops (here, on power off), when it is removed, and at exit.
-	// The device volume calls are made on the calling thread, without holding the router's lock.
-	// UI/timer thread.
+	// The device volume calls are made on the calling thread, without holding the router's lock. BetterFxSound: an
+	// output whose render thread is opening its stream (and setting its device's volume) is not waited for: that
+	// thread applies the change itself once it is done. UI/timer thread.
 	void setDriven(bool driven);
 
 	// Whether the engine drives the outputs (see setDriven()). Only then do they take their devices over.
@@ -102,7 +114,20 @@ private:
 	MultiOutputRouter(const MultiOutputRouter&) = delete;
 	MultiOutputRouter& operator=(const MultiOutputRouter&) = delete;
 
-	SRWLOCK lock_;
+	// BetterFxSound: configure() with configure_mutex_ held.
+	void configureLocked(const std::vector<AdditionalOutputConfig>& outputs);
+
+	mutable SRWLOCK lock_;
+	// BetterFxSound: serializes the changes of the list (configure(), retryFailedOutputs()), which build the new list
+	// without lock_. Guards configs_ and last_retry_tick_.
+	std::mutex configure_mutex_;
+	std::vector<AdditionalOutputConfig> configs_;	// As passed to the last configure()
+	DWORD last_retry_tick_ = 0;
+	// BetterFxSound, audio thread only: frames write() could not hand over while the list was swapped, at this rate,
+	// since this tick. Queued as silence with the next block (at most 100 ms of them, and only shortly after).
+	UINT32 skipped_frames_ = 0;
+	UINT32 skipped_rate_ = 0;
+	DWORD skipped_tick_ = 0;
 	// Read by the outputs' render threads, which may outlive the router (see above), hence shared.
 	std::shared_ptr<std::atomic<bool>> driven_;
 	// shared_ptr so that setDriven() can keep the outputs alive while it works on them without the lock.

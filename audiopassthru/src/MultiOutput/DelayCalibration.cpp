@@ -30,6 +30,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 #include "DelayCalibration.h"
 #include "MasterVolume.h"
+#include "RenderSession.h"
 
 namespace
 {
@@ -249,18 +250,23 @@ namespace
 
 			if (error.empty())
 			{
-				const DWORD flags = AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY | AUDCLNT_STREAMFLAGS_NOPERSIST;
+				// BetterFxSound: in the engine's private render session (RenderSession.h), at 100% and unmuted.
+				const DWORD flags = AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY | kRenderSessionFlags;
 				WAVEFORMATEXTENSIBLE wfx;
 
 				fillFloatFormat(wfx, 2);
 				if (FAILED(render_device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, NULL, (void**)&render_client_)) ||
-					FAILED(render_client_->Initialize(AUDCLNT_SHAREMODE_SHARED, flags, kStreamBufferHns, 0, reinterpret_cast<WAVEFORMATEX*>(&wfx), NULL)) ||
+					FAILED(render_client_->Initialize(AUDCLNT_SHAREMODE_SHARED, flags, kStreamBufferHns, 0, reinterpret_cast<WAVEFORMATEX*>(&wfx), &kRenderSessionGuid)) ||
 					FAILED(render_client_->GetBufferSize(&render_frames_)) ||
 					FAILED(render_client_->GetService(__uuidof(IAudioRenderClient), (void**)&render_)) ||
 					FAILED(render_client_->GetService(__uuidof(IAudioClock), (void**)&clock_)) ||
 					FAILED(clock_->GetFrequency(&clock_frequency_)) || clock_frequency_ == 0)
 				{
 					error = L"The test sound could not be played.";
+				}
+				else
+				{
+					resetRenderSessionVolume(render_client_);
 				}
 			}
 

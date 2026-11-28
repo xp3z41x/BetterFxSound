@@ -25,17 +25,23 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include <Mmdeviceapi.h>
 #include <Audioclient.h>
 #include <endpointvolume.h>
+#include <avrt.h>
 #include <atomic>
 #include <cmath>
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <string>
 #include <vector>
 
 #include "MultiOutput.h"
 #include "MasterVolume.h"
 #include "OwedVolume.h"
+#include "RenderSession.h"
+
+// BetterFxSound: MMCSS for the render threads (Vista and later).
+#pragma comment(lib, "avrt.lib")
 
 namespace
 {
@@ -378,15 +384,23 @@ public:
 	static constexpr UINT32 kRingMask = kRingFrames - 1;
 	static constexpr int kBaseLatencyMs = 60;                 // Headroom for the bursty writes of the capture loop
 	static constexpr int kMaxDelayMs = 500;
-	static constexpr REFERENCE_TIME kDeviceBufferHns = 200000; // 20 ms WASAPI buffer
+	// BetterFxSound: 30 ms WASAPI buffer. It was 20 ms, so with the engine's 10 ms period a wake-up of the render
+	// thread more than about 10 ms late (other apps' MMCSS threads, CPU load, power throttling) left the device
+	// without audio, a click on this output only. The latency does not change: the device's queue is counted in the
+	// level held at the target (render()), the ring simply holds that much less.
+	static constexpr REFERENCE_TIME kDeviceBufferHns = 300000;
 	static constexpr DWORD kRetryMs = 1000;                   // Retry interval when the device is missing
+	static constexpr DWORD kRetryLongMs = 5000;               // BetterFxSound: same, once it failed kRetriesBeforeBackoff times in a row
+	static constexpr int kRetriesBeforeBackoff = 5;
+	static constexpr DWORD kStallMs = 2000;                   // BetterFxSound: a running stream that makes no progress this long is reopened
+	                                                          // (long enough for a Bluetooth stream that starts consuming late)
 	static constexpr DWORD kIdleStopMs = 2000;                // Stop the stream after this much silence
 	static constexpr int kRealignMs = 3;                      // Delay changes from this size on are applied at once
 	static constexpr double kRealignErrorSecs = 0.020;        // A lasting offset from the target this big is too
 	static constexpr DWORD kFlushMs = 30;                     // Less than the target queued and nothing more for this long: play it
 	static constexpr double kWriteGapSecs = 0.050;            // Writes further apart than this are a pause, not the write spacing
 	static constexpr double kPhaseCapSecs = 0.100;            // Time since the last write counted in the level of an empty queue at most
-	static constexpr int kDeviceAllowanceMs = 10;             // Device queue counted in the target (a 20 ms buffer less a period)
+	static constexpr int kDeviceAllowanceMs = 10;             // Device queue counted in the target (a 20 ms buffer less a period; kept with the 30 ms buffer, see kDeviceBufferHns)
 	static constexpr int kDeviceHeadroomUseMs = 20;           // A larger device queue may take this much of the ring's headroom
 
 	// Creates the output and starts its render thread. The thread holds its own reference to the output, so the
@@ -394,15 +408,36 @@ public:
 	static std::shared_ptr<SecondaryOutput> create(const AdditionalOutputConfig& config, const std::shared_ptr<std::atomic<bool>>& driven)
 	{
 		std::shared_ptr<SecondaryOutput> output(new SecondaryOutput(config, driven));
+		DWORD error = ERROR_SUCCESS;
 		if (output->stop_event_ != NULL && output->audio_event_ != NULL)
 		{
 			auto* thread_reference = new std::shared_ptr<SecondaryOutput>(output);
 			output->thread_ = CreateThread(NULL, 0, threadProc, thread_reference, 0, NULL);
 			if (output->thread_ == NULL)
+			{
+				error = GetLastError();
 				delete thread_reference;
+			}
 		}
+		else
+		{
+			error = GetLastError();
+		}
+		// BetterFxSound: an output without its render thread never plays. It is kept in the list (the router's indexes
+		// follow the engine's, see the delay measurement) but reported as failed, and the router creates it again
+		// (started(), MultiOutputRouter::retryFailedOutputs()). It stayed in the list, silent, until the device left.
+		if (output->thread_ == NULL)
+			output->last_error_.store(error != ERROR_SUCCESS ? HRESULT_FROM_WIN32(error) : E_OUTOFMEMORY);
 		return output;
 	}
+
+	// BetterFxSound: whether the render thread runs (create()).
+	bool started() const { return thread_ != NULL; }
+
+	// BetterFxSound: the stream is open (written by the render thread), and the error of the last failed open or
+	// render (S_OK once a stream opened). Any thread.
+	bool isOpen() const { return stream_open_.load(); }
+	HRESULT lastError() const { return last_error_.load(); }
 
 	// Runs when the last reference goes: on the UI thread once the render thread has exited, or on the render
 	// thread itself, as its last step, if it was still busy when the output was removed. Either way nothing
@@ -442,9 +477,26 @@ public:
 	// Router, UI thread: the engine starts or stops driving the outputs. Starting takes over a device
 	// whose stream is already open (the others are taken over when their stream opens). Stopping
 	// puts the device's own level and mute back.
+	// BetterFxSound: never waits for the render thread. While it is opening its stream it holds volume_mutex_ across
+	// the device volume calls (seconds on a Bluetooth device that is connecting), and the UI thread waited for it. Then
+	// the render thread applies the change itself, with the router's flag as it is then, once it is done.
 	void setDriven(bool driven)
 	{
-		std::lock_guard<std::mutex> lock(volume_mutex_);
+		std::unique_lock<std::mutex> lock(volume_mutex_, std::try_to_lock);
+		if (!lock.owns_lock())
+		{
+			volume_recheck_.store(true);
+			if (audio_event_ != NULL)
+				SetEvent(audio_event_);
+			return;
+		}
+		applyDrivenLocked(driven);
+	}
+
+private:
+	// Takes the device over or hands it back for the engine's driving state. Caller holds volume_mutex_.
+	void applyDrivenLocked(bool driven)
+	{
 		if (driven)
 		{
 			if (!volume_taken_ && stream_open_.load() && !stopping_.load())
@@ -456,6 +508,16 @@ public:
 		}
 	}
 
+	// BetterFxSound: render thread, outside render(): a driving change that setDriven() could not apply.
+	void applyDeferredDriven()
+	{
+		if (!volume_recheck_.load(std::memory_order_relaxed) || !volume_recheck_.exchange(false))
+			return;
+		std::lock_guard<std::mutex> lock(volume_mutex_);
+		applyDrivenLocked(driven_ != nullptr && driven_->load());
+	}
+
+public:
 	void setDelayMs(int delay_ms)
 	{
 		if (delay_ms < 0) delay_ms = 0;
@@ -480,8 +542,10 @@ public:
 		setVolumePercent(config.volume_percent);
 	}
 
-	// Audio thread. Never blocks. 'silent' queues silence of the same length instead.
-	void write(const float* data, UINT32 frames, UINT32 channels, UINT32 sample_rate, bool silent)
+	// Audio thread. Never blocks. 'silent' queues silence of the same length instead. BetterFxSound: lead_silence
+	// frames of silence are queued first, for blocks the router could not hand over (MultiOutputRouter::write()), so the
+	// queue keeps its level and the output its alignment.
+	void write(const float* data, UINT32 frames, UINT32 channels, UINT32 sample_rate, bool silent, UINT32 lead_silence)
 	{
 		if (data == nullptr || frames == 0 || channels == 0 || channels > kMaxChannels || sample_rate == 0)
 			return;
@@ -491,15 +555,18 @@ public:
 		// format is copying into it (see tryResetRing()).
 		writing_.store(true);
 		const UINT32 active = active_format_.load();
+		const bool rate_changed = pending_rate_.load(std::memory_order_relaxed) != sample_rate;
+		// BetterFxSound: the rate being produced is published by every block, not only by one the ring is not set up
+		// for. After A, X, then A again before the render thread saw X, pending_rate_ stayed X: the render thread then
+		// emptied the working ring for X, and again for A at the next block, a needless dropout.
+		if (rate_changed)
+			pending_rate_.store(sample_rate, std::memory_order_release);
 		if (active == 0 || formatRate(active) != sample_rate)
 		{
 			// The render thread opens the device (once) and sets the ring up for this rate, then publishes
 			// the ring's format in active_format_. Until then the audio is simply not queued for this output.
-			if (pending_rate_.load(std::memory_order_relaxed) != sample_rate)
-			{
-				pending_rate_.store(sample_rate, std::memory_order_release);
+			if (rate_changed)
 				SetEvent(audio_event_);
-			}
 			writing_.store(false, std::memory_order_release);
 			return;
 		}
@@ -511,9 +578,14 @@ public:
 		if (convert && !silent)
 			buildChannelMatrix(channels, out_channels, matrix);
 
-		const UINT32 w = write_pos_.load(std::memory_order_relaxed);
+		const UINT32 w0 = write_pos_.load(std::memory_order_relaxed);
 		const UINT32 r = read_pos_.load(std::memory_order_acquire);
-		const UINT32 free_frames = kRingFrames - (w - r);
+		const UINT32 free_total = kRingFrames - (w0 - r);
+		const UINT32 lead = lead_silence < free_total ? lead_silence : free_total;
+		for (UINT32 i = 0; i < lead; i++)
+			std::memset(&ring_[static_cast<size_t>((w0 + i) & kRingMask) * kMaxChannels], 0, out_channels * sizeof(float));
+		const UINT32 w = w0 + lead;
+		const UINT32 free_frames = free_total - lead;
 		const UINT32 n = frames < free_frames ? frames : free_frames;
 
 		// Every channel is queued (in the ring's channels). The channel mode is applied by render(), on what is played now, so a
@@ -603,8 +675,14 @@ private:
 	void run()
 	{
 		SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+		// BetterFxSound: registered with MMCSS (Pro Audio), as the processing thread is, so the threads of other apps'
+		// audio (games, calls, DAWs) and CPU load hold it off less often. Without it (the service is not available) it
+		// keeps its own priority.
+		DWORD mmcss_task_index = 0;
+		HANDLE mmcss_handle = AvSetMmThreadCharacteristicsW(L"Pro Audio", &mmcss_task_index);
 
 		DWORD next_retry = GetTickCount();
+		int failures = 0;	// BetterFxSound: opens or streams that failed in a row (retry backoff)
 		HANDLE handles[2] = { stop_event_, audio_event_ };
 
 		for (;;)
@@ -617,8 +695,12 @@ private:
 				timeout = 200;
 			else if (client_ != nullptr && !primed_ && write_pos_.load(std::memory_order_relaxed) != read_pos_.load(std::memory_order_relaxed))
 				timeout = 5;
-			if (WaitForMultipleObjects(2, handles, FALSE, timeout) == WAIT_OBJECT_0)
+			const DWORD wait_result = WaitForMultipleObjects(2, handles, FALSE, timeout);
+			if (wait_result == WAIT_OBJECT_0)
 				break;
+			woke_on_event_ = (wait_result == WAIT_OBJECT_0 + 1);
+
+			applyDeferredDriven();
 
 			const UINT32 pending = pending_rate_.load(std::memory_order_acquire);
 			const DWORD now = GetTickCount();
@@ -635,9 +717,13 @@ private:
 				if (!openClient())
 				{
 					closeClient();
-					next_retry = now + kRetryMs;
+					// BetterFxSound: a device that keeps failing (held in exclusive mode, a driver that does not come back)
+					// is tried less often. The error is reported (lastError()).
+					failures++;
+					next_retry = now + (failures > kRetriesBeforeBackoff ? kRetryLongMs : kRetryMs);
 					continue;
 				}
+				last_error_.store(S_OK);
 				ring_rate_ = pending;
 				ring_reset_pending_ = true;
 			}
@@ -654,15 +740,24 @@ private:
 			if (!render())
 			{
 				// Typically AUDCLNT_E_DEVICE_INVALIDATED: the device was unplugged or its
-				// format changed. Close it and reopen it later.
+				// format changed. Close it and reopen it later. BetterFxSound: also a stream that stalled (render()).
+				last_error_.store(FAILED(render_error_) ? render_error_ : E_FAIL);
 				active_format_.store(0, std::memory_order_release);
 				closeClient();
-				next_retry = now + kRetryMs;
+				failures++;
+				next_retry = now + (failures > kRetriesBeforeBackoff ? kRetryLongMs : kRetryMs);
+			}
+			else if (running_)
+			{
+				failures = 0;	// Playing again
 			}
 		}
 
 		active_format_.store(0, std::memory_order_release);
 		closeClient();
+
+		if (mmcss_handle != NULL)
+			AvRevertMmThreadCharacteristics(mmcss_handle);
 	}
 
 	// BetterFxSound: empties the ring and sets it up for ring_rate_ (the processing rate), once no write() that saw the
@@ -731,25 +826,32 @@ private:
 		}
 	}
 
+	// BetterFxSound: records why the stream could not be opened (lastError()). Render thread.
+	bool openFailed(HRESULT hr)
+	{
+		last_error_.store(FAILED(hr) ? hr : E_FAIL);
+		return false;
+	}
+
 	bool openClient()
 	{
 		IMMDeviceEnumerator* enumerator = nullptr;
 		HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), NULL, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), (void**)&enumerator);
 		if (FAILED(hr) || enumerator == nullptr)
-			return false;
+			return openFailed(hr);
 
 		hr = enumerator->GetDevice(device_id_.c_str(), &device_);
 		safeRelease(enumerator);
 		if (FAILED(hr) || device_ == nullptr)
-			return false;
+			return openFailed(hr);
 
 		DWORD state = 0;
 		if (FAILED(device_->GetState(&state)) || state != DEVICE_STATE_ACTIVE)
-			return false;
+			return openFailed(HRESULT_FROM_WIN32(ERROR_NOT_FOUND));
 
 		hr = device_->Activate(__uuidof(IAudioClient), CLSCTX_ALL, NULL, (void**)&client_);
 		if (FAILED(hr) || client_ == nullptr)
-			return false;
+			return openFailed(hr);
 
 		// BetterFxSound: the device's own mix format (channel count at most kMaxChannels), whatever the carrier's:
 		// write() converts the processing format's channels to the ring's and render() its rate to the device's. It
@@ -757,14 +859,24 @@ private:
 		// channel count or in the other rate family was chosen.
 		UINT32 channels = 0;
 		UINT32 sample_rate = 0;
+		DWORD mix_mask = 0;		// The mix format's own speaker mask, 0 if it is not a 32 bit float extensible format
 		WAVEFORMATEX* mix = nullptr;
-		if (FAILED(client_->GetMixFormat(&mix)) || mix == nullptr)
-			return false;
+		hr = client_->GetMixFormat(&mix);
+		if (FAILED(hr) || mix == nullptr)
+			return openFailed(hr);
 		channels = mix->nChannels;
+		const UINT32 mix_channels = channels;
 		sample_rate = mix->nSamplesPerSec;
+		if (mix->wFormatTag == WAVE_FORMAT_EXTENSIBLE && mix->cbSize >= sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX) &&
+			mix->wBitsPerSample == 32)
+		{
+			const WAVEFORMATEXTENSIBLE* mix_ext = reinterpret_cast<const WAVEFORMATEXTENSIBLE*>(mix);
+			if (IsEqualGUID(mix_ext->SubFormat, kSubtypeIeeeFloat))
+				mix_mask = mix_ext->dwChannelMask;
+		}
 		CoTaskMemFree(mix);
 		if (channels == 0 || sample_rate == 0)
-			return false;
+			return openFailed(E_UNEXPECTED);
 		if (channels > kMaxChannels)
 			channels = kMaxChannels;
 
@@ -782,20 +894,40 @@ private:
 		wfx.dwChannelMask = defaultChannelMask(channels);
 		wfx.SubFormat = kSubtypeIeeeFloat;
 
-		const DWORD flags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK
+		// BetterFxSound: in the engine's private render session, hidden and not persisted, as the carrier's
+		// (RenderSession.h). It was the default session, whose flags and stored level the first stream on the device set.
+		const DWORD session_flags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK | kRenderSessionFlags;
+		const DWORD flags = session_flags
 			| AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
-			| AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY
-			| AUDCLNT_STREAMFLAGS_NOPERSIST;
+			| AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
 
-		hr = client_->Initialize(AUDCLNT_SHAREMODE_SHARED, flags, kDeviceBufferHns, 0, reinterpret_cast<WAVEFORMATEX*>(&wfx), NULL);
+		hr = client_->Initialize(AUDCLNT_SHAREMODE_SHARED, flags, kDeviceBufferHns, 0, reinterpret_cast<WAVEFORMATEX*>(&wfx), &kRenderSessionGuid);
+		if ((hr == AUDCLNT_E_UNSUPPORTED_FORMAT || hr == E_INVALIDARG) && mix_mask != 0 && mix_channels <= kMaxChannels)
+		{
+			// BetterFxSound: an audio engine or APO that refuses the conversion flags (or the standard speaker mask) gets
+			// its own mix format as is, which needs no conversion: same rate, channel count and speaker mask. Back and
+			// side surrounds play the same role here (channelRole()), so the ring's layout still fits. Only when the
+			// device has at most kMaxChannels. A fresh client, as the carrier does after a refused format.
+			safeRelease(client_);
+			hr = device_->Activate(__uuidof(IAudioClient), CLSCTX_ALL, NULL, (void**)&client_);
+			if (FAILED(hr) || client_ == nullptr)
+				return openFailed(hr);
+			wfx.dwChannelMask = mix_mask;
+			hr = client_->Initialize(AUDCLNT_SHAREMODE_SHARED, session_flags, kDeviceBufferHns, 0, reinterpret_cast<WAVEFORMATEX*>(&wfx), &kRenderSessionGuid);
+		}
 		if (FAILED(hr))
-			return false;
+			return openFailed(hr);
 
-		if (FAILED(client_->SetEventHandle(audio_event_)))
-			return false;
+		// BetterFxSound: the session's own level and mute at 100% and unmuted, so only the app's gain applies.
+		resetRenderSessionVolume(client_);
 
-		if (FAILED(client_->GetBufferSize(&buffer_frames_)) || buffer_frames_ == 0)
-			return false;
+		hr = client_->SetEventHandle(audio_event_);
+		if (FAILED(hr))
+			return openFailed(hr);
+
+		hr = client_->GetBufferSize(&buffer_frames_);
+		if (FAILED(hr) || buffer_frames_ == 0)
+			return openFailed(hr);
 
 		// BetterFxSound: the device queue counted in the latency target (render()). A fixed allowance, so the output's
 		// latency does not move with the buffer size and engine period of each open; only a device that keeps a much
@@ -818,7 +950,7 @@ private:
 
 		hr = client_->GetService(__uuidof(IAudioRenderClient), (void**)&render_);
 		if (FAILED(hr) || render_ == nullptr)
-			return false;
+			return openFailed(hr);
 
 		// Start with a buffer of silence so the first period does not glitch.
 		BYTE* buffer = nullptr;
@@ -831,6 +963,9 @@ private:
 		sample_rate_ = sample_rate;
 		running_ = false;
 		primed_ = false;
+		render_error_ = S_OK;
+		padding_after_ = buffer_frames_;
+		last_progress_tick_ = GetTickCount();
 
 		// The device's own volume, once per stream open, never while rendering. While the engine drives the
 		// outputs it records the device's own level and mute, then sets 100% and unmuted so they do not stack
@@ -957,11 +1092,23 @@ private:
 	bool render()
 	{
 		UINT32 padding = 0;
-		if (FAILED(client_->GetCurrentPadding(&padding)))
-			return false;
+		const HRESULT hr_padding = client_->GetCurrentPadding(&padding);
+		if (FAILED(hr_padding))
+			return renderFailed(hr_padding);
 
 		const UINT32 space = buffer_frames_ > padding ? buffer_frames_ - padding : 0;
 		const DWORD now = GetTickCount();
+
+		// BetterFxSound: stall watchdog. A running stream signals every device period and its queue goes down between
+		// two of them. A device that stops consuming (its padding stays where the last write left it) or whose stream
+		// stops signalling (this thread then only wakes on its 200 ms timeout) returned no error: the output stayed
+		// silent or choppy until the outputs changed. After kStallMs without progress it fails, so run() closes the
+		// stream and opens it again.
+		if (!running_ || (woke_on_event_ && padding < padding_after_))
+			last_progress_tick_ = now;
+		else if (now - last_progress_tick_ > kStallMs)
+			return renderFailed(HRESULT_FROM_WIN32(ERROR_TIMEOUT));
+		padding_after_ = padding;
 
 		// BetterFxSound: the ring is being set up for a new processing rate (tryResetRing()): silence meanwhile.
 		if (ring_reset_pending_ || play_rate_ == 0)
@@ -1097,8 +1244,9 @@ private:
 
 				if (!running_)
 				{
-					if (FAILED(client_->Start()))
-						return false;
+					const HRESULT hr_start = client_->Start();
+					if (FAILED(hr_start))
+						return renderFailed(hr_start);
 					running_ = true;
 				}
 			}
@@ -1152,8 +1300,9 @@ private:
 		ratio_ = nominal * (1.0 + adjust);
 
 		BYTE* buffer = nullptr;
-		if (FAILED(render_->GetBuffer(space, &buffer)) || buffer == nullptr)
-			return false;
+		const HRESULT hr_buffer = render_->GetBuffer(space, &buffer);
+		if (FAILED(hr_buffer) || buffer == nullptr)
+			return renderFailed(hr_buffer);
 
 		float* out = reinterpret_cast<float*>(buffer);
 		UINT32 produced = 0;
@@ -1272,7 +1421,18 @@ private:
 			realign_pending_ = false;
 		}
 
-		return SUCCEEDED(render_->ReleaseBuffer(space, 0));
+		const HRESULT hr_release = render_->ReleaseBuffer(space, 0);
+		if (FAILED(hr_release))
+			return renderFailed(hr_release);
+		padding_after_ += space;
+		return true;
+	}
+
+	// BetterFxSound: records why render() failed (run() reports it, lastError()). Render thread.
+	bool renderFailed(HRESULT hr)
+	{
+		render_error_ = FAILED(hr) ? hr : E_FAIL;
+		return false;
 	}
 
 	// BetterFxSound: moves the output by shift ring frames (render()). Later (shift > 0): silence not played yet goes
@@ -1306,9 +1466,13 @@ private:
 		if (frames == 0)
 			return true;
 		BYTE* buffer = nullptr;
-		if (FAILED(render_->GetBuffer(frames, &buffer)))
-			return false;
-		return SUCCEEDED(render_->ReleaseBuffer(frames, AUDCLNT_BUFFERFLAGS_SILENT));
+		HRESULT hr = render_->GetBuffer(frames, &buffer);
+		if (SUCCEEDED(hr))
+			hr = render_->ReleaseBuffer(frames, AUDCLNT_BUFFERFLAGS_SILENT);
+		if (FAILED(hr))
+			return renderFailed(hr);
+		padding_after_ += frames;
+		return true;
 	}
 
 	SecondaryOutput(const SecondaryOutput&) = delete;
@@ -1327,6 +1491,8 @@ private:
 	const std::shared_ptr<std::atomic<bool>> driven_;	// The router's flag
 	std::atomic<bool> stream_open_{ false };	// Written by the render thread
 	std::atomic<bool> stopping_{ false };		// requestStop() was called: the device is not taken over any more
+	std::atomic<HRESULT> last_error_{ S_OK };	// BetterFxSound: last failed open or render, S_OK once a stream opened (lastError())
+	std::atomic<bool> volume_recheck_{ false };	// BetterFxSound: setDriven() left the change to the render thread (applyDeferredDriven())
 
 	// The device's own volume is recorded in the owed volume record (OwedVolume.h) when the engine takes the
 	// device over (100% and unmuted), and put back when it stops using it. Stream open (render thread), power
@@ -1386,6 +1552,10 @@ private:
 	bool realign_pending_ = false;	// Fading out before the output is moved (realign_reason_)
 	RealignReason realign_reason_ = kRealignDelay;	// Why realign_pending_ was set: what the output moves by
 	double device_allowance_secs_ = -1.0;	// Device queue counted in the latency target (seconds, first openClient()), < 0 = not set
+	HRESULT render_error_ = S_OK;	// BetterFxSound: why render() failed last (renderFailed())
+	bool woke_on_event_ = false;	// BetterFxSound: run()'s last wake-up was audio_event_ (stall watchdog, render())
+	UINT32 padding_after_ = 0;		// BetterFxSound: the device's queue right after the last write (stall watchdog)
+	DWORD last_progress_tick_ = 0;	// BetterFxSound: when the device was last seen consuming (stall watchdog)
 };
 
 bool setDeviceFullVolumeById(const std::wstring& device_id, const GUID* event_context)
@@ -1484,15 +1654,23 @@ MultiOutputRouter::~MultiOutputRouter()
 
 void MultiOutputRouter::configure(const std::vector<AdditionalOutputConfig>& outputs)
 {
+	std::lock_guard<std::mutex> configure_lock(configure_mutex_);
+	configs_ = outputs;
+	configureLocked(outputs);
+}
+
+void MultiOutputRouter::configureLocked(const std::vector<AdditionalOutputConfig>& outputs)
+{
 	// Fast path: same devices as now, only settings (delay, volume, channels) changed. Those
 	// are atomics, so a shared lock is enough and the audio thread keeps running untouched.
-	// This is what happens while a slider is being dragged.
+	// This is what happens while a slider is being dragged. BetterFxSound: an output without its render thread
+	// (create()) is not the same: it is created again.
 	{
 		AcquireSRWLockShared(&lock_);
 		bool same_devices = (outputs.size() == outputs_.size());
 		for (size_t i = 0; same_devices && i < outputs.size(); i++)
 		{
-			if (outputs_[i] == nullptr || outputs_[i]->deviceId() != outputs[i].device_id)
+			if (outputs_[i] == nullptr || !outputs_[i]->started() || outputs_[i]->deviceId() != outputs[i].device_id)
 				same_devices = false;
 		}
 		if (same_devices)
@@ -1506,52 +1684,85 @@ void MultiOutputRouter::configure(const std::vector<AdditionalOutputConfig>& out
 			return;
 	}
 
+	// BetterFxSound: the new list is built without lock_: kept outputs are shared, new ones are created here (a 2 MB
+	// ring, two events and a thread each). It used to be built under the exclusive lock, and the audio thread, which
+	// never waits for it, dropped its blocks for every output meanwhile: a skip in the audio of the outputs that stayed,
+	// which then played about one block early. configure_mutex_ keeps outputs_ from changing meanwhile.
+	std::vector<std::shared_ptr<SecondaryOutput>> current;
+	AcquireSRWLockShared(&lock_);
+	current = outputs_;
+	ReleaseSRWLockShared(&lock_);
+
 	std::vector<std::shared_ptr<SecondaryOutput>> next;
-	std::vector<std::shared_ptr<SecondaryOutput>> removed;
-
-	AcquireSRWLockExclusive(&lock_);
-
+	std::vector<std::wstring> next_ids;	// Device of each entry of next (an entry may be empty)
 	for (const auto& config : outputs)
 	{
 		if (config.device_id.empty())
 			continue;
 
 		bool duplicate = false;
-		for (const auto& output : next)
+		for (const auto& id : next_ids)
 		{
-			if (output->deviceId() == config.device_id)
+			if (id == config.device_id)
 				duplicate = true;
 		}
 		if (duplicate)
 			continue;
 
 		std::shared_ptr<SecondaryOutput> output;
-		for (auto& existing : outputs_)
+		for (const auto& existing : current)
 		{
-			if (existing != nullptr && existing->deviceId() == config.device_id)
+			if (existing != nullptr && existing->started() && existing->deviceId() == config.device_id)
 			{
-				output = std::move(existing);
+				output = existing;
 				break;
 			}
 		}
 
 		if (output != nullptr)
+		{
 			output->applyConfig(config);
+		}
 		else
-			output = SecondaryOutput::create(config, driven_);
+		{
+			// BetterFxSound: out of memory, the output is left empty at its index (the delay measurement relies on the
+			// indexes) and created again by retryFailedOutputs(). The exception used to leave the exclusive lock held.
+			try
+			{
+				output = SecondaryOutput::create(config, driven_);
+			}
+			catch (const std::bad_alloc&)
+			{
+				output.reset();
+			}
+		}
 
 		next.push_back(std::move(output));
+		next_ids.push_back(config.device_id);
 	}
 
-	for (auto& existing : outputs_)
-	{
-		if (existing != nullptr)
-			removed.push_back(std::move(existing));
-	}
-
+	// Only the swap is done under the exclusive lock. next then holds the previous list.
+	AcquireSRWLockExclusive(&lock_);
 	outputs_.swap(next);
-
 	ReleaseSRWLockExclusive(&lock_);
+
+	std::vector<std::shared_ptr<SecondaryOutput>> removed;
+	for (auto& previous : next)
+	{
+		if (previous == nullptr)
+			continue;
+		bool kept = false;
+		for (const auto& output : outputs_)
+		{
+			if (output == previous)
+				kept = true;
+		}
+		if (!kept)
+			removed.push_back(std::move(previous));
+	}
+	// Only removed holds the removed outputs from here on.
+	next.clear();
+	current.clear();
 
 	// Stopping the render threads of removed outputs happens outside the lock so the audio thread is never held
 	// up by it. Once a thread has exited, dropping the last reference here hands the device back.
@@ -1562,6 +1773,52 @@ void MultiOutputRouter::configure(const std::vector<AdditionalOutputConfig>& out
 void MultiOutputRouter::stopAll()
 {
 	configure(std::vector<AdditionalOutputConfig>());
+}
+
+void MultiOutputRouter::retryFailedOutputs()
+{
+	std::lock_guard<std::mutex> configure_lock(configure_mutex_);
+
+	bool any_failed = false;
+	AcquireSRWLockShared(&lock_);
+	for (const auto& output : outputs_)
+	{
+		if (output == nullptr || !output->started())
+			any_failed = true;
+	}
+	ReleaseSRWLockShared(&lock_);
+	if (!any_failed)
+		return;
+
+	const DWORD now = GetTickCount();
+	if (now - last_retry_tick_ < 1000)
+		return;
+	last_retry_tick_ = now;
+
+	// configs_ itself is not changed by configureLocked().
+	configureLocked(configs_);
+}
+
+std::vector<AdditionalOutputStatus> MultiOutputRouter::getStatus() const
+{
+	// Read under the shared lock rather than from copies of the outputs: a copy could end up holding the last
+	// reference to a removed output, and free it (handing its device back) on the calling thread.
+	std::vector<AdditionalOutputStatus> status;
+	AcquireSRWLockShared(&lock_);
+	for (const auto& output : outputs_)
+	{
+		if (output == nullptr)
+			continue;
+		AdditionalOutputStatus entry;
+		entry.device_id = output->deviceId();
+		entry.open = output->isOpen();
+		const HRESULT error = output->lastError();
+		entry.failed = !entry.open && FAILED(error);
+		entry.last_error = error;
+		status.push_back(entry);
+	}
+	ReleaseSRWLockShared(&lock_);
+	return status;
 }
 
 void MultiOutputRouter::setDriven(bool driven)
@@ -1588,15 +1845,32 @@ bool MultiOutputRouter::isDriven() const
 
 void MultiOutputRouter::write(const float* data, UINT32 frames, UINT32 channels, UINT32 sample_rate, int solo_index)
 {
-	// Never wait on the audio thread: if the list is being changed right now, skip this block.
+	// Never wait on the audio thread: if the list is being changed right now, skip this block. BetterFxSound: its
+	// length is queued as silence with the next block, so the outputs that stay keep their level and alignment
+	// (a skip used to leave them playing one block early until the drift correction caught up, seconds later).
+	const DWORD now = GetTickCount();
 	if (!TryAcquireSRWLockShared(&lock_))
+	{
+		if (skipped_rate_ != sample_rate || now - skipped_tick_ > 100)
+			skipped_frames_ = 0;
+		skipped_rate_ = sample_rate;
+		skipped_tick_ = now;
+		const UINT32 cap = sample_rate / 10;
+		const UINT32 total = skipped_frames_ + frames;
+		skipped_frames_ = total < cap ? total : cap;
 		return;
+	}
+
+	// Only blocks skipped just before this one, at this rate: after a pause or a new processing thread they are stale.
+	const UINT32 lead_silence = (skipped_frames_ > 0 && skipped_rate_ == sample_rate && now - skipped_tick_ <= 100) ? skipped_frames_ : 0;
+	skipped_frames_ = 0;
 
 	const bool solo_active = (solo_index >= -1);
 	for (size_t i = 0; i < outputs_.size(); i++)
 	{
 		const bool silent = solo_active && static_cast<int>(i) != solo_index;
-		outputs_[i]->write(data, frames, channels, sample_rate, silent);
+		if (outputs_[i] != nullptr)
+			outputs_[i]->write(data, frames, channels, sample_rate, silent, lead_silence);
 	}
 
 	ReleaseSRWLockShared(&lock_);

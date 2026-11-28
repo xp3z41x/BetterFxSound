@@ -65,6 +65,7 @@ public:
 	int getDelayCalibrationState(int* progress_percent);
 	std::vector<DelayCalibrationResult> getDelayCalibrationResults();
 	std::wstring getDelayCalibrationError();
+	std::vector<AdditionalOutputStatus> getAdditionalOutputStatus();
 
 private:
 	void applyMainDelay(float* buffer, UINT32 frames, UINT32 channels, UINT32 sample_rate, bool silence_fill);
@@ -162,6 +163,7 @@ private:
 	std::atomic<unsigned int> stream_generation_{ 0 };
 	std::vector<AdditionalOutputConfig> effective_outputs_;	// As passed to multi_output_ (guarded by config_mutex_)
 	std::wstring calibration_carrier_id_;	// Carrier when the measurement started, a switch aborts it (guarded by config_mutex_)
+	std::vector<std::wstring> calibration_unavailable_;	// BetterFxSound: outputs left out of it, device not opened (guarded by config_mutex_)
 	DelayCalibration calibration_;
 };
 

@@ -128,6 +128,11 @@ void AudioPassthru::setOutputs(const std::vector<OutputConfig>& outputs)
 	data_->setOutputs(outputs);
 }
 
+std::vector<AdditionalOutputStatus> AudioPassthru::getAdditionalOutputStatus()
+{
+	return data_->getAdditionalOutputStatus();
+}
+
 bool AudioPassthru::startDelayCalibration()
 {
 	return data_->startDelayCalibration();

@@ -32,6 +32,43 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 // BetterFxSound: CreateWaitableTimerExW() flag, Windows 10 1803 and later (older versions refuse it, see processingThread()).
 static const DWORD kCreateWaitableTimerHighResolution = 0x00000002;
 
+/*
+* BetterFxSound: opts the process out of power throttling (EcoQoS), Windows 10 1709 and later. While FxSound has no
+* visible window and plays nothing (the audio paused), Windows may run its threads on efficiency cores at low clock
+* speed, and the processing and render threads then woke late when the audio resumed: clicks, mostly on the
+* additional outputs. SetProcessInformation() is looked up at run time (Windows 7 has none); ProcessPowerThrottling
+* and its state are declared here so this builds whatever the SDK's target version.
+*/
+static void disableProcessPowerThrottling()
+{
+	struct PowerThrottlingState
+	{
+		ULONG Version;
+		ULONG ControlMask;
+		ULONG StateMask;
+	};
+	typedef BOOL (WINAPI *SetProcessInformationFn)(HANDLE, int, LPVOID, DWORD);
+	const int kProcessPowerThrottling = 4;							// PROCESS_INFORMATION_CLASS
+	const ULONG kPowerThrottlingVersion = 1;						// PROCESS_POWER_THROTTLING_CURRENT_VERSION
+	const ULONG kPowerThrottlingExecutionSpeed = 0x1;				// PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+	const ULONG kPowerThrottlingIgnoreTimerResolution = 0x4;		// PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION (Windows 11)
+
+	HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
+	if (kernel32 == NULL)
+		return;
+	SetProcessInformationFn set_process_information = reinterpret_cast<SetProcessInformationFn>(GetProcAddress(kernel32, "SetProcessInformation"));
+	if (set_process_information == nullptr)
+		return;
+
+	// The timer resolution part is refused before Windows 11: then the execution speed alone.
+	PowerThrottlingState state = { kPowerThrottlingVersion, kPowerThrottlingExecutionSpeed | kPowerThrottlingIgnoreTimerResolution, 0 };
+	if (!set_process_information(GetCurrentProcess(), kProcessPowerThrottling, &state, sizeof(state)))
+	{
+		state.ControlMask = kPowerThrottlingExecutionSpeed;
+		set_process_information(GetCurrentProcess(), kProcessPowerThrottling, &state, sizeof(state));
+	}
+}
+
 #define DFXG_SND_SERVER_KILL_THREAD_TIMEOUT_MSECS		  3000
 #define DFXG_SND_SERVER_KILL_THREAD_WAIT_PER_LOOP_MSECS   50
 #define DFXG_TRUNCATED_DRIVER_TEXT_LENGTH			      50
@@ -58,6 +95,8 @@ AudioPassthruPrivate::AudioPassthruPrivate()
 	swprintf(wcp_playback_device_guid_, PT_MAX_GENERIC_STRLEN, L"");
 	b_no_valid_snd_device_dialog_shown_ = false;
 	debug_ = IS_TRUE;
+
+	disableProcessPowerThrottling();
 }
 
 AudioPassthruPrivate::~AudioPassthruPrivate()
@@ -432,6 +471,9 @@ int AudioPassthruPrivate::processTimer()
 		}
 		if (apply_pending)
 			applyAdditionalOutputs();
+
+		/* BetterFxSound: an additional output whose render thread could not be created is created again (at most once a second) */
+		multi_output_.retryFailedOutputs();
 	}
 
 	/*
@@ -1542,8 +1584,24 @@ bool AudioPassthruPrivate::startDelayCalibration()
 			DelayCalibration::Target carrier_target = { std::wstring(wcp_targeted_guid), -1, main_delay_ms_.load(std::memory_order_relaxed) };
 			targets.push_back(carrier_target);
 		}
+		// BetterFxSound: an output whose device could not be opened (held by an exclusive-mode app, a driver failing) is
+		// not measured: its sweeps could not be heard, and it was reported as not heard. It gets an entry that says so
+		// (getDelayCalibrationResults()). Its index stays its own.
+		const std::vector<AdditionalOutputStatus> router_status = multi_output_.getStatus();
+		calibration_unavailable_.clear();
 		for (size_t i = 0; i < effective_outputs_.size(); i++)
 		{
+			bool unavailable = false;
+			for (const auto& status : router_status)
+			{
+				if (status.device_id == effective_outputs_[i].device_id && status.failed)
+					unavailable = true;
+			}
+			if (unavailable)
+			{
+				calibration_unavailable_.push_back(effective_outputs_[i].device_id);
+				continue;
+			}
 			DelayCalibration::Target target = { effective_outputs_[i].device_id, (int)i, effective_outputs_[i].delay_ms };
 			targets.push_back(target);
 		}
@@ -1584,6 +1642,8 @@ bool AudioPassthruPrivate::startDelayCalibration()
 
 			if (!any_enabled)
 				no_targets_error = L"No output is turned on. Turn on at least one output, then synchronize again.";
+			else if (!calibration_unavailable_.empty())
+				no_targets_error = L"The outputs that are turned on could not be opened. Another app may be using them exclusively. Close it, then synchronize again.";
 			else if (!any_connected)
 				no_targets_error = L"None of the outputs that are turned on is connected. Connect one of them, then synchronize again.";
 			else
@@ -1613,7 +1673,27 @@ int AudioPassthruPrivate::getDelayCalibrationState(int* progress_percent)
 
 std::vector<DelayCalibrationResult> AudioPassthruPrivate::getDelayCalibrationResults()
 {
-	return calibration_.getResults();
+	std::vector<DelayCalibrationResult> results = calibration_.getResults();
+
+	// BetterFxSound: the outputs left out because their device could not be opened (startDelayCalibration()).
+	if (!results.empty())
+	{
+		std::lock_guard<std::mutex> lock(config_mutex_);
+		for (const auto& device_id : calibration_unavailable_)
+		{
+			DelayCalibrationResult result;
+			result.device_id = device_id;
+			result.measured = false;
+			result.unavailable = true;
+			results.push_back(result);
+		}
+	}
+	return results;
+}
+
+std::vector<AdditionalOutputStatus> AudioPassthruPrivate::getAdditionalOutputStatus()
+{
+	return multi_output_.getStatus();
 }
 
 std::wstring AudioPassthruPrivate::getDelayCalibrationError()

@@ -41,6 +41,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "u_sndDevices.h"
 #include "sndDevices.h"
 #include "OwedVolume.h"
+#include "RenderSession.h"
 
 /*
  * FUNCTION: sndDevicesInitialSetupCaptureDevice()
@@ -467,11 +468,13 @@ int PT_DECLSPEC sndDevicesFinalSetupPlaybackDevice(PT_HANDLE *hp_sndDevices, int
 		return(NOT_OKAY);
 
 	// The volume control hide flag can only be used on Win7.
+	// BetterFxSound: the engine's private render session, hidden and not persisted, shared with the additional outputs
+	// (RenderSession.h). It was the default session, persisted, whose flags the first stream on the device decided.
 	if( procInfo & OPERATING_SYSTEM_VISTA )
-		StreamFlags = 0;
+		StreamFlags = AUDCLNT_STREAMFLAGS_NOPERSIST;
 	else
 		// The AUDCLNT_SESSIONFLAGS_DISPLAY_HIDE flag hides extra occurences of our volume control in Mixer dialog.
-		StreamFlags = AUDCLNT_SESSIONFLAGS_DISPLAY_HIDE;
+		StreamFlags = kRenderSessionFlags;
 
 	// Must call GetMixFormat on the freshly activated client; a copied WAVEFORMATEX is not accepted by Initialize.
 	pwfx = NULL;
@@ -497,14 +500,14 @@ int PT_DECLSPEC sndDevicesFinalSetupPlaybackDevice(PT_HANDLE *hp_sndDevices, int
 		SAFE_RELEASE(cast_handle->pAudioClientPlayback);
 		hr = cast_handle->pPlaybackDevice->Activate(cast_handle->IID_IAudioClient, CLSCTX_ALL, NULL, (void**)&cast_handle->pAudioClientPlayback);
 		if (SUCCEEDED(hr) && cast_handle->pAudioClientPlayback != NULL)
-			hr = cast_handle->pAudioClientPlayback->Initialize(AUDCLNT_SHAREMODE_SHARED, StreamFlags, cast_handle->hnsRequestedDurationPlayback, 0, pClosestMatch, NULL);
+			hr = cast_handle->pAudioClientPlayback->Initialize(AUDCLNT_SHAREMODE_SHARED, StreamFlags, cast_handle->hnsRequestedDurationPlayback, 0, pClosestMatch, &kRenderSessionGuid);
 		else
 			hr = E_FAIL;
 	}
 	else
 	{
 		// Format is supported (S_OK) or IsFormatSupported gave no match — try pwfx directly.
-		hr = cast_handle->pAudioClientPlayback->Initialize(AUDCLNT_SHAREMODE_SHARED, StreamFlags, cast_handle->hnsRequestedDurationPlayback, 0, pwfx, NULL);
+		hr = cast_handle->pAudioClientPlayback->Initialize(AUDCLNT_SHAREMODE_SHARED, StreamFlags, cast_handle->hnsRequestedDurationPlayback, 0, pwfx, &kRenderSessionGuid);
 		CoTaskMemFree(pwfx);
 		pwfx = NULL;
 
@@ -514,7 +517,7 @@ int PT_DECLSPEC sndDevicesFinalSetupPlaybackDevice(PT_HANDLE *hp_sndDevices, int
 			SAFE_RELEASE(cast_handle->pAudioClientPlayback);
 			hr = cast_handle->pPlaybackDevice->Activate(cast_handle->IID_IAudioClient, CLSCTX_ALL, NULL, (void**)&cast_handle->pAudioClientPlayback);
 			if (SUCCEEDED(hr) && cast_handle->pAudioClientPlayback != NULL)
-				hr = cast_handle->pAudioClientPlayback->Initialize(AUDCLNT_SHAREMODE_SHARED, StreamFlags, cast_handle->hnsRequestedDurationPlayback, 0, pClosestMatch, NULL);
+				hr = cast_handle->pAudioClientPlayback->Initialize(AUDCLNT_SHAREMODE_SHARED, StreamFlags, cast_handle->hnsRequestedDurationPlayback, 0, pClosestMatch, &kRenderSessionGuid);
 			else
 				hr = E_FAIL;
 		}
@@ -528,6 +531,9 @@ int PT_DECLSPEC sndDevicesFinalSetupPlaybackDevice(PT_HANDLE *hp_sndDevices, int
 		*ip_status = SND_DEVICES_AUDIO_CLIENT_INIT_FAILED;
 		SND_DEVICES_SET_STATUS_AND_RETURN_OK(SND_DEVICES_AUDIO_CLIENT_INIT_FAILED);
 	}
+
+	// BetterFxSound: the session's own level and mute at 100% and unmuted, so only the app's gain applies (RenderSession.h).
+	resetRenderSessionVolume(cast_handle->pAudioClientPlayback);
 
 	// Get the actual size of the allocated buffer in sample sets, which are called frames.
 	hr = cast_handle->pAudioClientPlayback->GetBufferSize(&cast_handle->bufferFrameSizePlayback);

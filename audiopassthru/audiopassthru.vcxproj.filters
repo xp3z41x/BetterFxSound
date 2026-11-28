@@ -239,5 +239,8 @@
     <ClInclude Include="include\AudioPassthru.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="include\RenderSession.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
 </Project>

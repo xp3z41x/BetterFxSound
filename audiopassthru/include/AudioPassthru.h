@@ -70,6 +70,14 @@ struct AdditionalOutputConfig {
 	int volume_percent = 100;	// Volume of this output, 0 to 100
 };
 
+// BetterFxSound: the state of one additional output (AudioPassthru::getAdditionalOutputStatus()).
+struct AdditionalOutputStatus {
+	std::wstring device_id;
+	bool open = false;		// Its stream is open (it opens when audio first comes)
+	bool failed = false;	// Not open, and its device could not be opened or stopped working; the engine keeps retrying it
+	long last_error = 0;	// HRESULT of the last failed open or render, 0 (S_OK) once a stream opened
+};
+
 // BetterFxSound: one output in the set passed to AudioPassthru::setOutputs(), carrier included.
 // The level actually played is master_volume * (master_mute ? 0 : 1) * trim(volume_percent), where
 // the master volume and mute are the FxSound virtual device's (the Windows volume).
@@ -85,6 +93,7 @@ struct OutputConfig {
 struct DelayCalibrationResult {
 	std::wstring device_id;
 	bool measured = false;		// False if the test sound was not heard clearly from this output
+	bool unavailable = false;	// BetterFxSound: not measured because its device could not be opened (measured is false)
 	double latency_ms = 0.0;	// Time from the test sound until it was heard, including the output's current delay
 	double confidence = 0.0;	// Correlation peak / RMS, higher is better
 };
@@ -130,11 +139,16 @@ public:
 	// carrier switch, power off, exit), it puts the saved level and mute back. Nothing is kept
 	// across a crash. The FxSound virtual device's volume is never changed.
 	void setOutputs(const std::vector<OutputConfig>& outputs);
+	// BetterFxSound: the state of every output playing through the additional outputs (every enabled, present output
+	// other than the carrier), so an output whose device cannot be opened (held by an exclusive-mode app, a driver
+	// failing after a resume) can be shown as such. The engine keeps retrying it meanwhile.
+	std::vector<AdditionalOutputStatus> getAdditionalOutputStatus();
 
 	// BetterFxSound: measures the delay of every enabled output that is present (the carrier
 	// only if it is enabled) with the default microphone. Runs in the background; poll
 	// getDelayCalibrationState(). State: 0 idle (also after a cancel), 1 running, 2 done, 3 failed.
 	// Results have one entry per measured output, keyed by device_id, in no particular order.
+	// BetterFxSound: an output whose device could not be opened is not measured; it has an entry with unavailable set.
 	// With nothing to measure (no output turned on, or none of them connected), or when the test
 	// sound could not be heard (FxSound not playing, Windows volume muted) the measurement fails at
 	// once and getDelayCalibrationError() says why. A carrier switch while it runs makes it fail too.
