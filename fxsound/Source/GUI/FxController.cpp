@@ -1764,6 +1764,9 @@ void FxController::updateOutputs(std::vector<SoundDevice>& sound_devices, const 
 	//  - HDMI reconnects in time (including after sleep): it is still enabled and is elected again.
 	//  - Not in time: physical disconnect, a new carrier is elected among the enabled outputs.
 	String returned_carrier_id;
+	// BetterFxSound: the wait ended without HDMI back. The engine's stand-in carrier (picked by its own rules at
+	// the removal) is not kept then: the new carrier is elected by priority.
+	bool hdmi_wait_timed_out = false;
 	if (!hdmi_reconnect_pending_ && list_changed && carrier_id_.isNotEmpty() && findActiveOutput(carrier_id_) == nullptr)
 	{
 		auto* entry = findOutputEntry(carrier_id_);
@@ -1788,6 +1791,8 @@ void FxController::updateOutputs(std::vector<SoundDevice>& sound_devices, const 
 		// BetterFxSound: HDMI back in time is the carrier again (if still enabled), not the one used meanwhile.
 		if (findActiveOutput(failover_output_id_) != nullptr)
 			returned_carrier_id = failover_output_id_;
+		else
+			hdmi_wait_timed_out = true;
 		clearOutputRestore();
 	}
 
@@ -1824,11 +1829,12 @@ void FxController::updateOutputs(std::vector<SoundDevice>& sound_devices, const 
 	// (see electCarrier()) are HDMI back in time, a switch the engine's rules got in the way of (asked for
 	// again), and a device the user made the Windows default. Otherwise the carrier stays only when this reinit
 	// neither changed the devices nor moved the carrier, so a turned-on output does not cost a reinit (see
-	// setOutputEnabled()). After a device change, or a carrier the engine's rules took on their own (a device just
-	// added), the election is by priority: the same devices always give the same carrier.
+	// setOutputEnabled()). After a device change, a carrier the engine's rules took on their own (a device just
+	// added), or an HDMI wait that ended without HDMI back, the election is by priority: the same devices always
+	// give the same carrier.
 	if (returned_carrier_id.isNotEmpty())
 		keep_carrier_id = returned_carrier_id;
-	else if (keep_carrier_id.isEmpty() && !list_changed && engine_carrier_id == previous_carrier_id)
+	else if (keep_carrier_id.isEmpty() && !list_changed && !hdmi_wait_timed_out && engine_carrier_id == previous_carrier_id)
 		keep_carrier_id = engine_carrier_id;
 	applyCarrier(keep_carrier_id);
 
