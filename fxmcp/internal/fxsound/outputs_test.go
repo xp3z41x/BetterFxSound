@@ -88,7 +88,7 @@ func TestResolveOutput(t *testing.T) {
 		{Name: "Speakers", Present: true},
 		{Name: "TV", Enabled: true, Present: false},
 	}}
-	if o, err := s.ResolveOutput("Speakers", true); err != nil || o.Name != "Speakers" {
+	if o, err := s.ResolveOutput("Speakers", true); err != nil || len(o) != 1 || o[0].Name != "Speakers" {
 		t.Fatalf("Speakers: %v", err)
 	}
 	if _, err := s.ResolveOutput("TV", false); err != nil {
@@ -101,5 +101,42 @@ func TestResolveOutput(t *testing.T) {
 	_, err = s.ResolveOutput("Nope", false)
 	if err == nil || !strings.Contains(err.Error(), `"Speakers"`) || !strings.Contains(err.Error(), `"TV"`) {
 		t.Fatalf("Nope: %v", err)
+	}
+}
+
+func TestMatchOutputsSharedName(t *testing.T) {
+	// Two identical monitors, the first disabled, plus an enabled entry of the
+	// same name that is not connected (a device back under a new endpoint id).
+	s := &Status{Outputs: []OutputInfo{
+		{ID: "{m1}", Name: "Monitor", Enabled: false, Present: true},
+		{ID: "{m2}", Name: "Monitor", Enabled: true, Present: true},
+		{ID: "{old}", Name: "Monitor", Enabled: true, Present: false},
+		{ID: "{s}", Name: "Speakers", Present: true},
+	}}
+	ids := func(os []OutputInfo) []string {
+		var r []string
+		for _, o := range os {
+			r = append(r, o.ID)
+		}
+		return r
+	}
+	if got := ids(s.MatchOutputs("Monitor", false)); !reflect.DeepEqual(got, []string{"{m1}", "{m2}", "{old}"}) {
+		t.Errorf("disable/volume/delay by name: %v", got)
+	}
+	if got := ids(s.MatchOutputs("Monitor", true)); !reflect.DeepEqual(got, []string{"{m1}", "{m2}"}) {
+		t.Errorf("enable by name: %v", got)
+	}
+	if got := ids(s.MatchOutputs("{m2}", false)); !reflect.DeepEqual(got, []string{"{m2}"}) {
+		t.Errorf("by id: %v", got)
+	}
+	if got := s.MatchOutputs("{old}", true); len(got) != 0 {
+		t.Errorf("enable by id of a disconnected output: %v", got)
+	}
+	if o := s.FindOutput("{s}"); o == nil || o.Name != "Speakers" {
+		t.Errorf("FindOutput by id: %+v", o)
+	}
+	_, err := s.ResolveOutput("{old}", true)
+	if err == nil || !strings.Contains(err.Error(), "not connected") {
+		t.Errorf("enable by id of a disconnected output: %v", err)
 	}
 }

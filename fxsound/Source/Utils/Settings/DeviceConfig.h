@@ -38,6 +38,15 @@ namespace FxSound
         static void saveDeviceConfigs(Settings& settings, juce::StringRef key, const juce::Array<DeviceConfig>& device_configs);
 
         static DeviceConfig getDeviceConfig(Settings& settings, const juce::String& device_name);
+        // BetterFxSound: rows are keyed by endpoint id. The friendly name only finds a row that has no id.
+        static DeviceConfig getDeviceConfig(Settings& settings, const juce::String& device_id, const juce::String& device_name);
+        static int indexOf(const juce::Array<DeviceConfig>& device_configs, const juce::String& device_id, const juce::String& device_name);
+        // The row of this device: by id (or name, see indexOf()), else the row of the same device under an endpoint id
+        // Windows no longer lists (see updateDeviceConfigs()). -1 if it has none. sound_devices: every endpoint listed.
+        static int findDeviceConfigIndex(const juce::Array<DeviceConfig>& device_configs, const SoundDevice& sound_device,
+                                         const std::vector<SoundDevice>& sound_devices);
+        // A device usable as an output (real, active, stereo or more): only these are learned as devices.
+        static bool qualifiesAsOutput(const SoundDevice& sound_device);
 
         static std::function<void()> onDeviceConfigsUpdate;
 
@@ -45,6 +54,7 @@ namespace FxSound
         static juce::var toJson(const DeviceConfig& device_config);
         static DeviceConfig fromJson(const juce::var& v);
         static juce::Array<DeviceConfig> removeDuplicates(const juce::Array<DeviceConfig>& device_configs);
+        static void notifyDeviceConfigsUpdate();
     };
 }
 

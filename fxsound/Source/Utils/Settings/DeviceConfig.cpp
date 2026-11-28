@@ -57,40 +57,49 @@ namespace FxSound
         auto prioritize_new_output = settings.getBool("prioritize_new_output");
 
         bool save_config = false;
-        for (auto sound_device : sound_devices)
+        for (const auto& sound_device : sound_devices)
         {
-            if (!sound_device.isRealDevice)
+            // BetterFxSound: a device is learned once it can be an output. One first listed while unplugged, or
+            // whose format could not be read, is learned (and counts as new) when it becomes usable.
+            if (!qualifiesAsOutput(sound_device))
                 continue;
 
-            bool device_found = false;
-            for (auto device_config : device_configs)
-            {
-                if (device_config.device_name == sound_device.deviceFriendlyName.c_str())
-                {
-                    device_found = true;
-                    break;
-                }
-            }
-            if (!device_found)
+            juce::String id(sound_device.pwszID.c_str());
+            juce::String name(sound_device.deviceFriendlyName.c_str());
+
+            auto index = findDeviceConfigIndex(device_configs, sound_device, sound_devices);
+            if (index < 0)
             {
                 save_config = true;
-                DeviceConfig device_config = { sound_device.pwszID.c_str(), sound_device.deviceFriendlyName.c_str(), "", sound_device.deviceFormFactor.c_str() };
+                DeviceConfig device_config = { id, name, "", sound_device.deviceFormFactor.c_str() };
                 if (prioritize_new_output)
-                {   
+                {
                     device_configs.insert(0, device_config);
                 }
                 else
                 {
                     device_configs.add(device_config);
                 }
+                continue;
+            }
+
+            // BetterFxSound: a known device keeps its row (priority, preset) when it is renamed, or comes back
+            // under a new endpoint id. The row follows its current id and name.
+            auto& device_config = device_configs.getReference(index);
+            if (device_config.device_id != id || device_config.device_name != name)
+            {
+                save_config = true;
+                device_config.device_id = id;
+                device_config.device_name = name;
+                if (!sound_device.deviceFormFactor.empty())
+                    device_config.device_form_factor = sound_device.deviceFormFactor.c_str();
             }
         }
 
         if (save_config)
         {
-            saveDeviceConfigs(settings, "device_configs", device_configs);
-            if (onDeviceConfigsUpdate)
-                onDeviceConfigsUpdate();
+            saveDeviceConfigs(settings, "device_configs", removeDuplicates(device_configs));
+            notifyDeviceConfigsUpdate();
             return;
         }
 
@@ -98,13 +107,33 @@ namespace FxSound
         {
             if (std::find_if(sound_devices.begin(), sound_devices.end(),
                 [&](const SoundDevice& sound_device) {
-                    return device_config.device_name == sound_device.deviceFriendlyName.c_str();
+                    return device_config.device_id.isNotEmpty()
+                        ? device_config.device_id == sound_device.pwszID.c_str()
+                        : device_config.device_name == sound_device.deviceFriendlyName.c_str();
                 }) == sound_devices.end())
             {
-                if (onDeviceConfigsUpdate)
-                    onDeviceConfigsUpdate();
+                // BetterFxSound: one refresh covers every absent device.
+                notifyDeviceConfigsUpdate();
+                break;
             }
         }
+    }
+
+    // BetterFxSound: the listener (Output preferences) updates its components, so it only runs on the
+    // message thread. From any other thread it is queued, and the listener current at that time is called.
+    void DeviceConfig::notifyDeviceConfigsUpdate()
+    {
+        if (juce::MessageManager::existsAndIsCurrentThread())
+        {
+            if (onDeviceConfigsUpdate)
+                onDeviceConfigsUpdate();
+            return;
+        }
+
+        juce::MessageManager::callAsync([]() {
+            if (onDeviceConfigsUpdate)
+                onDeviceConfigsUpdate();
+        });
     }
 
     DeviceConfig DeviceConfig::getDeviceConfig(Settings& settings, const juce::String& device_name)
@@ -120,6 +149,106 @@ namespace FxSound
         }
 
         return {};
+    }
+
+    DeviceConfig DeviceConfig::getDeviceConfig(Settings& settings, const juce::String& device_id, const juce::String& device_name)
+    {
+        juce::Array<DeviceConfig> device_configs = loadDeviceConfigs(settings, "device_configs");
+
+        auto index = indexOf(device_configs, device_id, device_name);
+        if (index < 0)
+            return {};
+
+        return device_configs[index];
+    }
+
+    int DeviceConfig::indexOf(const juce::Array<DeviceConfig>& device_configs, const juce::String& device_id, const juce::String& device_name)
+    {
+        int index = 0;
+        if (device_id.isNotEmpty())
+        {
+            for (const auto& device_config : device_configs)
+            {
+                if (device_config.device_id == device_id)
+                    return index;
+                index++;
+            }
+        }
+
+        index = 0;
+        if (device_name.isNotEmpty())
+        {
+            for (const auto& device_config : device_configs)
+            {
+                if (device_config.device_id.isEmpty() && device_config.device_name == device_name)
+                    return index;
+                index++;
+            }
+        }
+
+        return -1;
+    }
+
+    int DeviceConfig::findDeviceConfigIndex(const juce::Array<DeviceConfig>& device_configs, const SoundDevice& sound_device,
+                                            const std::vector<SoundDevice>& sound_devices)
+    {
+        juce::String id(sound_device.pwszID.c_str());
+        juce::String name(sound_device.deviceFriendlyName.c_str());
+        juce::String form_factor(sound_device.deviceFormFactor.c_str());
+
+        auto index = indexOf(device_configs, id, name);
+        if (index >= 0)
+            return index;
+
+        // BetterFxSound: the same device under a new endpoint id (another USB port, Bluetooth paired again, driver
+        // reinstalled). Only when this is the one usable device with that name whose id is unknown, and exactly one
+        // row with that name (and form factor) belongs to an endpoint Windows no longer lists. An endpoint that is
+        // still listed (an unplugged twin) keeps its row.
+        int unknown = 0;
+        for (const auto& other : sound_devices)
+        {
+            if (qualifiesAsOutput(other) && name == other.deviceFriendlyName.c_str() &&
+                indexOf(device_configs, juce::String(other.pwszID.c_str()), juce::String()) < 0)
+            {
+                unknown++;
+            }
+        }
+        if (unknown != 1)
+            return -1;
+
+        int found = -1;
+        index = 0;
+        for (const auto& device_config : device_configs)
+        {
+            const int row = index++;
+            if (device_config.device_id.isEmpty() || device_config.device_name != name)
+                continue;
+            if (device_config.device_form_factor.isNotEmpty() && form_factor.isNotEmpty() && device_config.device_form_factor != form_factor)
+                continue;
+
+            bool listed = false;
+            for (const auto& other : sound_devices)
+            {
+                if (device_config.device_id == other.pwszID.c_str())
+                {
+                    listed = true;
+                    break;
+                }
+            }
+            if (listed)
+                continue;
+
+            if (found >= 0)
+                return -1;  // Ambiguous: keep both rows, learn the device as new
+            found = row;
+        }
+
+        return found;
+    }
+
+    bool DeviceConfig::qualifiesAsOutput(const SoundDevice& sound_device)
+    {
+        return sound_device.isRealDevice && sound_device.isActive && sound_device.deviceNumChannel >= 2;
     }
 
     juce::var DeviceConfig::toJson(const DeviceConfig& device_config)
@@ -150,14 +279,17 @@ namespace FxSound
 
     juce::Array<DeviceConfig> DeviceConfig::removeDuplicates(const juce::Array<DeviceConfig>& device_configs)
     {
+        // BetterFxSound: one row per endpoint id, so two devices with the same name (identical monitors or DACs)
+        // each keep their own. Only a row with no id is matched by name.
         juce::Array<DeviceConfig> result;
-        juce::StringArray duplicate_names;
+        juce::StringArray seen_keys;
 
         for (const auto& device_config : device_configs)
         {
-            if (!duplicate_names.contains(device_config.device_name))
+            auto key = device_config.device_id.isNotEmpty() ? "id:" + device_config.device_id : "name:" + device_config.device_name;
+            if (!seen_keys.contains(key))
             {
-                duplicate_names.add(device_config.device_name);
+                seen_keys.add(key);
                 result.add(device_config);
             }
         }

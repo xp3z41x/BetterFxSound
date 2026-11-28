@@ -69,6 +69,12 @@ FxSound::Settings::~Settings()
 {
 }
 
+void FxSound::Settings::flush() noexcept
+{
+	app_user_properties_.saveIfNeeded();
+	app_secure_properties_.saveIfNeeded();
+}
+
 String FxSound::Settings::getString(StringRef key) noexcept
 {
 	return user_settings_->getValue(key);

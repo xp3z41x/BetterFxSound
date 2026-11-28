@@ -98,7 +98,9 @@ public:
         if (main_window_.get() != nullptr)
         {
             FxController::getInstance().autoSaveModifiedPreset();
-            FxController::getInstance().stopTimer();
+            // BetterFxSound: stops the timer and detaches the controller from the engine first, so a device
+            // notification or a queued call during the engine's teardown never reaches it.
+            FxController::getInstance().detachAudioPassthru();
 
             audio_passthru_.reset();
 
@@ -123,6 +125,10 @@ public:
             logRemainingDesktopComponents();
         }
 
+        // BetterFxSound: the settings timer that would write the last changes never fires once the message
+        // loop has ended, and the controller (which owns the settings) is never destroyed.
+        FxController::getInstance().flushSettings();
+
         LocalisedStrings::setCurrentMappings(nullptr);
         LookAndFeel::setDefaultLookAndFeel(nullptr);
 
@@ -135,6 +141,9 @@ public:
         // This is called when the app is being asked to quit: you can ignore this
         // request and let the app carry on running, or call quit() to allow the app to close.
         
+        // BetterFxSound: written now too, since at logoff or shutdown Windows may end the process before
+        // shutdown() runs.
+        FxController::getInstance().flushSettings();
         quit();
     }
 
@@ -192,6 +201,11 @@ private:
         CaptureAndLogCallStack(exception_info->ContextRecord);
 
         relaunchAfterCrash();
+
+        // BetterFxSound: best effort, so the relaunched instance (or the next start) gets the last settings changes.
+        // After the relaunch, so a fault or a held settings lock here can't cost it: the new instance starts about
+        // 3 s later (launchNewInstance), after this flush.
+        controller.flushSettings();
 
         return EXCEPTION_EXECUTE_HANDLER;
     }

@@ -17,6 +17,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
 #include "SysInfo.h"
+#include <Audioclient.h>
 
 void SysInfo::enumAudioOutputs(StringArray& audioOutputNames)
 {
@@ -65,6 +66,70 @@ void SysInfo::enumAudioOutputs(StringArray& audioOutputNames)
 	}
 
 	pEnumerator->Release();
+}
+
+std::wstring SysInfo::getDefaultAudioOutputId()
+{
+	std::wstring device_id;
+	IMMDeviceEnumerator *pEnumerator = NULL;
+
+	HRESULT hRes = CoCreateInstance(__uuidof(MMDeviceEnumerator), NULL,
+		CLSCTX_ALL, __uuidof(IMMDeviceEnumerator),
+		(void**)&pEnumerator);
+	if (FAILED(hRes) || pEnumerator == NULL)
+		return device_id;
+
+	IMMDevice *pDevice = NULL;
+	hRes = pEnumerator->GetDefaultAudioEndpoint(eRender, eMultimedia, &pDevice);
+	if (SUCCEEDED(hRes) && pDevice != NULL)
+	{
+		LPWSTR pwszID = NULL;
+		if (SUCCEEDED(pDevice->GetId(&pwszID)) && pwszID != NULL)
+		{
+			device_id = pwszID;
+			CoTaskMemFree(pwszID);
+		}
+		pDevice->Release();
+	}
+
+	pEnumerator->Release();
+	return device_id;
+}
+
+DWORD SysInfo::getAudioDeviceSampleRate(const std::wstring& device_id)
+{
+	DWORD sample_rate = 0;
+	if (device_id.empty())
+		return sample_rate;
+
+	IMMDeviceEnumerator *pEnumerator = NULL;
+	HRESULT hRes = CoCreateInstance(__uuidof(MMDeviceEnumerator), NULL,
+		CLSCTX_ALL, __uuidof(IMMDeviceEnumerator),
+		(void**)&pEnumerator);
+	if (FAILED(hRes) || pEnumerator == NULL)
+		return sample_rate;
+
+	IMMDevice *pDevice = NULL;
+	hRes = pEnumerator->GetDevice(device_id.c_str(), &pDevice);
+	if (SUCCEEDED(hRes) && pDevice != NULL)
+	{
+		IAudioClient *pAudioClient = NULL;
+		hRes = pDevice->Activate(__uuidof(IAudioClient), CLSCTX_ALL, NULL, (void**)&pAudioClient);
+		if (SUCCEEDED(hRes) && pAudioClient != NULL)
+		{
+			WAVEFORMATEX *pwfx = NULL;
+			if (SUCCEEDED(pAudioClient->GetMixFormat(&pwfx)) && pwfx != NULL)
+			{
+				sample_rate = pwfx->nSamplesPerSec;
+				CoTaskMemFree(pwfx);
+			}
+			pAudioClient->Release();
+		}
+		pDevice->Release();
+	}
+
+	pEnumerator->Release();
+	return sample_rate;
 }
 
 String SysInfo::getAudioOutputName(IMMDevice *pDevice)

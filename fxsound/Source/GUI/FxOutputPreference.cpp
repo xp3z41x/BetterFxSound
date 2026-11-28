@@ -67,7 +67,10 @@ FxOutputDeviceRow::FxOutputDeviceRow(FxOutputPreferenceListModel& model) : up_bu
             auto preset = preset_list_.getItemText(index);
             device_config_.preset = preset;
             output_preference_list_model_.updateDeviceConfig(device_config_);
-            if (device_config_.device_name == FxController::getInstance().getOutputName())
+            // BetterFxSound: by endpoint id (by name only for a row with no id).
+            auto& controller = FxController::getInstance();
+            if (device_config_.device_id.isNotEmpty() ? device_config_.device_id == controller.getOutputId()
+                                                      : device_config_.device_name == controller.getOutputName())
             {
                 FxController::getInstance().setPreset(preset);
             }
@@ -127,7 +130,7 @@ void FxOutputDeviceRow::update(int index, bool is_row_selected, const DeviceConf
     down_button_.setBounds(x, y, BUTTON_WIDTH, BUTTON_WIDTH);
 
     remove_button_.setBounds((bounds.getWidth() - BUTTON_WIDTH - MARGIN), y, BUTTON_WIDTH, BUTTON_WIDTH);
-    remove_button_.setVisible(!FxController::getInstance().isOutputDevicePresent(device_config.device_name));
+    remove_button_.setVisible(!FxController::getInstance().isOutputDevicePresent(device_config.device_id, device_config.device_name));
 
     x = remove_button_.getX() - PRESET_LIST_WIDTH - MARGIN;
 
@@ -138,7 +141,7 @@ void FxOutputDeviceRow::update(int index, bool is_row_selected, const DeviceConf
     device_name_.setBounds(x, bounds.getY(), width, bounds.getHeight());
 
     device_name_.setText(String::formatted("%d. ", row_index_ + 1) +  device_config.device_name, NotificationType::dontSendNotification);
-    device_name_.setEnabled(FxController::getInstance().isOutputDeviceConnected(device_config.device_name));
+    device_name_.setEnabled(FxController::getInstance().isOutputDeviceConnected(device_config.device_id, device_config.device_name));
 
     if (is_row_selected != is_row_selected_)
     {
@@ -286,7 +289,9 @@ void FxOutputPreferenceListModel::updateDeviceConfig(const DeviceConfig device_c
 {
     for (auto i = 0; i < device_configs_.size(); i++)
     {
-        if (device_configs_[i].device_name == device_config.device_name)
+        // BetterFxSound: by endpoint id, so two devices with the same name each keep their own preset.
+        if (device_config.device_id.isNotEmpty() ? device_configs_[i].device_id == device_config.device_id
+                                                 : device_configs_[i].device_name == device_config.device_name)
         {
             device_configs_.getReference(i).preset = device_config.preset;
             break;
