@@ -392,8 +392,12 @@ public:
 			else
 				std::memcpy(dst, src, channels * sizeof(float));
 		}
+		// BetterFxSound: the write time is stored before the block is published, so render() never sees the new block
+		// with the time of an older one (and flushes it at once as if nothing had come for a while).
+		LARGE_INTEGER qpc_now;
+		QueryPerformanceCounter(&qpc_now);
+		last_write_qpc_.store(qpc_now.QuadPart, std::memory_order_relaxed);
 		write_pos_.store(w + n, std::memory_order_release);
-		last_write_tick_.store(GetTickCount(), std::memory_order_relaxed);
 	}
 
 private:
@@ -403,6 +407,9 @@ private:
 		applyConfig(config);
 		// Fade in from silence: the master volume is applied on top of the trim.
 		current_gain_ = 0.0f;
+		LARGE_INTEGER qpc_freq;
+		QueryPerformanceFrequency(&qpc_freq);
+		qpc_freq_ = static_cast<double>(qpc_freq.QuadPart);
 		stop_event_ = CreateEvent(NULL, FALSE, FALSE, NULL);
 		audio_event_ = CreateEvent(NULL, FALSE, FALSE, NULL);
 	}
@@ -692,8 +699,13 @@ private:
 			// BetterFxSound: a sound shorter than the target after silence (nothing more came for kFlushMs) is played
 			// too, at the moment more audio would have filled the queue to the target, as the carrier does
 			// (sndDevicesDoCapture()). It used to wait for the next sound to fill the rest, and then play late.
-			const DWORD since_write = now - last_write_tick_.load(std::memory_order_relaxed);
-			const bool flush = fill > 0 && fill < target && since_write >= kFlushMs;
+			// The time since the last write is measured with QPC, as the carrier does: GetTickCount() is ~15.6 ms coarse.
+			// The write time is read after fill (write_pos_ acquire above), so it is the time of that block or newer.
+			LARGE_INTEGER qpc_now;
+			QueryPerformanceCounter(&qpc_now);
+			const LONGLONG since_write_qpc = qpc_now.QuadPart - last_write_qpc_.load(std::memory_order_relaxed);
+			const double since_write = since_write_qpc > 0 ? static_cast<double>(since_write_qpc) / qpc_freq_ : 0.0; // seconds
+			const bool flush = fill > 0 && fill < target && since_write * 1000.0 >= static_cast<double>(kFlushMs);
 			if ((fill >= target && fill > 0) || flush)
 			{
 				primed_ = true;
@@ -706,7 +718,7 @@ private:
 				const UINT32 queued = write_pos_.load(std::memory_order_acquire) - read_pos_.load(std::memory_order_relaxed);
 				if (queued < target)
 				{
-					const double waited = static_cast<double>(since_write) * rate / 1000.0;
+					const double waited = since_write * rate;
 					const double missing = static_cast<double>(target - queued) - waited;
 					hold_frames_ = missing > 0.0 ? static_cast<UINT32>(missing) : 0;
 				}
@@ -902,7 +914,8 @@ private:
 	std::atomic<UINT32> read_pos_{ 0 };    // Written by the render thread only
 	std::atomic<UINT32> active_format_{ 0 };  // Format the ring and the device are set up for, 0 = none
 	std::atomic<UINT32> pending_format_{ 0 }; // Format the audio thread is producing
-	std::atomic<DWORD> last_write_tick_{ 0 }; // GetTickCount() of the last block queued by the audio thread
+	std::atomic<LONGLONG> last_write_qpc_{ 0 }; // QPC of the last block queued by the audio thread, stored before write_pos_
+	double qpc_freq_ = 1.0;                     // QueryPerformanceFrequency(), set once in the constructor
 
 	HANDLE stop_event_ = NULL;
 	HANDLE audio_event_ = NULL;
