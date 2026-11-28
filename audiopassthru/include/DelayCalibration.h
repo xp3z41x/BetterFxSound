@@ -65,6 +65,8 @@ public:
 	// BetterFxSound: lines every additional output up exactly on its latency target, whatever its offset (a fresh start
 	// leaves up to ~20 ms to the slow drift correction). Called once the warm-up has started them, before the first sweep.
 	typedef std::function<void()> AlignFunction;
+	// BetterFxSound: true while an output has not done what AlignFunction asked yet. The first sweep waits for it.
+	typedef std::function<bool()> AlignPendingFunction;
 
 	DelayCalibration();
 	~DelayCalibration();
@@ -74,12 +76,19 @@ public:
 	// or a generic one if that is empty. Callers also use this to report why a measurement cannot run.
 	// BetterFxSound: stream_generation, if given, must outlive the measurement. It changes whenever the audio of the
 	// outputs is interrupted (a processing thread ended); if it no longer equals start_generation while the sweeps
-	// play, the measurement fails, as it recorded gaps or partial sweeps. solo and align, and what they use, must
-	// outlive this object: its destructor waits for the measurement thread.
+	// play, the measurement fails, as it recorded gaps or partial sweeps. solo, align, align_pending and stream_generation,
+	// and what they use, must outlive the measurement thread, or shutdown() returning false (see there).
 	bool start(const std::wstring& virtual_device_id, const std::vector<Target>& targets, SoloFunction solo,
-		AlignFunction align, const std::wstring& no_targets_error = std::wstring(),
+		AlignFunction align, AlignPendingFunction align_pending, const std::wstring& no_targets_error = std::wstring(),
 		const std::atomic<unsigned int>* stream_generation = nullptr, unsigned int start_generation = 0);
 	void cancel();
+	/*
+	* BetterFxSound: cancels the measurement and waits up to timeout_ms for its thread. True: it ended, this object may be
+	* freed. False: it is held in a stream call (a device driver that does not return); it no longer calls solo, align or
+	* align_pending nor reads stream_generation, but still uses this object, which the caller must then leave allocated.
+	* The destructor waits without bound (FxSound's exit hung on such a driver), so an owner calls this first.
+	*/
+	bool shutdown(DWORD timeout_ms);
 	// Stops a running measurement because it can no longer be valid; it fails with this reason.
 	void abort(const std::wstring& reason);
 	// BetterFxSound: Running, but cancelled or aborted: the thread ends within a few ms and its results are discarded.
@@ -104,11 +113,18 @@ private:
 	// BetterFxSound: publishes why the measurement stopped early: a cancel (Idle), an abort (Failed with its reason), or
 	// a device error (cancelled false). Only once the streams are closed and the outputs are all back on.
 	void publishStopped(bool cancelled);
+	// BetterFxSound: the caller's functions and stream_generation, called or read by the thread under callback_mutex_
+	// and never once detached_ (shutdown() gave up waiting): the caller may have freed what they use.
+	void callSolo(int index);
+	void callAlign();
+	bool callAlignPending();
+	bool streamsInterrupted();
 
 	std::wstring virtual_device_id_;
 	std::vector<Target> targets_;
 	SoloFunction solo_;
 	AlignFunction align_;
+	AlignPendingFunction align_pending_;
 	const std::atomic<unsigned int>* stream_generation_ = nullptr;
 	unsigned int start_generation_ = 0;
 
@@ -117,6 +133,8 @@ private:
 	std::atomic<int> progress_{ 0 };
 	std::atomic<bool> cancel_{ false };
 	std::atomic<bool> holds_outputs_{ false };	// BetterFxSound: see holdsOutputs()
+	std::mutex callback_mutex_;		// BetterFxSound: see callSolo()
+	bool detached_ = false;			// BetterFxSound: shutdown() gave up waiting for the thread, under callback_mutex_
 
 	mutable std::mutex mutex_;
 	std::vector<DelayCalibrationResult> results_;

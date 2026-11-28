@@ -104,13 +104,18 @@ AudioPassthruPrivate::~AudioPassthruPrivate()
 	int i_result_flag;
 	int i_timed_out;
 
+	/* BetterFxSound: stop a running delay measurement first, before anything it uses goes. Waited for with a bound: a
+	   stream call that a device driver never returns from hung FxSound's exit (and the installer's updates) for good.
+	   Such a thread then no longer touches this object (DelayCalibration::shutdown()), and its own is left allocated. */
+	if (!calibration_->shutdown(kCalibrationExitWaitMs))
+		(void)calibration_.release();	// Left allocated on purpose
+
 	if (hp_sndDevices_ == NULL)
 		return;
 
-	/* BetterFxSound: stop a running delay measurement and close the additional outputs first. The router stops driving
+	/* BetterFxSound: close the additional outputs first. The router stops driving
 	   them before they are removed: an output whose render thread outlives the wait for it then hands its device back itself when it
 	   exits, after this sweep's chance (it left that to a sweep of processTimer(), which no longer runs). */
-	calibration_.cancel();
 	multi_output_.setDriven(false);
 	multi_output_.stopAll();
 
@@ -466,7 +471,7 @@ int AudioPassthruPrivate::processTimer()
 
 	/* BetterFxSound: an output change that arrived during a delay measurement is applied once its sweeps are recorded
 	   (its analysis no longer needs the outputs, see DelayCalibration::holdsOutputs()) */
-	if (!b_need_to_start_thread && !calibration_.holdsOutputs())
+	if (!b_need_to_start_thread && !calibration_->holdsOutputs())
 	{
 		bool apply_pending;
 		{
@@ -559,8 +564,8 @@ int AudioPassthruPrivate::processTimer()
 		* changes: it is stopped, and applyAdditionalOutputs() below then applies the outputs at once. Not once its sweeps are
 		* recorded (holdsOutputs() false): its analysis stays valid, unless the carrier changes (applyAdditionalOutputs()).
 		*/
-		if (calibration_.holdsOutputs())
-			calibration_.abort(L"The audio devices changed during the measurement. Synchronize again.");
+		if (calibration_->holdsOutputs())
+			calibration_->abort(L"The audio devices changed during the measurement. Synchronize again.");
 
 		/* Initialize flag which can be set by the outside telling thread to end */
 		i_kill_processing_thread_ = IS_FALSE;
@@ -1375,16 +1380,16 @@ void AudioPassthruPrivate::applyAdditionalOutputs()
 
 		/* The measurement relies on the output order, keep it stable while it runs. processTimer() applies the
 		   change once the measurement is over. */
-		const bool measuring = calibration_.getState(NULL) == DelayCalibration::State::Running;
+		const bool measuring = calibration_->getState(NULL) == DelayCalibration::State::Running;
 
 		// A carrier switch cannot wait: the carrier's sweeps (solo -1) would now play on another device and be
 		// reported for the old one, which stays silent because it cannot join the router before the end.
 		if (measuring && carrier_id != calibration_carrier_id_)
-			calibration_.abort(L"The outputs changed during the measurement. Synchronize again.");
+			calibration_->abort(L"The outputs changed during the measurement. Synchronize again.");
 		// BetterFxSound: also once it has ended, while its results were not taken yet: the switch came during its analysis
 		// (after its last look at the abort) or before the view picked the results up, which then applied them as valid.
 		if (carrier_id != calibration_carrier_id_)
-			calibration_.invalidate(L"The outputs changed during the measurement. Synchronize again.");
+			calibration_->invalidate(L"The outputs changed during the measurement. Synchronize again.");
 
 		/*
 		* BetterFxSound: a measurement that is being stopped (aborted or cancelled) stays Running until its thread
@@ -1393,7 +1398,7 @@ void AudioPassthruPrivate::applyAdditionalOutputs()
 		* router) and the previous carrier silent until a later timer tick. BetterFxSound: once the sweeps are recorded
 		* (the analysis, holdsOutputs() false) the order no longer matters either, and the outputs are all back on.
 		*/
-		if (calibration_.holdsOutputs() && !calibration_.isStopping())
+		if (calibration_->holdsOutputs() && !calibration_->isStopping())
 		{
 			apply_pending_ = true;
 		}
@@ -1831,7 +1836,7 @@ bool AudioPassthruPrivate::startDelayCalibration()
 			std::lock_guard<std::mutex> lock(config_mutex_);
 			apply_pending = apply_pending_;
 		}
-		if (apply_pending && calibration_.getState(NULL) != DelayCalibration::State::Running)
+		if (apply_pending && calibration_->getState(NULL) != DelayCalibration::State::Running)
 			applyAdditionalOutputs();
 	}
 
@@ -1870,7 +1875,7 @@ bool AudioPassthruPrivate::startDelayCalibration()
 		}
 
 		// A carrier switch during the measurement aborts it, see applyAdditionalOutputs().
-		if (calibration_.getState(NULL) != DelayCalibration::State::Running)
+		if (calibration_->getState(NULL) != DelayCalibration::State::Running)
 			calibration_carrier_id_ = wcp_targeted_guid;
 
 		// The sweeps could not be heard anywhere, or would be played to a carrier that is about to change:
@@ -1919,26 +1924,27 @@ bool AudioPassthruPrivate::startDelayCalibration()
 	if (!targets.empty() && wcp_dfx_guid[0] == L'\0')
 		return false;
 
-	// solo_ and multi_output_ are declared before calibration_, whose destructor waits for the measurement thread.
+	// solo_ and multi_output_ are declared before calibration_, which ~AudioPassthruPrivate() shuts down first.
 	std::atomic<int>* solo = &solo_;
 	MultiOutputRouter* router = &multi_output_;
-	return calibration_.start(std::wstring(wcp_dfx_guid), targets, [solo](int index) { solo->store(index, std::memory_order_relaxed); },
-		[router]() { router->requestExactAlignment(); }, no_targets_error, &stream_generation_, stream_generation);
+	return calibration_->start(std::wstring(wcp_dfx_guid), targets, [solo](int index) { solo->store(index, std::memory_order_relaxed); },
+		[router]() { router->requestExactAlignment(); }, [router]() { return router->exactAlignmentPending(); },
+		no_targets_error, &stream_generation_, stream_generation);
 }
 
 void AudioPassthruPrivate::cancelDelayCalibration()
 {
-	calibration_.cancel();
+	calibration_->cancel();
 }
 
 int AudioPassthruPrivate::getDelayCalibrationState(int* progress_percent)
 {
-	return (int)calibration_.getState(progress_percent);
+	return (int)calibration_->getState(progress_percent);
 }
 
 std::vector<DelayCalibrationResult> AudioPassthruPrivate::getDelayCalibrationResults()
 {
-	std::vector<DelayCalibrationResult> results = calibration_.getResults();
+	std::vector<DelayCalibrationResult> results = calibration_->getResults();
 
 	// BetterFxSound: the outputs left out because their device could not be opened (startDelayCalibration()).
 	if (!results.empty())
@@ -1963,5 +1969,5 @@ std::vector<AdditionalOutputStatus> AudioPassthruPrivate::getAdditionalOutputSta
 
 std::wstring AudioPassthruPrivate::getDelayCalibrationError()
 {
-	return calibration_.getError();
+	return calibration_->getError();
 }

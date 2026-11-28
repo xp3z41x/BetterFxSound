@@ -28,6 +28,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include <vector> 
 #include <map>
 #include <atomic>
+#include <memory>
 #include <mutex>
 #include <string>
 
@@ -148,6 +149,7 @@ private:
 	// take-over (sndDevicesHdlType::playbackFullVolumeReassert), since that take-over. UI/timer thread only.
 	int carrier_reasserts_ = 0;
 	static constexpr int kCarrierReasserts = 3;
+	static constexpr DWORD kCalibrationExitWaitMs = 5000;	// BetterFxSound: ~AudioPassthruPrivate() waits this long for a delay measurement
 	bool handed_back_ = false;					// restoreDefaultPlaybackDevice() called, until processing starts again
 	bool parked_ = false;						// The last reinit failed, until one succeeds or power off
 	std::wstring failed_carrier_id_;			// Carrier reported as failed (getFailedCarrierId()), until a reinit succeeds
@@ -182,6 +184,8 @@ private:
 	std::vector<AdditionalOutputConfig> effective_outputs_;	// As passed to multi_output_ (guarded by config_mutex_)
 	std::wstring calibration_carrier_id_;	// Carrier when the measurement started, a switch aborts it (guarded by config_mutex_)
 	std::vector<std::wstring> calibration_unavailable_;	// BetterFxSound: outputs left out of it, device not opened (guarded by config_mutex_)
-	DelayCalibration calibration_;
+	// BetterFxSound: on the heap, so ~AudioPassthruPrivate() can leave it allocated under a measurement thread that a
+	// device driver holds (DelayCalibration::shutdown()). Declared last, so it goes before what its functions use.
+	std::unique_ptr<DelayCalibration> calibration_{ new DelayCalibration() };
 };
 

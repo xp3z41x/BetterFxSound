@@ -58,7 +58,10 @@ namespace
 											// idle start again, outputs fill their delay, devices that wake up slowly
 											// (HDMI, Bluetooth) do not swallow the first sweep
 	constexpr DWORD kAlignMs = 500;			// BetterFxSound: after the warm-up, the outputs are lined up exactly on their
-											// latency target (AlignFunction) and given this long to do it, before the first sweep
+											// latency target (AlignFunction); once all did it, this long to settle before the first sweep
+	constexpr DWORD kAlignPollMs = 50;		// BetterFxSound: how often the outputs are asked whether they did it (AlignPendingFunction)
+	constexpr DWORD kAlignMaxWaitMs = 3500;	// BetterFxSound: they are waited for this long at most (an output that does not
+											// play drops the request after SecondaryOutput::kExactAlignWindowMs)
 	constexpr DWORD kSettleMs = 300;		// Silence before the sweep, lets the previous one die out
 	constexpr DWORD kListenMs = 1300;		// Recording after the sweep is queued (it plays ~100 ms later), plus the output's delay
 	constexpr DWORD kTailMs = 200;			// Extra recording after the last sweep, so its whole search window is recorded
@@ -203,17 +206,6 @@ namespace
 	{
 		double stream;
 		double qpc_seconds;
-	};
-
-	// Puts all outputs back on when the measurement ends, however it ends.
-	struct SoloGuard
-	{
-		const DelayCalibration::SoloFunction& solo;
-		~SoloGuard()
-		{
-			if (solo)
-				solo(DelayCalibration::kSoloNone);
-		}
 	};
 
 	// The two WASAPI streams used for a measurement.
@@ -556,20 +548,58 @@ DelayCalibration::DelayCalibration()
 
 DelayCalibration::~DelayCalibration()
 {
+	/* BetterFxSound: until the thread has ended. It used to give up after 10 s and free the members (and the solo
+	   function's target) under a thread still analysing, which did not look at the cancel: a crash at exit right
+	   after a sync. Every phase now ends within a few ms of the cancel; only a stream call a driver never returns from
+	   holds it, so an owner calls shutdown() with a bound first and leaves this object allocated if it gives up. */
+	shutdown(INFINITE);
+}
+
+bool DelayCalibration::shutdown(DWORD timeout_ms)
+{
 	cancel();
-	if (thread_ != NULL)
+	if (thread_ == NULL)
+		return true;
+	if (WaitForSingleObject(thread_, timeout_ms) == WAIT_TIMEOUT)
 	{
-		/* BetterFxSound: until the thread has ended. It used to give up after 10 s and free the members (and the solo
-		   function's target) under a thread still analysing, which did not look at the cancel: a crash at exit right
-		   after a sync. Every phase now ends within a few ms of the cancel (the streams' calls aside, which a device
-		   going away can hold for a few seconds). */
-		WaitForSingleObject(thread_, INFINITE);
-		CloseHandle(thread_);
+		// The thread keeps this object, but no longer touches what the caller gave it (callSolo()).
+		std::lock_guard<std::mutex> lock(callback_mutex_);
+		detached_ = true;
+		return false;
 	}
+	CloseHandle(thread_);
+	thread_ = NULL;
+	return true;
+}
+
+void DelayCalibration::callSolo(int index)
+{
+	std::lock_guard<std::mutex> lock(callback_mutex_);
+	if (!detached_ && solo_)
+		solo_(index);
+}
+
+void DelayCalibration::callAlign()
+{
+	std::lock_guard<std::mutex> lock(callback_mutex_);
+	if (!detached_ && align_)
+		align_();
+}
+
+bool DelayCalibration::callAlignPending()
+{
+	std::lock_guard<std::mutex> lock(callback_mutex_);
+	return !detached_ && align_pending_ && align_pending_();
+}
+
+bool DelayCalibration::streamsInterrupted()
+{
+	std::lock_guard<std::mutex> lock(callback_mutex_);
+	return !detached_ && stream_generation_ != nullptr && stream_generation_->load() != start_generation_;
 }
 
 bool DelayCalibration::start(const std::wstring& virtual_device_id, const std::vector<Target>& targets, SoloFunction solo,
-	AlignFunction align, const std::wstring& no_targets_error, const std::atomic<unsigned int>* stream_generation,
+	AlignFunction align, AlignPendingFunction align_pending, const std::wstring& no_targets_error, const std::atomic<unsigned int>* stream_generation,
 	unsigned int start_generation)
 {
 	if (state_.load() == static_cast<int>(State::Running))
@@ -589,6 +619,7 @@ bool DelayCalibration::start(const std::wstring& virtual_device_id, const std::v
 	targets_ = targets;
 	solo_ = solo;
 	align_ = align;
+	align_pending_ = align_pending;
 	stream_generation_ = stream_generation;
 	start_generation_ = start_generation;
 	cancel_.store(false);
@@ -749,7 +780,16 @@ void DelayCalibration::run()
 	bool stopped_by_cancel = false;
 
 	{
-		SoloGuard guard = { solo_ };
+		// Puts all outputs back on when the measurement ends, however it ends.
+		struct SoloGuard
+		{
+			DelayCalibration* owner;
+			~SoloGuard()
+			{
+				owner->callSolo(DelayCalibration::kSoloNone);
+			}
+		};
+		SoloGuard guard = { this };
 		Streams streams;
 
 		auto recordAll = [&]() -> Recorded
@@ -774,7 +814,7 @@ void DelayCalibration::run()
 						return false;
 					// BetterFxSound: the processing stopped (a reinit), so the capture and every output were interrupted
 					// and restart muted: the sweeps around it are lost or partial, with or without a carrier change.
-					if (stream_generation_ != nullptr && stream_generation_->load() != start_generation_)
+					if (streamsInterrupted())
 					{
 						this->abort(L"The audio devices changed during the measurement. Synchronize again.");
 						return false;
@@ -800,17 +840,24 @@ void DelayCalibration::run()
 			const float chirp_level = kChirpLevel * boost;
 
 			// Wake every output before the first sweep (they all get silence, the first target is soloed).
-			if (solo_)
-				solo_(targets_.front().solo_index);
+			callSolo(targets_.front().solo_index);
 			if (!pumpFor(kWarmUpMs))
 				return Recorded::Stopped;
 
 			/* BetterFxSound: the outputs that have just started are lined up exactly on their latency target. A start
 			   leaves them up to ~20 ms off it, which only the drift correction takes back, over ~10 s: each sweep was
-			   measured with a different part of that offset, and the delays kept it once it was gone. */
+			   measured with a different part of that offset, and the delays kept it once it was gone. They are waited
+			   for until every one has done it: an output with long device periods, or one that started late (Bluetooth,
+			   HDMI), did it after a fixed wait, so it faded out and moved within the first sweep. */
 			if (align_)
 			{
-				align_();
+				callAlign();
+				const DWORD align_begin = GetTickCount();
+				do
+				{
+					if (!pumpFor(kAlignPollMs))
+						return Recorded::Stopped;
+				} while (callAlignPending() && GetTickCount() - align_begin < kAlignMaxWaitMs);
 				if (!pumpFor(kAlignMs))
 					return Recorded::Stopped;
 			}
@@ -819,8 +866,7 @@ void DelayCalibration::run()
 			{
 				for (size_t t = 0; t < targets_.size(); t++)
 				{
-					if (solo_)
-						solo_(targets_[t].solo_index);
+					callSolo(targets_[t].solo_index);
 
 					if (!pumpFor(kSettleMs))
 						return Recorded::Stopped;

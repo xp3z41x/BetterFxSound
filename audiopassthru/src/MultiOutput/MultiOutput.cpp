@@ -960,6 +960,13 @@ public:
 		exact_align_tick_.store(GetTickCount() | 1u);
 	}
 
+	// BetterFxSound: a requestExactAlignment() not carried out yet, and not dropped either (kExactAlignWindowMs). Any thread.
+	bool exactAlignmentPending() const
+	{
+		const DWORD tick = exact_align_tick_.load();
+		return tick != 0 && GetTickCount() - tick <= kExactAlignWindowMs;
+	}
+
 	void setChannelMode(OutputChannelMode mode)
 	{
 		channel_mode_.store(static_cast<int>(mode), std::memory_order_relaxed);
@@ -1623,10 +1630,15 @@ private:
 		const double device_rate = static_cast<double>(sample_rate_);
 		const double nominal = rate / device_rate;	// Ring frames per device frame, before the drift correction
 		auto holdQueued = [this, nominal]() -> UINT32 { return static_cast<UINT32>(hold_frames_ * nominal + 0.5); };
-		// BetterFxSound: plus the offset that lines this path up with the carrier's (MultiOutputRouter::alignPaths()).
-		const UINT32 target = static_cast<UINT32>((kBaseLatencyMs + delay_ms_.load(std::memory_order_relaxed) +
-			path_offset_ms_.load(std::memory_order_relaxed)) * rate / 1000.0);
 		const UINT32 slack = static_cast<UINT32>(rate * 0.15); // 150 ms
+		// BetterFxSound: plus the offset that lines this path up with the carrier's (MultiOutputRouter::alignPaths()).
+		// The target, its slack and a write's worth of audio always fit in the ring: at high processing rates (the ring
+		// holds ~680 ms at 96 kHz) a long delay plus that offset asked for more than it holds, write() dropped the newest
+		// audio and the output never reached its target.
+		const double ring_room = static_cast<double>(kRingFrames) - static_cast<double>(slack) - rate * kWriteGapSecs;
+		const double wanted_target = (kBaseLatencyMs + delay_ms_.load(std::memory_order_relaxed) +
+			path_offset_ms_.load(std::memory_order_relaxed)) * rate / 1000.0;
+		const UINT32 target = static_cast<UINT32>(wanted_target < ring_room ? wanted_target : (ring_room > 0.0 ? ring_room : 0.0));
 
 		// BetterFxSound: the level held at the target is the latency of the newest queued frame, in ring frames: the queue
 		// (silence still to be played included), the device's own queue (padding) and the time since that frame was
@@ -1786,6 +1798,8 @@ private:
 			fill_avg_ = level;
 			fill_avg_valid_ = true;
 			fill_avg_periods_ = 0;
+			exact_level_sum_ = 0.0;
+			exact_level_count_ = 0;
 		}
 		else
 		{
@@ -1795,21 +1809,29 @@ private:
 		}
 		// BetterFxSound: an exact alignment was asked for (requestExactAlignment()): once the averaged level has settled,
 		// the output moves by its offset, however small, as for a lasting offset below. Below kRealignErrorSecs the offset
-		// a start leaves was only taken back by the drift correction, over ~10 s.
+		// a start leaves was only taken back by the drift correction, over ~10 s. The offset is that of the level's mean
+		// over kExactAlignPeriods more periods: fill_avg_ follows the last few periods only, so moving by it left a few ms.
 		DWORD exact_tick = exact_align_tick_.load(std::memory_order_relaxed);
 		if (exact_tick != 0 && now - exact_tick > kExactAlignWindowMs)
 		{
 			exact_align_tick_.compare_exchange_strong(exact_tick, 0);
+			exact_level_sum_ = 0.0;
+			exact_level_count_ = 0;
 		}
 		else if (exact_tick != 0 && !realign_pending_ && fill_avg_periods_ >= kExactAlignPeriods)
 		{
-			if (exact_align_tick_.compare_exchange_strong(exact_tick, 0))
+			exact_level_sum_ += level;
+			exact_level_count_++;
+			if (exact_level_count_ >= kExactAlignPeriods && exact_align_tick_.compare_exchange_strong(exact_tick, 0))
 			{
-				const double offset = fill_avg_ - level_target;
+				exact_level_ = exact_level_sum_ / static_cast<double>(exact_level_count_);
+				exact_level_sum_ = 0.0;
+				exact_level_count_ = 0;
+				const double offset = exact_level_ - level_target;
 				if (offset >= kExactAlignMinSecs * rate || offset <= -kExactAlignMinSecs * rate)
 				{
 					realign_pending_ = true;
-					realign_reason_ = kRealignOffset;
+					realign_reason_ = kRealignExact;
 				}
 			}
 		}
@@ -1939,10 +1961,14 @@ private:
 				shift = static_cast<INT64>(aligned_target_) - static_cast<INT64>(target);
 			else if (realign_reason_ == kRealignJump)
 				shift = static_cast<INT64>(level + 0.5) - level_target_frames;
+			else if (realign_reason_ == kRealignExact)
+				shift = static_cast<INT64>(exact_level_ + 0.5) - level_target_frames;
 			else
 				shift = static_cast<INT64>(fill_avg_ + 0.5) - level_target_frames;
 			shiftOutput(shift, nominal);
 			fill_avg_ -= static_cast<double>(shift);	// Re-seeded instead if resetResampler() ran
+			exact_level_sum_ = 0.0;	// BetterFxSound: what was summed is from before the move
+			exact_level_count_ = 0;
 			error_avg_ = 0.0;
 			current_gain_ = 0.0f;
 			aligned_target_ = target;
@@ -2011,6 +2037,7 @@ private:
 	{
 		kRealignDelay,		// The delay moved: by the change
 		kRealignOffset,		// A lasting offset: by the averaged level's offset
+		kRealignExact,		// BetterFxSound: requestExactAlignment(): by the offset of the level's mean (exact_level_)
 		kRealignJump,		// The device stalled, far too much queued: by the level's offset now
 		kRealignReprime		// Far too little queued: build the queue up again
 	};
@@ -2094,6 +2121,9 @@ private:
 	double fill_avg_ = 0.0;			// Short average of the level (render()), silence to play included (ring frames)
 	bool fill_avg_valid_ = false;
 	UINT32 fill_avg_periods_ = 0;	// BetterFxSound: periods fill_avg_ has followed the level since it was seeded (up to kExactAlignPeriods)
+	double exact_level_sum_ = 0.0;	// BetterFxSound: the level summed over the periods of an exact alignment (render())
+	UINT32 exact_level_count_ = 0;	// BetterFxSound: periods in exact_level_sum_
+	double exact_level_ = 0.0;		// BetterFxSound: their mean, which a kRealignExact moves to the target
 	bool realign_pending_ = false;	// Fading out before the output is moved (realign_reason_)
 	RealignReason realign_reason_ = kRealignDelay;	// Why realign_pending_ was set: what the output moves by
 	double device_allowance_secs_ = -1.0;	// Device queue counted in the latency target (seconds, first openClient()), < 0 = not set
@@ -2484,6 +2514,19 @@ void MultiOutputRouter::requestExactAlignment()
 	ReleaseSRWLockShared(&lock_);
 }
 
+bool MultiOutputRouter::exactAlignmentPending()
+{
+	bool pending = false;
+	AcquireSRWLockShared(&lock_);
+	for (const auto& output : outputs_)
+	{
+		if (output != nullptr && output->exactAlignmentPending())
+			pending = true;
+	}
+	ReleaseSRWLockShared(&lock_);
+	return pending;
+}
+
 int MultiOutputRouter::alignPaths(int carrier_latency_ms)
 {
 	// Never wait on the audio thread: while the list is being changed, the last offsets stay.
@@ -2493,6 +2536,11 @@ int MultiOutputRouter::alignPaths(int carrier_latency_ms)
 	// The common latency: the largest of the carrier's and the outputs' (those not opened yet are lined up once they are).
 	int reference = carrier_latency_ms > 0 ? carrier_latency_ms : 0;
 	bool any_output = false;
+	// BetterFxSound: and the shortest. No path is delayed by more than SecondaryOutput::kMaxPathOffsetMs, the carrier's
+	// included: the reference is capped at the shortest plus that, so every path up to it still gets the same latency
+	// (a path even slower keeps its own), whichever device is the carrier. Only the outputs here were capped.
+	int shortest = carrier_latency_ms > 0 ? carrier_latency_ms : 0;
+	bool any_latency = carrier_latency_ms > 0;
 	for (const auto& output : outputs_)
 	{
 		if (output == nullptr)
@@ -2501,7 +2549,14 @@ int MultiOutputRouter::alignPaths(int carrier_latency_ms)
 		const int latency = output->pathLatencyMs();
 		if (latency > reference)
 			reference = latency;
+		if (latency >= 0 && (!any_latency || latency < shortest))
+		{
+			shortest = latency;
+			any_latency = true;
+		}
 	}
+	if (any_latency && reference > shortest + SecondaryOutput::kMaxPathOffsetMs)
+		reference = shortest + SecondaryOutput::kMaxPathOffsetMs;
 	for (const auto& output : outputs_)
 	{
 		if (output == nullptr)
@@ -2509,7 +2564,7 @@ int MultiOutputRouter::alignPaths(int carrier_latency_ms)
 		const int latency = output->pathLatencyMs();
 		output->setPathOffsetMs(latency >= 0 ? reference - latency : 0);
 	}
-	carrier_path_offset_ms_ = (any_output && carrier_latency_ms > 0) ? reference - carrier_latency_ms : 0;
+	carrier_path_offset_ms_ = (any_output && carrier_latency_ms > 0 && reference > carrier_latency_ms) ? reference - carrier_latency_ms : 0;
 
 	ReleaseSRWLockShared(&lock_);
 	return carrier_path_offset_ms_;

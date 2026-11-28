@@ -132,6 +132,9 @@ public:
 	// it. Within a few hundred ms (an output that is not playing yet does it once it plays, for a few seconds). For the
 	// delay measurement, before its first sweep. Not the audio thread (it takes the list's lock).
 	void requestExactAlignment();
+	// BetterFxSound: an output has not carried a requestExactAlignment() out yet (an output that does not play drops it
+	// after a few seconds, so this ends). Not the audio thread.
+	bool exactAlignmentPending();
 
 	/*
 	* BetterFxSound: audio thread, once per block; never blocks. Gives the carrier and the outputs here the same latency
