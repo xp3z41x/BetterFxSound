@@ -50,8 +50,11 @@ bool getDeviceVolumeById(const std::wstring& device_id, float* level, BOOL* mute
 // BetterFxSound: puts the device's own level and mute back if the engine owes them (see OwedVolume.h), then forgets
 // them. Returns false if something is owed and the device or its volume control is not available (it stays owed), or
 // if the device was taken over again meanwhile (it is then left at 100% and stays owed).
-// For devices the engine does not use (any more). Never from an audio processing or render loop.
-bool handBackOwedVolumeById(const std::wstring& device_id);
+// For devices the engine does not use (any more). Never from an audio processing or render loop. BetterFxSound: never
+// waits for a hand-back of the same device that is already running (on a render thread, possibly stuck in a driver
+// call): it then does nothing, returns false (the device stays owed) and sets *busy (if not null), so the caller tries
+// again later.
+bool handBackOwedVolumeById(const std::wstring& device_id, bool* busy = nullptr);
 
 // Rewrites an interleaved block in place for the given channel mode (no-op for Both).
 // Channel 0 is front left and channel 1 is front right in every standard layout. BetterFxSound: with more than two
@@ -75,8 +78,9 @@ void applyOutputChannelMode(float* buffer, UINT32 frames, UINT32 channels, Outpu
  *    allocates and never calls into COM.
  *  - Each output's render thread holds a reference to its output, so an output that is removed while its
  *    thread is stuck in a driver call (a Bluetooth device going away can block WASAPI calls for seconds) is
- *    never freed under it: removal waits for the threads for a bounded time, and a thread that is still busy
- *    finishes and frees its output on its own. BetterFxSound: it then leaves the device's volume to the engine's sweep
+ *    never freed under it: configure() only asks the removed outputs' threads to stop (BetterFxSound: it no longer
+ *    waits for them, which froze the UI and the timer), and a thread frees its output on its own once it exits;
+ *    stopAll() (exit) waits for them for a bounded time. BetterFxSound: it then leaves the device's volume to the engine's sweep
  *    (takeLateExits()) while the router drives its outputs, and hands it back itself while it does not.
  */
 class MultiOutputRouter
@@ -84,6 +88,10 @@ class MultiOutputRouter
 public:
 	MultiOutputRouter();
 	~MultiOutputRouter();
+
+	// BetterFxSound: alignPaths() delays a path (an output here or the carrier) by this much at most. The carrier's delay
+	// line keeps room for it, see AudioPassthruPrivate::applyMainDelay().
+	static constexpr int kMaxPathOffsetMs = 200;
 
 	// Replaces the set of secondary outputs. Outputs whose device is already open keep
 	// running (only their delay is updated), so calling this repeatedly is cheap.
@@ -157,8 +165,9 @@ private:
 	MultiOutputRouter(const MultiOutputRouter&) = delete;
 	MultiOutputRouter& operator=(const MultiOutputRouter&) = delete;
 
-	// BetterFxSound: configure() with configure_mutex_ held.
-	void configureLocked(const std::vector<AdditionalOutputConfig>& outputs);
+	// BetterFxSound: configure() with configure_mutex_ held. wait_for_removed: wait (bounded) for the removed outputs'
+	// render threads to exit (stopAll() only).
+	void configureLocked(const std::vector<AdditionalOutputConfig>& outputs, bool wait_for_removed);
 
 	mutable SRWLOCK lock_;
 	// BetterFxSound: serializes the changes of the list (configure(), retryFailedOutputs()), which build the new list

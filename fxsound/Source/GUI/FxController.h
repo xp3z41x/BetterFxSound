@@ -161,6 +161,9 @@ public:
 		String name;		// Friendly name
 		bool enabled = false;
 		bool present = true;	// False for an enabled output whose device is not connected now
+		// BetterFxSound: enabled and connected, but the audio engine cannot open its device (held by an exclusive-mode
+		// app, a driver failing): it does not play. The engine keeps retrying it.
+		bool failed = false;
 		int volume_percent = 100;	// 0 to 100, fine trim on top of the Windows master volume
 		int delay_ms = 0;			// 0 to 500
 		OutputChannelMode channel_mode = OutputChannelMode::Both;
@@ -395,6 +398,11 @@ private:
 	// BetterFxSound: a requested switch with no reinit after CARRIER_REQUEST_TIMEOUT ticks (the engine's stop
 	// request can be lost) is asked for again, up to MAX_CARRIER_REQUEST_RETRIES times, then given up on.
 	static constexpr int CARRIER_REQUEST_TIMEOUT = 10;	// 10 ticks * 100 ms = 1 s
+	// BetterFxSound: the additional outputs the engine could not open (AudioPassthru::getAdditionalOutputStatus()),
+	// sorted, read by the timer every OUTPUT_STATUS_TICKS (getOutputs() reports them as failed).
+	StringArray failed_output_ids_;
+	int output_status_ticks_ = 0;
+	static constexpr int OUTPUT_STATUS_TICKS = 10;	// 10 ticks * 100 ms = 1 s
 	static constexpr int MAX_CARRIER_REQUEST_RETRIES = 3;
 	int carrier_request_ticks_ = 0;
 	int carrier_request_retries_ = 0;
@@ -411,7 +419,8 @@ private:
 	// the delays it was measured with: applyDelayCalibrationResults() removes them, whatever the delays are by then.
 	std::map<String, int> calibration_delays_;
 	// The carrier when the measurement started, and the delay the engine actually played it with: it delays the
-	// carrier by at most MAIN_DELAY_FRAMES - 1 frames at the processing rate (about 341 ms at 192 kHz), so a larger
+	// carrier by at most MAIN_DELAY_FRAMES - 1 frames at the processing rate, less the room kept for the path offset
+	// (about 141 ms at 192 kHz, 482 ms at 96 kHz), so a larger
 	// delay is played shorter. calibration_carrier_max_delay_ms_ is the largest whole delay it plays in full.
 	String calibration_carrier_id_;
 	double calibration_carrier_delay_ms_ = 0.0;

@@ -591,12 +591,28 @@ namespace
 	// the user set if it keeps that one; nothing if the device was handed back meanwhile. Hand-backs of the same device
 	// run one at a time: one that was stuck in a driver call used to force 100% after a newer owner had already handed
 	// the device back, which left it at 100% with nothing owed.
-	bool restoreOwedVolume(const std::wstring& device_id, IMMDevice* device)
+	// BetterFxSound: wait false (the UI/timer thread): a hand-back of the device that is already running (a render thread's,
+	// stuck in a driver call for seconds on a Bluetooth device going away) is not waited for. Nothing is done, the device
+	// stays owed (false) and *busy is set: the caller tries again later. The UI and the timer froze for as long as that
+	// driver call hung.
+	bool restoreOwedVolume(const std::wstring& device_id, IMMDevice* device, bool wait, bool* busy)
 	{
+		if (busy != nullptr)
+			*busy = false;
 		if (device_id.empty())
 			return true;
 		const std::shared_ptr<std::mutex> serial = owedVolumeHandBackMutex(device_id);
-		std::lock_guard<std::mutex> serial_lock(*serial);
+		std::unique_lock<std::mutex> serial_lock(*serial, std::defer_lock);
+		if (wait)
+		{
+			serial_lock.lock();
+		}
+		else if (!serial_lock.try_lock())
+		{
+			if (busy != nullptr)
+				*busy = true;
+			return false;
+		}
 
 		unsigned generation = 0;
 		float level = 1.0f;
@@ -677,7 +693,7 @@ public:
 	static constexpr DWORD kReassertMs = 5000;                // BetterFxSound: a device's own level change this soon after the take-over is not the user's
 	static constexpr int kMaxReasserts = 3;                   // BetterFxSound: 100% set again that many times at most per take-over
 	static constexpr int kWritePhaseMs = 5;                   // BetterFxSound: half the usual write spacing (one 10 ms loopback packet), see pathLatencyMs()
-	static constexpr int kMaxPathOffsetMs = 200;              // BetterFxSound: alignPaths() delays an output by this much at most
+	static constexpr int kMaxPathOffsetMs = MultiOutputRouter::kMaxPathOffsetMs; // BetterFxSound: alignPaths() delays an output by this much at most
 	static constexpr DWORD kExactAlignWindowMs = 3000;        // BetterFxSound: requestExactAlignment() is carried out within this long, or dropped
 	static constexpr UINT32 kExactAlignPeriods = 20;          // BetterFxSound: periods the averaged level is followed before it is trusted for that
 	static constexpr double kExactAlignMinSecs = 0.0005;      // BetterFxSound: an offset smaller than this is left as it is
@@ -744,8 +760,8 @@ public:
 	// uses this object any more.
 	~SecondaryOutput()
 	{
-		// BetterFxSound: on the render thread, the output was removed while that thread was stuck in a driver call, and
-		// the router gave up waiting for it: the device may have been taken over again since (the output enabled again,
+		// BetterFxSound: on the render thread, the output was removed while that thread still ran (the router no longer
+		// waits for it, see configure(); it may have been stuck in a driver call): the device may have been taken over again since (the output enabled again,
 		// or the device made the carrier), and handing it back here undid that (the new owner then played at the device's
 		// own level times the app's gain, and its record was erased). The engine's sweep, which knows the devices in use
 		// now, hands it back instead (MultiOutputRouter::takeLateExits()). Only while the router drives its outputs: while it
@@ -768,8 +784,12 @@ public:
 		}
 		else if (started)
 		{
+			// BetterFxSound: off the render thread (the router or the UI/timer thread dropped the last reference), a hand-back
+			// of the device already running elsewhere (stuck in a driver call) is not waited for: the engine's sweep does it
+			// later (takeLateExits()).
 			std::lock_guard<std::mutex> lock(volume_mutex_);
-			handBackVolumeLocked(nullptr);
+			if (!handBackVolumeLocked(nullptr, late) && late_exits_ != nullptr)
+				late_exits_->store(true);
 		}
 
 		if (stop_event_ != NULL) CloseHandle(stop_event_);
@@ -816,14 +836,22 @@ public:
 				SetEvent(audio_event_);
 			return;
 		}
-		applyDrivenLocked(driven);
+		// BetterFxSound: a hand-back of the device already running elsewhere is not waited for either: left pending
+		// (volumeChangePending()), and applied by serviceVolume() or by the render thread once its stream no longer plays.
+		if (!applyDrivenLocked(driven, false))
+		{
+			volume_recheck_.store(true);
+			if (audio_event_ != NULL)
+				SetEvent(audio_event_);
+		}
 	}
 
 private:
 	// Takes the device over or hands it back for the engine's driving state. Caller holds volume_mutex_. BetterFxSound:
 	// a take-over whose 100% could not be set is tried again. Stopping to drive ends a level the user set meanwhile: the
-	// next take-over sets 100% again (as for the carrier).
-	void applyDrivenLocked(bool driven)
+	// next take-over sets 100% again (as for the carrier). wait: see handBackVolumeLocked(). False if the hand-back was
+	// not done because one of the same device was already running (wait false).
+	bool applyDrivenLocked(bool driven, bool wait)
 	{
 		if (driven)
 		{
@@ -832,19 +860,25 @@ private:
 				full_volume_attempts_ = 0;
 				takeOverVolumeLocked(nullptr);
 			}
+			return true;
 		}
-		else
-		{
-			user_level_ = false;
-			handBackVolumeLocked(nullptr);
-		}
+		user_level_ = false;
+		return handBackVolumeLocked(nullptr, wait);
 	}
 
 	// BetterFxSound: render thread, outside render(): a driving change that setDriven() could not apply. Not once the
-	// output is being removed: removal hands the device back (~SecondaryOutput()).
+	// output is being removed: removal hands the device back (~SecondaryOutput()). BetterFxSound: only while the stream
+	// does not play (before its first Start(), or once it stopped): the device volume work (COM, endpoint activation, the
+	// registry, the owed record's locks) takes hundreds of ms on a Bluetooth device that is connecting, and the stream
+	// underran. While it plays the change is left to the UI/timer thread (serviceVolume()); volumeChangePending() keeps the
+	// engine's sweep away from the device until then.
 	void applyDeferredDriven()
 	{
-		if (!volume_recheck_.load(std::memory_order_relaxed) || !volume_recheck_.exchange(false))
+		if (!volume_recheck_.load(std::memory_order_relaxed))
+			return;
+		if (client_ != nullptr && running_)
+			return;
+		if (!volume_recheck_.exchange(false))
 			return;
 		// BetterFxSound: never waits on this thread for the UI thread's device volume work (serviceVolume()): left pending
 		// for a later pass.
@@ -856,7 +890,7 @@ private:
 		}
 		if (stopping_.load())
 			return;
-		applyDrivenLocked(driven_ != nullptr && driven_->load());
+		applyDrivenLocked(driven_ != nullptr && driven_->load(), true);
 	}
 
 public:
@@ -868,12 +902,22 @@ public:
 	void serviceVolume(DWORD now)
 	{
 		const bool notice = volume_notice_ != nullptr && volume_notice_->load(std::memory_order_acquire);
-		if (!notice && !volume_retry_.load(std::memory_order_relaxed))
+		const bool deferred = volume_recheck_.load();
+		if (!deferred && !notice && !volume_retry_.load(std::memory_order_relaxed))
 			return;
 
 		std::unique_lock<std::mutex> lock(volume_mutex_, std::try_to_lock);
 		if (!lock.owns_lock())
 			return;
+
+		// BetterFxSound: a driving change setDriven() left pending, which the render thread no longer applies while its
+		// stream plays (applyDeferredDriven()). A hand-back of the device already running elsewhere is not waited for:
+		// tried again on a later call.
+		if (deferred && volume_recheck_.exchange(false) && !stopping_.load())
+		{
+			if (!applyDrivenLocked(driven_ != nullptr && driven_->load(), false))
+				volume_recheck_.store(true);
+		}
 
 		if (volume_retry_.load(std::memory_order_relaxed) && now - volume_retry_tick_ >= kFullVolumeRetryMs)
 		{
@@ -1561,7 +1605,9 @@ private:
 	// stays owed and is put back later (next stream open while not driven, power off, removal, or the engine's
 	// sweep of devices it does not use). Caller holds volume_mutex_. device may be null, then the device is looked
 	// up by its ID. BetterFxSound: a newer take-over of the device that ran meanwhile wins (restoreOwedVolume()).
-	void handBackVolumeLocked(IMMDevice* device)
+	// wait false (UI/timer thread): a hand-back of the same device already running elsewhere is not waited for, and false
+	// is returned (the device stays owed, the caller tries again later). True otherwise.
+	bool handBackVolumeLocked(IMMDevice* device, bool wait = true)
 	{
 		volume_taken_ = false;
 		diag_volume_taken_.store(false, std::memory_order_relaxed);
@@ -1569,7 +1615,9 @@ private:
 		full_volume_attempts_ = 0;
 		volume_retry_.store(false);
 		took_over_tick_ = 0;
-		restoreOwedVolume(device_id_, device);
+		bool busy = false;
+		restoreOwedVolume(device_id_, device, wait, &busy);
+		return !busy;
 	}
 
 	void closeClient()
@@ -2239,9 +2287,9 @@ bool getDeviceVolumeById(const std::wstring& device_id, float* level, BOOL* mute
 	});
 }
 
-bool handBackOwedVolumeById(const std::wstring& device_id)
+bool handBackOwedVolumeById(const std::wstring& device_id, bool* busy)
 {
-	return restoreOwedVolume(device_id, nullptr);
+	return restoreOwedVolume(device_id, nullptr, false, busy);
 }
 
 void applyOutputChannelMode(float* buffer, UINT32 frames, UINT32 channels, OutputChannelMode mode)
@@ -2285,16 +2333,23 @@ void applyOutputChannelMode(float* buffer, UINT32 frames, UINT32 channels, Outpu
 
 namespace
 {
-	// How long removing outputs waits, in all, for their render threads to exit. A thread still busy after that
-	// (stuck in a driver call) frees its output itself when it is done, so this only bounds the UI thread's wait.
+	// How long stopAll() (exit) waits, in all, for the removed outputs' render threads to exit. A thread still busy after
+	// that (stuck in a driver call) frees its output itself when it is done, so this only bounds the wait.
 	// BetterFxSound: such an output leaves its device's owed volume to the engine's sweep (takeLateExits()) while the router
 	// drives its outputs, and hands it back itself otherwise (~SecondaryOutput()).
 	constexpr DWORD kStopWaitMs = 2000;
 
-	void stopOutputs(std::vector<std::shared_ptr<SecondaryOutput>>& outputs)
+	// BetterFxSound: wait false (configure(), the UI/timer thread): the render threads are only asked to stop. Each holds
+	// its own reference to its output, so the output is freed on that thread once it exits, and its device's volume is
+	// handed back as above. Waiting up to kStopWaitMs here froze the UI and the timer on every output removal or carrier
+	// switch while a Bluetooth output was stuck in a driver call.
+	void stopOutputs(std::vector<std::shared_ptr<SecondaryOutput>>& outputs, bool wait)
 	{
 		for (auto& output : outputs)
 			output->requestStop();
+
+		if (!wait)
+			return;
 
 		const DWORD start = GetTickCount();
 		for (auto& output : outputs)
@@ -2321,10 +2376,10 @@ void MultiOutputRouter::configure(const std::vector<AdditionalOutputConfig>& out
 {
 	std::lock_guard<std::mutex> configure_lock(configure_mutex_);
 	configs_ = outputs;
-	configureLocked(outputs);
+	configureLocked(outputs, false);
 }
 
-void MultiOutputRouter::configureLocked(const std::vector<AdditionalOutputConfig>& outputs)
+void MultiOutputRouter::configureLocked(const std::vector<AdditionalOutputConfig>& outputs, bool wait_for_removed)
 {
 	// Fast path: same devices as now, only settings (delay, volume, channels) changed. Those
 	// are atomics, so a shared lock is enough and the audio thread keeps running untouched.
@@ -2430,14 +2485,18 @@ void MultiOutputRouter::configureLocked(const std::vector<AdditionalOutputConfig
 	current.clear();
 
 	// Stopping the render threads of removed outputs happens outside the lock so the audio thread is never held
-	// up by it. Once a thread has exited, dropping the last reference here hands the device back.
-	stopOutputs(removed);
+	// up by it. Once a thread has exited, dropping the last reference here hands the device back. BetterFxSound: only
+	// stopAll() waits for them (see stopOutputs()).
+	stopOutputs(removed, wait_for_removed);
 	removed.clear();
 }
 
 void MultiOutputRouter::stopAll()
 {
-	configure(std::vector<AdditionalOutputConfig>());
+	// BetterFxSound: at exit the threads are waited for (bounded), so the devices are handed back before the process ends.
+	std::lock_guard<std::mutex> configure_lock(configure_mutex_);
+	configs_.clear();
+	configureLocked(std::vector<AdditionalOutputConfig>(), true);
 }
 
 void MultiOutputRouter::retryFailedOutputs()
@@ -2461,7 +2520,7 @@ void MultiOutputRouter::retryFailedOutputs()
 	last_retry_tick_ = now;
 
 	// configs_ itself is not changed by configureLocked().
-	configureLocked(configs_);
+	configureLocked(configs_, false);
 }
 
 std::vector<AdditionalOutputStatus> MultiOutputRouter::getStatus() const

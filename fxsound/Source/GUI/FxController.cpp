@@ -2651,6 +2651,32 @@ void FxController::timerCallback()
 		syncPlaybackAvailability();
 	}
 
+	// BetterFxSound: an enabled output the engine cannot open (held by an exclusive-mode app, a driver failing) showed as
+	// playing while it was silent. The engine's per-output state is read here (no wait on the audio threads) and shown
+	// on the output (getOutputs()).
+	if (++output_status_ticks_ >= OUTPUT_STATUS_TICKS)
+	{
+		output_status_ticks_ = 0;
+		StringArray failed_ids;
+		for (const auto& status : audio_passthru_->getAdditionalOutputStatus())
+		{
+			if (status.failed)
+				failed_ids.add(String(status.device_id.c_str()));
+		}
+		failed_ids.sort(false);
+		bool failed_changed = false;
+		{
+			ScopedLock auto_lock(lock_);
+			if (failed_ids != failed_output_ids_)
+			{
+				failed_output_ids_ = failed_ids;
+				failed_changed = true;
+			}
+		}
+		if (failed_changed)
+			FxModel::getModel().notifyOutputListUpdated();
+	}
+
 	auto total_audio_process_time = dfx_dsp_.getTotalAudioProcessedTime();
 	if (audio_process_time_ != total_audio_process_time)
 	{
@@ -3279,6 +3305,9 @@ void FxController::setNewOutputPrioritized(bool prioritize)
 
 // BetterFxSound: size of the engine's carrier delay line in frames (AudioPassthruPrivate::kMainDelayFrames).
 static constexpr double MAIN_DELAY_FRAMES = 65536.0;
+// BetterFxSound: room the engine keeps in that line for the path offset (MultiOutputRouter::kMaxPathOffsetMs), which
+// the carrier's own delay never uses.
+static constexpr double MAIN_DELAY_OFFSET_RESERVE_MS = 200.0;
 
 // Message thread, with lock_ not held by the caller.
 bool FxController::startDelayCalibration()
@@ -3322,15 +3351,20 @@ bool FxController::startDelayCalibration()
 		}
 
 		// BetterFxSound: the engine plays the carrier's delay at the processing rate (the FxSound virtual device's)
-		// with at most MAIN_DELAY_FRAMES - 1 frames, so above about 341 ms at 192 kHz it plays less than was asked.
+		// with at most MAIN_DELAY_FRAMES - 1 frames less the room it keeps for the path offset
+		// (AudioPassthruPrivate::applyMainDelay()), so above about 141 ms at 192 kHz or 482 ms at 96 kHz it plays less
+		// than was asked.
 		calibration_carrier_id_ = carrier_id_;
 		calibration_carrier_max_delay_ms_ = 500;
 		double carrier_delay_cap_ms = 500.0;
 		if (processing_rate > 0)
 		{
-			carrier_delay_cap_ms = (MAIN_DELAY_FRAMES - 1) * 1000.0 / processing_rate;
-			// Largest whole delay whose frame count stays below MAIN_DELAY_FRAMES.
-			calibration_carrier_max_delay_ms_ = jlimit(0, 500, (int)((MAIN_DELAY_FRAMES * 1000.0 - 1.0) / processing_rate));
+			// The engine's integer arithmetic: whole frames of the reserve, whole frames of the delay.
+			const double reserve_frames = std::floor(MAIN_DELAY_OFFSET_RESERVE_MS * processing_rate / 1000.0);
+			const double own_frames = jmax(0.0, MAIN_DELAY_FRAMES - reserve_frames);	// One more than the largest the carrier's own delay gets
+			carrier_delay_cap_ms = jmax(0.0, own_frames - 1.0) * 1000.0 / processing_rate;
+			// Largest whole delay whose frame count stays below own_frames.
+			calibration_carrier_max_delay_ms_ = jlimit(0, 500, (int)((own_frames * 1000.0 - 1.0) / processing_rate));
 		}
 		auto carrier_delay = calibration_delays_.find(calibration_carrier_id_);
 		calibration_carrier_delay_ms_ = carrier_delay != calibration_delays_.end() ? jmin((double)jlimit(0, 500, carrier_delay->second), carrier_delay_cap_ms) : 0.0;
@@ -4415,10 +4449,9 @@ String FxController::applySoleOutputPreset(const String& previous_sole_id)
 }
 
 // BetterFxSound: only stores the outputs. The engine gets them from flushOutputsToEngine(), queued here,
-// with lock_ released, so lock_ is never held across the engine call. setOutputs() itself still runs on the
-// message thread and, until the engine stops removed outputs without waiting for their render threads,
-// can block it (UI and timer included) while a slow output closes. Every change is made on the message
-// thread and the flush always sends the latest outputs, so the engine gets them in order.
+// with lock_ released, so lock_ is never held across the engine call. The engine no longer waits for the render
+// threads of the outputs it removes, so a slow output closing does not hold up the message thread. Every change is
+// made on the message thread and the flush always sends the latest outputs, so the engine gets them in order.
 void FxController::pushOutputsToEngine()
 {
 	ScopedLock auto_lock(lock_);
@@ -4553,6 +4586,8 @@ std::vector<FxController::OutputState> FxController::getOutputs()
 		state.present = true;
 		if (auto* entry = findOutputEntry(state.id))
 			fill(state, *entry);
+		// BetterFxSound: only while FxSound is on: the engine opens the outputs only then.
+		state.failed = state.enabled && FxModel::getModel().getPowerState() && failed_output_ids_.contains(state.id);
 		outputs.push_back(state);
 	}
 

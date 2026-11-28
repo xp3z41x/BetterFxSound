@@ -176,6 +176,12 @@ void FxProView::updateOutputsNotice()
 	{
 		notice = sync_status_;
 	}
+	else if (counts.failed > 0)
+	{
+		// BetterFxSound: an enabled output the engine could not open (its tile says which).
+		notice = FxOutputsGrid::getFailedNotice(counts.failed);
+		colour = error_colour;
+	}
 	else
 	{
 		notice = TRANS("%1 of %2 outputs playing").replace("%1", String(counts.playing)).replace("%2", String(counts.total));

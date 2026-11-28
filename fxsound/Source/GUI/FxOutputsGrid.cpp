@@ -144,6 +144,7 @@ void FxOutputSettingsPanel::modelChanged(FxModel::Event model_event)
 		channel_list_.setSelectedId(static_cast<int>(output.channel_mode) + 1, NotificationType::dontSendNotification);
 		output_.enabled = output.enabled;
 		output_.present = output.present;
+		output_.failed = output.failed;
 		return;
 	}
 
@@ -274,6 +275,8 @@ void FxOutputsGrid::Tile::setOutput(const FxController::OutputState& output)
 	String tooltip = output_.name;
 	if (!output_.present)
 		tooltip += "\n" + TRANS("Disconnected, this output does not play");
+	else if (output_.failed)
+		tooltip += "\n" + TRANS("FxSound could not open this device, this output does not play. Another app may be using it exclusively. FxSound keeps trying.");
 	toggle_.setTooltip(tooltip);
 
 	repaint();
@@ -283,6 +286,9 @@ String FxOutputsGrid::Tile::getSummary() const
 {
 	if (!output_.present)
 		return TRANS("Disconnected");
+	// BetterFxSound: see FxController::OutputState::failed.
+	if (output_.failed)
+		return TRANS("Could not be opened");
 
 	return String(output_.volume_percent) + " %" + getSeparator()
 		+ String(output_.delay_ms) + " ms" + getSeparator()
@@ -331,7 +337,7 @@ void FxOutputsGrid::Tile::paint(Graphics& g)
 	g.setFont(theme->getNormalFont().withHeight(14.0f));
 	g.drawFittedText(output_.name, name_bounds, Justification::bottomLeft, 1, 1.0f);
 
-	if (output_.present)
+	if (output_.present && !output_.failed)
 		g.setColour(getThemeColour(FxColor::DefaultText, output_.enabled ? 0.85f : 0.6f));
 	else
 		g.setColour(getThemeColour(FxColor::InvalidTextBorder));
@@ -401,10 +407,20 @@ String FxOutputsGrid::getDisconnectedNotice()
 	return TRANS("Enabled outputs are disconnected") + String(CharPointer_UTF8(" \xe2\x80\x94 ")) + TRANS("sound is muted");
 }
 
+String FxOutputsGrid::getFailedNotice(int failed)
+{
+	if (failed == 1)
+		return TRANS("An output could not be opened. Another app may be using it exclusively.");
+	return TRANS("%1 outputs could not be opened. Another app may be using them exclusively.").replace("%1", String(failed));
+}
+
 String FxOutputsGrid::getSilenceNotice(const Counts& counts)
 {
 	if (counts.enabled == 0)
 		return getMutedNotice();
+	// BetterFxSound: connected, but none of them could be opened.
+	if (counts.playing == 0 && counts.failed > 0)
+		return getFailedNotice(counts.failed);
 	if (counts.playing == 0)
 		return getDisconnectedNotice();
 	return {};
@@ -419,7 +435,9 @@ FxOutputsGrid::Counts FxOutputsGrid::countOutputs(const std::vector<FxController
 		if (output.enabled)
 		{
 			counts.enabled++;
-			if (output.present)
+			if (output.present && output.failed)
+				counts.failed++;
+			else if (output.present)
 				counts.playing++;
 		}
 	}

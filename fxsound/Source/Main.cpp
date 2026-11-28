@@ -95,6 +95,10 @@ public:
 
     void shutdown() override
     {
+        // BetterFxSound: the user quit. A crash from here on (a thread the engine could not stop at exit) must not
+        // start FxSound again.
+        shutting_down_.store(true);
+
         if (main_window_.get() != nullptr)
         {
             FxController::getInstance().autoSaveModifiedPreset();
@@ -157,6 +161,7 @@ private:
     static constexpr int MAX_FRAMES = 64;
     static constexpr ULONGLONG MIN_UPTIME_FOR_RELAUNCH_MS = 60 * 1000;
     static inline ULONGLONG start_tick_ = 0;
+    static inline std::atomic<bool> shutting_down_{ false };	// BetterFxSound: shutdown() has begun
 
     static LONG WINAPI unhandledExceptionFilter(EXCEPTION_POINTERS* exception_info)
     {
@@ -215,6 +220,12 @@ private:
     static void relaunchAfterCrash()
     {
         auto& controller = FxController::getInstance();
+
+        if (shutting_down_.load())
+        {
+            controller.logMessage("Crashed while quitting, not relaunching\n");
+            return;
+        }
 
         if (GetTickCount64() - start_tick_ < MIN_UPTIME_FOR_RELAUNCH_MS)
         {

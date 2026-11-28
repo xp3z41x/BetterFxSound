@@ -28,7 +28,11 @@ AudioPassthru::AudioPassthru()
 
 AudioPassthru::~AudioPassthru()
 {
-	delete data_;
+	// BetterFxSound: a processing thread that could not be stopped (stuck in a WASAPI call on a hung device) still uses
+	// the engine on every block: it is left allocated on purpose rather than destroyed under that thread.
+	if (data_->shutdown())
+		delete data_;
+	data_ = nullptr;
 }
 
 int AudioPassthru::init()

@@ -101,8 +101,26 @@ AudioPassthruPrivate::AudioPassthruPrivate()
 
 AudioPassthruPrivate::~AudioPassthruPrivate()
 {
+	if (!shut_down_)
+		(void)shutdown();
+}
+
+/*
+* FUNCTION: shutdown()
+* DESCRIPTION: BetterFxSound. What the destructor did: stops the delay measurement, the additional outputs and the
+* processing thread, hands the devices back. Runs once. Returns false if the processing thread may still be running (it
+* did not stop within its timeout, stuck in a WASAPI call on a hung device): it uses this object on every block
+* (the router, the carrier's delay line, the atomics), so the object must then be left allocated (~AudioPassthru()).
+* Its members used to be destroyed under it, and the crash at exit relaunched FxSound after the user had quit it.
+*/
+bool AudioPassthruPrivate::shutdown()
+{
 	int i_result_flag;
 	int i_timed_out;
+
+	if (shut_down_)
+		return shutdown_safe_;
+	shut_down_ = true;
 
 	/* BetterFxSound: stop a running delay measurement first, before anything it uses goes. Waited for with a bound: a
 	   stream call that a device driver never returns from hung FxSound's exit (and the installer's updates) for good.
@@ -111,7 +129,7 @@ AudioPassthruPrivate::~AudioPassthruPrivate()
 		(void)calibration_.release();	// Left allocated on purpose
 
 	if (hp_sndDevices_ == NULL)
-		return;
+		return true;
 
 	/* BetterFxSound: close the additional outputs first. The router stops driving
 	   them before they are removed: an output whose render thread outlives the wait for it then hands its device back itself when it
@@ -119,13 +137,20 @@ AudioPassthruPrivate::~AudioPassthruPrivate()
 	multi_output_.setDriven(false);
 	multi_output_.stopAll();
 
-	/* If the processing thread is running, kill it */
+	/* If the processing thread is running, kill it. BetterFxSound: it could not be stopped (the capture could not be
+	   stopped, or it did not end in time): it may still run, so this object is left allocated (see above). */
 	if (killProcessingThread(&i_timed_out) != OKAY)
-		return;
+	{
+		shutdown_safe_ = false;
+		return false;
+	}
 
 	/* If the killing of processing attempt timed out, then we can't do anything else */
 	if (i_timed_out)
-		return;
+	{
+		shutdown_safe_ = false;
+		return false;
+	}
 
 	/* Disable volume callbacks before switching devices to prevent the DFX driver's
 	   volume state reset from propagating to the real speakers during shutdown. */
@@ -133,7 +158,7 @@ AudioPassthruPrivate::~AudioPassthruPrivate()
 
 	/* Change the default soundcard to not be the DFX virtual one but instead the proper real one */
 	if (sndDevicesRestoreDefaultDevice(hp_sndDevices_, &i_result_flag) != OKAY)
-		return;
+		return true;
 
 	/* BetterFxSound: anything still owed to a present device goes back on it at exit */
 	handBackUnusedDevices(std::vector<std::wstring>());
@@ -150,9 +175,10 @@ AudioPassthruPrivate::~AudioPassthruPrivate()
 
 	/* Free the data allocated inside the sndDevices_hdl (NOTE: Does not free up structure) */
 	if (sndDevicesFree(hp_sndDevices_) != OKAY)
-		return;
+		return true;
 
 	hp_sndDevices_ = NULL;
+	return true;
 }
 
 int AudioPassthruPrivate::init()
@@ -467,6 +493,14 @@ int AudioPassthruPrivate::processTimer()
 			CloseHandle(hProcessingThread_);
 			hProcessingThread_ = NULL;
 		}
+	}
+
+	/* BetterFxSound: an owed device the last sweep left because a hand-back of it was already running elsewhere
+	   (handBackUnusedDevices()) is looked at again, once a second at most, whatever the engine's state */
+	if (hand_back_retry_ && (GetTickCount() - hand_back_retry_tick_) >= kHandBackRetryMs)
+	{
+		hand_back_retry_ = false;
+		applyAdditionalOutputs();
 	}
 
 	/* BetterFxSound: an output change that arrived during a delay measurement is applied once its sweeps are recorded
@@ -1283,6 +1317,12 @@ void AudioPassthruPrivate::applyAdditionalOutputs()
 	bool carrier_keeps_users_level = false;	// BetterFxSound: the user set the carrier's own level meanwhile, it is kept
 	std::vector<std::wstring> in_use;	// Devices the engine drives now: what is owed to them stays owed
 
+	/* BetterFxSound: the router is given its new list after config_mutex_ is released (below), so this keeps the changes
+	   in order: the router always ends with the list effective_outputs_ holds (the delay measurement relies on it). */
+	std::unique_lock<std::mutex> router_lock(router_mutex_);
+	bool configure_router = false;
+	std::vector<AdditionalOutputConfig> router_outputs;
+
 	{
 		std::lock_guard<std::mutex> lock(config_mutex_);
 
@@ -1410,8 +1450,9 @@ void AudioPassthruPrivate::applyAdditionalOutputs()
 
 			// The carrier can still be one of the router's outputs here: a carrier switch during a measurement is
 			// left out of the router only now, after the reinit took the device over as the carrier. Removing that
-			// output hands the device's own level back, so the carrier takes it over again below, after the router
-			// change (the COM calls run after this block).
+			// output may hand the device's own level back, so the carrier takes it over again below, after the router
+			// change (the COM calls run after this block). BetterFxSound: a removed output whose render thread exits
+			// later leaves the device to the engine's sweep, which keeps the carrier's device (in use).
 			bool carrier_was_routed = false;
 			for (const auto& output : effective_outputs_)
 			{
@@ -1422,7 +1463,10 @@ void AudioPassthruPrivate::applyAdditionalOutputs()
 			apply_pending_ = false;
 			effective_outputs_ = effective;
 			routed_carrier_id_ = carrier_id;
-			multi_output_.configure(effective);
+			/* BetterFxSound: the router is changed after the lock is released: it creates the new outputs' rings and
+			   threads, and config_mutex_ is taken by the timer and the controller's calls meanwhile */
+			configure_router = true;
+			router_outputs = effective;
 
 			if (carrier_was_routed && carrier_plays && processing && !handed_back_ && carrier_setting_saved)
 			{
@@ -1453,7 +1497,7 @@ void AudioPassthruPrivate::applyAdditionalOutputs()
 		* BetterFxSound: a carrier that starts playing while its device is still to be set to 100% (it was handed back
 		* when it was disabled, or the reinit just saved its own level) is held silent until that is done, after the
 		* lock: it faded in at its own level times the app's gain, then jumped up when the device got to 100% (after the
-		* router change, which may wait for outputs being removed). One that already plays keeps playing.
+		* router change). One that already plays keeps playing.
 		*/
 		if (carrier_plays)
 		{
@@ -1475,6 +1519,12 @@ void AudioPassthruPrivate::applyAdditionalOutputs()
 		if (!set_full_volume_id.empty() && !carrier_keeps_users_level)
 			s_sndDevices_.playbackTakeOversPending++;
 	}
+
+	/* BetterFxSound: never waits for removed outputs (their render threads stop and hand their devices back on their own,
+	   see MultiOutputRouter::configure()), so a removal no longer holds up the caller (the UI and the timer) */
+	if (configure_router)
+		multi_output_.configure(router_outputs);
+	router_lock.unlock();
 
 	/*
 	* COM calls, outside the lock. The change is tagged with this app's GUID, so the playback volume callback
@@ -1615,9 +1665,11 @@ void AudioPassthruPrivate::handBackUnusedDevices(const std::vector<std::wstring>
 	const std::vector<std::wstring> pending = multi_output_.pendingVolumeDevices();
 
 	bool handed_back;
+	bool parked;
 	{
 		std::lock_guard<std::mutex> lock(config_mutex_);
 		handed_back = handed_back_;
+		parked = parked_;
 	}
 
 	for (const auto& id : owedVolumeDevices())
@@ -1628,16 +1680,29 @@ void AudioPassthruPrivate::handBackUnusedDevices(const std::vector<std::wstring>
 			continue;
 		if (!isDevicePresent(id))
 			continue;
+		/* BetterFxSound: a hand-back of the device that is already running (a render thread's, possibly stuck in a driver
+		   call) is not waited for here: the device stays owed and the sweep runs again shortly (processTimer()) */
+		bool busy = false;
+		const bool done = handBackOwedVolumeById(id, &busy);
+		if (busy)
+		{
+			hand_back_retry_ = true;
+			hand_back_retry_tick_ = GetTickCount();
+		}
 		/* BetterFxSound: the carrier's device handed back here (parked, or the carrier output turned off) is no longer
 		   held at 100%, nor at a level the user set meanwhile: the next take-over sets 100% again */
-		if (handBackOwedVolumeById(id) && s_sndDevices_.playbackSettingsAreSaved && id == s_sndDevices_.savedPlaybackDeviceID)
+		if (done && s_sndDevices_.playbackSettingsAreSaved && id == s_sndDevices_.savedPlaybackDeviceID)
 		{
 			s_sndDevices_.engineTookOverPlaybackTick = 0;
 			s_sndDevices_.playbackLevelIsUsers = FALSE;
 			/* BetterFxSound: while FxSound is off (the carrier could not be handed back at power off, and is back now) the
 			   setting is no longer kept as saved either, as after a hand-back at power off: the next power on reads the
-			   device's own setting afresh, instead of putting this one back over what the user sets meanwhile */
-			if (handed_back)
+			   device's own setting afresh, instead of putting this one back over what the user sets meanwhile.
+			   BetterFxSound: also while parked (the last reinit failed): the device plays the apps directly at its own
+			   level, which the user may change, possibly with no callback tracking it (the failed reinit may have released
+			   it). The next successful reinit kept the stale setting and recorded it as owed (a later hand-back put the
+			   pre-park level back), or, on another carrier, put it back on this device a second time. */
+			if (handed_back || parked)
 			{
 				s_sndDevices_.playbackSettingsAreSaved = FALSE;
 				s_sndDevices_.playbackCallbackIsOnSavedDevice = FALSE;
@@ -1728,11 +1793,21 @@ void AudioPassthruPrivate::applyMainDelay(float* buffer, UINT32 frames, UINT32 c
 		return;
 	}
 
-	// BetterFxSound: plus the offset that lines the carrier's path up with the additional outputs' (threadWorker()).
-	const int delay_ms = main_delay_ms_.load(std::memory_order_relaxed) + (carrier_path_offset_ms_ > 0 ? carrier_path_offset_ms_ : 0);
-	UINT32 delay_frames = (UINT32)((UINT64)(delay_ms > 0 ? delay_ms : 0) * sample_rate / 1000);
-	if (delay_frames >= kMainDelayFrames)
-		delay_frames = kMainDelayFrames - 1;
+	// BetterFxSound: plus the offset that lines the carrier's path up with the additional outputs' (threadWorker()). The
+	// carrier's own delay is capped first, leaving room in the line for the largest offset (MultiOutputRouter::kMaxPathOffsetMs):
+	// capping the sum cut the carrier's own delay short by whatever offset the paths had at the time, so the carrier fell
+	// out of the alignment the offset is for, and a measurement subtracted a delay larger than the one played. The
+	// controller caps a measured carrier delay the same way (FxController::startDelayCalibration()).
+	const UINT64 offset_reserve_frames = (UINT64)MultiOutputRouter::kMaxPathOffsetMs * sample_rate / 1000;
+	const UINT64 own_cap_frames = ((UINT64)kMainDelayFrames - 1 > offset_reserve_frames) ? (UINT64)kMainDelayFrames - 1 - offset_reserve_frames : 0;
+	const int own_delay_ms = main_delay_ms_.load(std::memory_order_relaxed);
+	UINT64 own_frames = (UINT64)(own_delay_ms > 0 ? own_delay_ms : 0) * sample_rate / 1000;
+	if (own_frames > own_cap_frames)
+		own_frames = own_cap_frames;
+	UINT64 total_frames = own_frames + (UINT64)(carrier_path_offset_ms_ > 0 ? carrier_path_offset_ms_ : 0) * sample_rate / 1000;
+	if (total_frames >= kMainDelayFrames)
+		total_frames = kMainDelayFrames - 1;
+	UINT32 delay_frames = (UINT32)total_frames;
 
 	// A new format invalidates what is stored, start over with silence.
 	UINT32 format = (sample_rate << 4) | channels;
@@ -1844,6 +1919,8 @@ bool AudioPassthruPrivate::startDelayCalibration()
 	std::vector<DelayCalibration::Target> targets;
 	std::wstring no_targets_error;
 	{
+		// BetterFxSound: router_mutex_ too, so the router's list is the one effective_outputs_ holds (applyAdditionalOutputs()).
+		std::lock_guard<std::mutex> router_lock(router_mutex_);
 		std::lock_guard<std::mutex> lock(config_mutex_);
 
 		// The carrier is measured only if it is enabled, and is not necessarily the first result. Each target

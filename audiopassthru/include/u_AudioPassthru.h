@@ -44,6 +44,9 @@ class AudioPassthruPrivate
 public:
 	AudioPassthruPrivate();
 	~AudioPassthruPrivate();
+	// BetterFxSound: stops everything and hands the devices back (the destructor runs it if it was not called). False if
+	// the processing thread may still be running: the object must then never be destroyed (~AudioPassthru()).
+	bool shutdown();
 	int init();
 	void mute(bool mute);
 	std::vector<SoundDevice> getSoundDevices(bool active_devices = true);
@@ -132,6 +135,9 @@ private:
 	// BetterFxSound: requested outputs (UI/timer threads only, guarded by config_mutex_, never
 	// touched by the audio threads).
 	std::mutex config_mutex_;
+	// BetterFxSound: held by applyAdditionalOutputs() from building the router's list until the router has it, which it
+	// gets after config_mutex_ is released; taken before config_mutex_. UI/timer threads only.
+	std::mutex router_mutex_;
 	std::vector<OutputConfig> outputs_;			// As passed to setOutputs(), carrier included
 	std::wstring pending_carrier_id_;			// Asked for by setAsPlaybackDevice(), until the next reinit
 	bool apply_pending_ = false;				// A change arrived during a measurement, apply it afterwards
@@ -150,7 +156,14 @@ private:
 	// take-over (sndDevicesHdlType::playbackFullVolumeReassert), since that take-over. UI/timer thread only.
 	int carrier_reasserts_ = 0;
 	static constexpr int kCarrierReasserts = 3;
+	// BetterFxSound: handBackUnusedDevices() left an owed device because a hand-back of it was already running elsewhere
+	// (it does not wait for one): processTimer() runs the sweep again after kHandBackRetryMs. UI/timer thread only.
+	bool hand_back_retry_ = false;
+	DWORD hand_back_retry_tick_ = 0;
+	static constexpr DWORD kHandBackRetryMs = 1000;
 	static constexpr DWORD kCalibrationExitWaitMs = 5000;	// BetterFxSound: ~AudioPassthruPrivate() waits this long for a delay measurement
+	bool shut_down_ = false;					// BetterFxSound: shutdown() ran
+	bool shutdown_safe_ = true;					// BetterFxSound: and the processing thread is known to have ended
 	bool handed_back_ = false;					// restoreDefaultPlaybackDevice() called, until processing starts again
 	bool parked_ = false;						// The last reinit failed, until one succeeds or power off
 	std::wstring failed_carrier_id_;			// Carrier reported as failed (getFailedCarrierId()), until a reinit succeeds

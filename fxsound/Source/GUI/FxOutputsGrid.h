@@ -94,12 +94,14 @@ public:
 	void setColumns(int columns);
 	void setMaxVisibleRows(int rows);
 
-	// Outputs that are enabled, and outputs that really play (enabled and connected).
+	// Outputs that are enabled, and outputs that really play (enabled and connected). BetterFxSound: an output whose
+	// device the engine could not open (FxController::OutputState::failed) counts as failed, not as playing.
 	struct Counts
 	{
 		int total = 0;
 		int enabled = 0;
 		int playing = 0;
+		int failed = 0;
 	};
 	static Counts countOutputs(const std::vector<FxController::OutputState>& outputs);
 	// Counts from the tiles, so they include a click whose OutputListUpdated is still pending.
@@ -124,6 +126,8 @@ public:
 	// Short texts shared by the views that show the grid.
 	static String getMutedNotice();
 	static String getDisconnectedNotice();
+	// BetterFxSound: some enabled outputs could not be opened (count of them).
+	static String getFailedNotice(int failed);
 	// The muted or disconnected notice for these counts, empty when something plays.
 	static String getSilenceNotice(const Counts& counts);
 	static String getChannelModeText(OutputChannelMode channel_mode);
