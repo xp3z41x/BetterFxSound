@@ -2145,13 +2145,16 @@ void FxController::powerOn(bool on)
 		// BetterFxSound: handed back once per stop. Already off (a session event, or setPowerState() at init or
 		// unlock calling here again), another hand-back would make the device it picks the Windows default again,
 		// over a default the user chose meanwhile. Done again only while the virtual device is the Windows default
-		// (nothing would be heard).
+		// (nothing would be heard). The default is read from Windows: the engine's cached default is not updated
+		// when the virtual device itself becomes the default.
 		bool hand_back = was_processing || !engine_handed_back_;
 		if (!hand_back)
 		{
+			const std::wstring default_id = SysInfo::getDefaultAudioOutputId();
 			for (const auto& device : audio_passthru_->getSoundDevices(false))
 			{
-				if (device.isDFXDevice && device.isDefaultDevice)
+				if (device.isDFXDevice &&
+					(default_id.empty() ? device.isDefaultDevice : device.pwszID == default_id))
 				{
 					hand_back = true;
 					break;

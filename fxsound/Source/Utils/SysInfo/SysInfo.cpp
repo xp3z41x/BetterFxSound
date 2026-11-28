@@ -67,6 +67,34 @@ void SysInfo::enumAudioOutputs(StringArray& audioOutputNames)
 	pEnumerator->Release();
 }
 
+std::wstring SysInfo::getDefaultAudioOutputId()
+{
+	std::wstring device_id;
+	IMMDeviceEnumerator *pEnumerator = NULL;
+
+	HRESULT hRes = CoCreateInstance(__uuidof(MMDeviceEnumerator), NULL,
+		CLSCTX_ALL, __uuidof(IMMDeviceEnumerator),
+		(void**)&pEnumerator);
+	if (FAILED(hRes) || pEnumerator == NULL)
+		return device_id;
+
+	IMMDevice *pDevice = NULL;
+	hRes = pEnumerator->GetDefaultAudioEndpoint(eRender, eMultimedia, &pDevice);
+	if (SUCCEEDED(hRes) && pDevice != NULL)
+	{
+		LPWSTR pwszID = NULL;
+		if (SUCCEEDED(pDevice->GetId(&pwszID)) && pwszID != NULL)
+		{
+			device_id = pwszID;
+			CoTaskMemFree(pwszID);
+		}
+		pDevice->Release();
+	}
+
+	pEnumerator->Release();
+	return device_id;
+}
+
 String SysInfo::getAudioOutputName(IMMDevice *pDevice)
 {
 	String audioOutputName;

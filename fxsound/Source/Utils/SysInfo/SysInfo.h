@@ -28,6 +28,9 @@ public:
 	~SysInfo() = default;
 
 	static void enumAudioOutputs(StringArray& audioOutputNames);
+	// BetterFxSound: id of the Windows default playback device (eRender, eMultimedia) as Windows reports it now,
+	// empty if it cannot be read.
+	static std::wstring getDefaultAudioOutputId();
     static bool isServiceRunning(LPCWSTR service_name);
     static bool canSupportHotkeys();
 	static bool isRemoteSession();
