@@ -111,6 +111,9 @@ public:
 	void registerCallback(AudioPassthruCallback *callback);
     bool isPlaybackDeviceAvailable();
 	bool checkDeviceChanges();
+	// BetterFxSound: true while a carrier switch asked for with setAsPlaybackDevice() waits for the
+	// reinit that takes it. Until then the carrier reported by getSoundDevices() is still the old one.
+	bool isCarrierSwitchPending();
 	void restoreDefaultPlaybackDevice();
 	// BetterFxSound: the whole desired set of outputs, carrier included. The carrier is still
 	// chosen with setAsPlaybackDevice(). If the carrier is missing from the list or is disabled,

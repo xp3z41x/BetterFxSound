@@ -109,7 +109,7 @@ int PT_DECLSPEC sndDevicesInit(PT_HANDLE *hp_sndDevices, CSlout *hp_slout, int i
 	InterlockedExchange(&(cast_handle->deviceListIsStale), 0);
 	cast_handle->channelCacheCount = 0;
 	cast_handle->activeDeviceIsUnprobed = FALSE;
-	cast_handle->channelProbeRetries = 0;
+	InterlockedExchange(&(cast_handle->channelProbeIsPending), 0);
 	cast_handle->lastEnumerationTick = 0;
 	wcscpy(cast_handle->requestedPlaybackID, L"");
 	cast_handle->outputsAreManaged = FALSE;

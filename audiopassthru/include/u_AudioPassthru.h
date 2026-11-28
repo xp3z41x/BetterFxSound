@@ -56,6 +56,7 @@ public:
 	void registerCallback(AudioPassthruCallback *callback);
     bool isPlaybackDeviceAvailable();
 	bool checkDeviceChanges();
+	bool isCarrierSwitchPending();
 	void restoreDefaultPlaybackDevice();
 	void setOutputs(const std::vector<OutputConfig>& outputs);
 	bool startDelayCalibration();

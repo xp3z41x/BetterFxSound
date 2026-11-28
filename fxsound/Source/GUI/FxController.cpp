@@ -1642,12 +1642,17 @@ void FxController::updateOutputs(std::vector<SoundDevice>& sound_devices, const 
 	{
 		// A switch asked for with setAsPlaybackDevice(). If the engine did not take it although the device
 		// is there, don't ask for it again until the devices change, so this can't loop.
-		if (engine_carrier_id != requested_carrier_id_ && findActiveOutput(requested_carrier_id_) != nullptr)
+		// BetterFxSound: only judged after the reinit that takes the request. A device list refresh can come
+		// first, still naming the old carrier: that blacklisted the requested carrier until the devices changed.
+		if (!audio_passthru_->isCarrierSwitchPending())
 		{
-			logMessage("Output switch not taken by the audio engine: " + requested_carrier_id_);
-			failed_carrier_ids_.addIfNotAlreadyThere(requested_carrier_id_);
+			if (engine_carrier_id != requested_carrier_id_ && findActiveOutput(requested_carrier_id_) != nullptr)
+			{
+				logMessage("Output switch not taken by the audio engine: " + requested_carrier_id_);
+				failed_carrier_ids_.addIfNotAlreadyThere(requested_carrier_id_);
+			}
+			requested_carrier_id_.clear();
 		}
-		requested_carrier_id_.clear();
 	}
 	else if (engine_carrier_id.isNotEmpty() && engine_carrier_id != carrier_id_ && !list_changed && !hdmi_reconnect_pending_)
 	{

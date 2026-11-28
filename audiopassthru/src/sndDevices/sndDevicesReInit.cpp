@@ -385,6 +385,12 @@ int PT_DECLSPEC sndCheckDeviceChanges(PT_HANDLE* hp_sndDevices, BOOL* bp_deviceC
 	hr = pCollectionAllDevices->GetCount(&deviceCount);
 	if (FAILED(hr)) SND_DEVICES_SET_STATUS_AND_RETURN_OK(SND_DEVICES_GETCOUNT_FAILED)
 
+	// BetterFxSound: sndDevices_GetAll() lists only the first SND_DEVICES_MAX_NUM_DEVICES endpoints, so only those are
+	// compared. With more, the count always differed and the endpoints past the limit were never found in the list: the
+	// list was read again on every tick, and stopped the processing on every check when one of them was the virtual device.
+	if (deviceCount > SND_DEVICES_MAX_NUM_DEVICES)
+		deviceCount = SND_DEVICES_MAX_NUM_DEVICES;
+
 	// A different count means a device was added or removed (which one is found below).
 	if (deviceCount != (UINT)listed_count)
 	{
@@ -457,6 +463,11 @@ int PT_DECLSPEC sndCheckDeviceChanges(PT_HANDLE* hp_sndDevices, BOOL* bp_deviceC
 	// the timer refresh the outputs on every tick.
 	for (j = 0; j < listed_count; j++)
 	{
+		// BetterFxSound: an entry sndDevices_GetAll() could not read has an empty ID and names no device. If its device
+		// can be read now, it was not found in the list above, which reports the difference.
+		if (cast_handle->pwszID[j][0] == L'\0')
+			continue;
+
 		if (!listed_seen[j])
 		{
 			*bp_deviceChanged = TRUE;
@@ -491,11 +502,13 @@ int PT_DECLSPEC sndCheckDeviceChanges(PT_HANDLE* hp_sndDevices, BOOL* bp_deviceC
 
 /*
 * FUNCTION: sndDevicesGetChannelProbeIsDue()
-* DESCRIPTION: BetterFxSound. TRUE when the last enumeration found an active device whose channel count it could not
-* read (and had not read before), at least SND_DEVICES_CHANNEL_PROBE_INTERVAL_MS ago, and fewer than
-* SND_DEVICES_MAX_CHANNEL_PROBE_RETRIES enumerations in a row did so. Its count is then read again: such a device
-* (being reconfigured as it arrives) is left out of the outputs while its count is unknown, and no notification
-* follows once its format can be read. A device that keeps failing is no longer retried, until another change.
+* DESCRIPTION: BetterFxSound. TRUE when the last enumeration, at least SND_DEVICES_CHANNEL_PROBE_INTERVAL_MS ago, found
+* an active device whose channel count it could not read (and had not read before), and that fewer than
+* SND_DEVICES_MAX_CHANNEL_PROBE_RETRIES due probes have tried to read (counted per device, channelCacheProbeRetries).
+* Its count is then read again: such a device (being reconfigured as it arrives) is left out of the outputs while its
+* count is unknown, and no notification follows once its format can be read. A device that keeps failing is no longer
+* retried until it stops being active (or its count is read); another device still gets its own retries. A TRUE result
+* marks the probe pending, so the next enumeration (the one the caller makes the timer start) counts as a retry.
 */
 int PT_DECLSPEC sndDevicesGetChannelProbeIsDue(PT_HANDLE* hp_sndDevices, BOOL* bp_isDue)
 {
@@ -507,12 +520,13 @@ int PT_DECLSPEC sndDevicesGetChannelProbeIsDue(PT_HANDLE* hp_sndDevices, BOOL* b
 	if (cast_handle == NULL)
 		return(NOT_OKAY);
 
-	if (!cast_handle->activeDeviceIsUnprobed || (cast_handle->channelProbeRetries >= SND_DEVICES_MAX_CHANNEL_PROBE_RETRIES))
+	if (!cast_handle->activeDeviceIsUnprobed)
 		return(OKAY);
 
 	if ((GetTickCount() - cast_handle->lastEnumerationTick) < (DWORD)SND_DEVICES_CHANNEL_PROBE_INTERVAL_MS)
 		return(OKAY);
 
+	InterlockedExchange(&(cast_handle->channelProbeIsPending), 1);
 	*bp_isDue = TRUE;
 	return(OKAY);
 }

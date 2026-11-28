@@ -435,11 +435,15 @@ struct sndDevicesHdlType {
 	// made it look absent to the controller.
 	WCHAR channelCacheID[SND_DEVICES_MAX_NUM_DEVICES][PT_MAX_GENERIC_STRLEN];
 	int channelCacheNumChannel[SND_DEVICES_MAX_NUM_DEVICES];
+	// BetterFxSound: per device, how many enumerations started by a due probe could not read its channel count yet.
+	int channelCacheProbeRetries[SND_DEVICES_MAX_NUM_DEVICES];
 	int channelCacheCount;
-	// BetterFxSound: TRUE when the last enumeration found an active device whose channel count it could not read. The
-	// list is then read again (sndDevicesGetChannelProbeIsDue()); channelProbeRetries counts such enumerations in a row.
+	// BetterFxSound: TRUE when the last enumeration found an active device whose channel count it never read, and that
+	// is still under SND_DEVICES_MAX_CHANNEL_PROBE_RETRIES. The list is then read again (sndDevicesGetChannelProbeIsDue()).
 	BOOL activeDeviceIsUnprobed;
-	int channelProbeRetries;
+	// BetterFxSound: set by sndDevicesGetChannelProbeIsDue() when it reports a probe as due, consumed by the next
+	// enumeration, which alone counts as a retry (not the GUI's, a reinit loop pass or a notification's refresh).
+	volatile LONG channelProbeIsPending;
 	DWORD lastEnumerationTick;	// GetTickCount() at the end of the last sndDevices_GetAll()
 	// BetterFxSound: the carrier the controller asked for (sndDevicesRequestTargetedPlaybackDevice()). The next run of the
 	// device rules takes it first, and consumes it.

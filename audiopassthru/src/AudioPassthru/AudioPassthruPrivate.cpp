@@ -765,6 +765,18 @@ bool AudioPassthruPrivate::checkDeviceChanges()
         return false;
 }
 
+/*
+* FUNCTION: isCarrierSwitchPending()
+* DESCRIPTION: BetterFxSound. True from setTargetedRealPlaybackDevice() asking for another carrier until the next reinit
+* (which takes the request, or fails). The device list can be read and reported to the controller in between (a refresh
+* by the timer), still naming the old carrier: the controller must not take that as the request being refused.
+*/
+bool AudioPassthruPrivate::isCarrierSwitchPending()
+{
+	std::lock_guard<std::mutex> lock(config_mutex_);
+	return !pending_carrier_id_.empty();
+}
+
 void AudioPassthruPrivate::restoreDefaultPlaybackDevice()
 {
 	int i_resultFlag;

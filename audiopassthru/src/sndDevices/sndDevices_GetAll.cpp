@@ -164,18 +164,21 @@ int PT_DECLSPEC sndDevices_GetAll(PT_HANDLE* hp_sndDevices, int* ip_num_devices)
 	return(i_return);
 }
 
-// BetterFxSound: the channel count the previous enumeration read for this device ID, 0 if none.
-static int sndDevices_GetAllCachedNumChannel(struct sndDevicesHdlType* cast_handle, const wchar_t* wcp_ID)
+// BetterFxSound: the index of this device ID in the channel cache written by the previous enumeration, -1 if none.
+static int sndDevices_GetAllFindCachedID(struct sndDevicesHdlType* cast_handle, const wchar_t* wcp_ID)
 {
 	int k;
+
+	if (wcp_ID[0] == L'\0')
+		return(-1);
 
 	for (k = 0; (k < cast_handle->channelCacheCount) && (k < SND_DEVICES_MAX_NUM_DEVICES); k++)
 	{
 		if (wcscmp(cast_handle->channelCacheID[k], wcp_ID) == 0)
-			return(cast_handle->channelCacheNumChannel[k]);
+			return(k);
 	}
 
-	return(0);
+	return(-1);
 }
 
 // BetterFxSound: an enumeration that stops part way keeps only the entries it has read completely, so the list never
@@ -206,7 +209,10 @@ static int sndDevices_GetAllDevices(PT_HANDLE* hp_sndDevices, int* ip_num_device
 	int i_found_dfx_string;
 	int resultFlag;
 	int known_num_channel[SND_DEVICES_MAX_NUM_DEVICES];	// BetterFxSound: channel counts actually read (or kept), 0 if not
+	int probe_retries[SND_DEVICES_MAX_NUM_DEVICES];		// BetterFxSound: per device, see channelCacheProbeRetries
+	int cache_index;
 	BOOL b_active_device_is_unprobed;
+	BOOL b_is_probe;
 
 	EDataFlow flow = eRender;
 	ERole role = eMultimedia;
@@ -232,6 +238,7 @@ static int sndDevices_GetAllDevices(PT_HANDLE* hp_sndDevices, int* ip_num_device
 			cast_handle->pAllDevices[i] = NULL;
 		}
 		known_num_channel[i] = 0;
+		probe_retries[i] = 0;
 	}
 	cast_handle->pCaptureDevice = NULL;
 	cast_handle->pPlaybackDevice = NULL;
@@ -239,6 +246,10 @@ static int sndDevices_GetAllDevices(PT_HANDLE* hp_sndDevices, int* ip_num_device
 	// BetterFxSound: nor does the default index of an earlier list survive an enumeration that stops part way. The device
 	// notification callbacks cannot publish it meanwhile (enumerationSequence is odd).
 	cast_handle->defaultDeviceNum = SND_DEVICES_DEVICE_NOT_PRESENT;
+
+	// BetterFxSound: whether this enumeration was asked for by a due channel probe (sndDevicesGetChannelProbeIsDue()).
+	// Only such an enumeration counts as a retry for a device whose channel count is still unknown.
+	b_is_probe = (InterlockedExchange(&(cast_handle->channelProbeIsPending), 0) != 0);
 
 	// BetterFxSound: the list of previous real devices, for the new device rule, is no longer copied here: any enumeration
 	// (the GUI's, a refresh) hid a device added since the last reinit from it. sndDevicesImplementDeviceRules() keeps it.
@@ -272,7 +283,6 @@ static int sndDevices_GetAllDevices(PT_HANDLE* hp_sndDevices, int* ip_num_device
 		for (k = 0; k < SND_DEVICES_MAX_NUM_DEVICES; k++)
 			cast_handle->pwszIDRealDevices[k] = NULL;
 		cast_handle->activeDeviceIsUnprobed = FALSE;
-		cast_handle->channelProbeRetries = 0;
 		cast_handle->lastEnumerationTick = GetTickCount();
 		return(OKAY);
 	}
@@ -296,45 +306,52 @@ static int sndDevices_GetAllDevices(PT_HANDLE* hp_sndDevices, int* ip_num_device
 
 	for (i = 0; i < deviceCount; i++)
 	{
-		hr = pCollectionAllDevices->Item(i, &(cast_handle->pAllDevices[i]));
-		if (FAILED(hr))
-		{
-			sndDevices_GetAllKeepEntries(cast_handle, ip_num_devices, (int)i);
-			CoTaskMemFree(pwszIDdefault);
-			SND_DEVICES_SET_STATUS_AND_RETURN_OK(SND_DEVICES_GET_INDEXED_DEVICE_FAILED);
-		}
-
-		// Get and store the endpoint ID string for this device.
-		LPWSTR pID = NULL;
-		cast_handle->pwszID[i][0] = L'\0';
-		hr = cast_handle->pAllDevices[i]->GetId(&pID);
-		if (FAILED(hr) || (pID == NULL))
-		{
-			sndDevices_GetAllKeepEntries(cast_handle, ip_num_devices, (int)i);
-			CoTaskMemFree(pwszIDdefault);
-			SND_DEVICES_SET_STATUS_AND_RETURN_OK(SND_DEVICES_GETID_FAILED);
-		}
-		wcscpy_s(cast_handle->pwszID[i], PT_MAX_GENERIC_STRLEN, pID);
-		CoTaskMemFree(pID);
-
 		// BetterFxSound: every field of the entry is written on every path below, so it never keeps another device's
-		// values from an earlier enumeration: its state first (sndCheckDeviceChanges() compares it with the system and
-		// would report a stale one as a change on every comparison), then what is written when a property is missing.
-		if (FAILED(cast_handle->pAllDevices[i]->GetState(&cast_handle->deviceState[i])))
-			cast_handle->deviceState[i] = 0;
+		// values from an earlier enumeration. An endpoint that cannot be read (being removed while the list is read)
+		// keeps an empty ID and state 0, and the enumeration goes on: stopping there cut the list short, so a carrier or
+		// virtual device listed after it looked gone (a reinit, a dropout on every output). An entry with an empty ID is
+		// no device: lookups by ID never match it, and it is not listed to the controller nor as a real device.
+		cast_handle->pwszID[i][0] = L'\0';
+		cast_handle->deviceState[i] = 0;
 		wcscpy_s(cast_handle->deviceFriendlyName[i], PT_MAX_GENERIC_STRLEN, L"Unknown");
 		wcscpy_s(cast_handle->deviceDescription[i], PT_MAX_GENERIC_STRLEN, L"Unknown");
 		wcscpy_s(cast_handle->deviceFormFactor[i], PT_MAX_GENERIC_STRLEN, L"Unknown");
 		cast_handle->deviceNumChannel[i] = 1;
 
+		hr = pCollectionAllDevices->Item(i, &(cast_handle->pAllDevices[i]));
+		if (FAILED(hr) || (cast_handle->pAllDevices[i] == NULL))
+		{
+			cast_handle->pAllDevices[i] = NULL;
+			continue;
+		}
+
+		// Get and store the endpoint ID string for this device.
+		LPWSTR pID = NULL;
+		hr = cast_handle->pAllDevices[i]->GetId(&pID);
+		if (FAILED(hr) || (pID == NULL))
+		{
+			CoTaskMemFree(pID);
+			continue;
+		}
+		wcscpy_s(cast_handle->pwszID[i], PT_MAX_GENERIC_STRLEN, pID);
+		CoTaskMemFree(pID);
+
+		// BetterFxSound: its state first (sndCheckDeviceChanges() compares it with the system and would report a stale
+		// one as a change on every comparison). A property that cannot be read leaves the values written above; the
+		// channel count and the probe retries the previous enumeration had for this device are kept then.
+		if (FAILED(cast_handle->pAllDevices[i]->GetState(&cast_handle->deviceState[i])))
+			cast_handle->deviceState[i] = 0;
+		cache_index = sndDevices_GetAllFindCachedID(cast_handle, cast_handle->pwszID[i]);
+		if (cache_index >= 0)
+		{
+			known_num_channel[i] = cast_handle->channelCacheNumChannel[cache_index];
+			probe_retries[i] = cast_handle->channelCacheProbeRetries[cache_index];
+		}
+
 		// Access the registry properties for this device.
 		hr = cast_handle->pAllDevices[i]->OpenPropertyStore(STGM_READ, &pProps);
 		if (FAILED(hr))
-		{
-			sndDevices_GetAllKeepEntries(cast_handle, ip_num_devices, (int)i);
-			CoTaskMemFree(pwszIDdefault);
-			SND_DEVICES_SET_STATUS_AND_RETURN_OK(SND_DEVICES_INSTANCE_CREATE_FAILED);
-		}
+			continue;
 
 		PropVariantInit(&FriendlyName);
 		hr = pProps->GetValue(PKEY_Device_FriendlyName, &FriendlyName);
@@ -395,20 +412,31 @@ static int sndDevices_GetAllDevices(PT_HANDLE* hp_sndDevices, int* ip_num_device
 			{
 				cast_handle->deviceNumChannel[i] = wfx.nChannels;
 				known_num_channel[i] = wfx.nChannels;
+				probe_retries[i] = 0;
 			}
 			else if (cast_handle->deviceState[i] == DEVICE_STATE_ACTIVE)
 			{
 				// BetterFxSound: an active device whose format cannot be read right now (it is being reconfigured: a
 				// format change, a Bluetooth reconnection, a monitor waking up) keeps the count it had. With 0 it looked
 				// absent to the controller while the engine still played to it. A device never read before is read
-				// again shortly (sndDevicesGetChannelProbeIsDue()).
-				known_num_channel[i] = sndDevices_GetAllCachedNumChannel(cast_handle, cast_handle->pwszID[i]);
+				// again shortly (sndDevicesGetChannelProbeIsDue()), up to SND_DEVICES_MAX_CHANNEL_PROBE_RETRIES due
+				// probes for this device: one that can never be read does not use up the retries of another.
 				cast_handle->deviceNumChannel[i] = known_num_channel[i];
 				if (known_num_channel[i] <= 0)
-					b_active_device_is_unprobed = TRUE;
+				{
+					if (b_is_probe && (probe_retries[i] < SND_DEVICES_MAX_CHANNEL_PROBE_RETRIES))
+						probe_retries[i]++;
+					if (probe_retries[i] < SND_DEVICES_MAX_CHANNEL_PROBE_RETRIES)
+						b_active_device_is_unprobed = TRUE;
+				}
 			}
 			else
+			{
+				// BetterFxSound: not active; read afresh (with new retries) once it is active again.
 				cast_handle->deviceNumChannel[i] = 0;
+				known_num_channel[i] = 0;
+				probe_retries[i] = 0;
+			}
 
 			// Check ID strings to see if this is the default device.
 			if (pwszIDdefault != NULL && wcscmp(cast_handle->pwszID[i], pwszIDdefault) == 0)
@@ -439,19 +467,11 @@ static int sndDevices_GetAllDevices(PT_HANDLE* hp_sndDevices, int* ip_num_device
 	{
 		wcscpy_s(cast_handle->channelCacheID[k], PT_MAX_GENERIC_STRLEN, cast_handle->pwszID[k]);
 		cast_handle->channelCacheNumChannel[k] = known_num_channel[k];
+		cast_handle->channelCacheProbeRetries[k] = probe_retries[k];
 	}
 	cast_handle->channelCacheCount = (int)deviceCount;
 
-	if (b_active_device_is_unprobed)
-	{
-		cast_handle->activeDeviceIsUnprobed = TRUE;
-		cast_handle->channelProbeRetries++;
-	}
-	else
-	{
-		cast_handle->activeDeviceIsUnprobed = FALSE;
-		cast_handle->channelProbeRetries = 0;
-	}
+	cast_handle->activeDeviceIsUnprobed = b_active_device_is_unprobed;
 	cast_handle->lastEnumerationTick = GetTickCount();
 
 	// -------------------------------------------------------------------------
@@ -460,7 +480,8 @@ static int sndDevices_GetAllDevices(PT_HANDLE* hp_sndDevices, int* ip_num_device
 	// -------------------------------------------------------------------------
 	for (i = 0; i < deviceCount; i++)
 	{
-		if ((int)i != cast_handle->dfxDeviceNum)
+		// BetterFxSound: an entry that could not be read (empty ID) is no device.
+		if (((int)i != cast_handle->dfxDeviceNum) && (cast_handle->pwszID[i][0] != L'\0'))
 		{
 			cast_handle->pwszIDRealDevices[cast_handle->numRealDevices] = cast_handle->pwszID[i];
 			cast_handle->deviceFriendlyNameRealDevices[cast_handle->numRealDevices] = cast_handle->deviceFriendlyName[i];

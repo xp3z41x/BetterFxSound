@@ -108,6 +108,11 @@ bool AudioPassthru::checkDeviceChanges()
     return data_->checkDeviceChanges();
 }
 
+bool AudioPassthru::isCarrierSwitchPending()
+{
+    return data_->isCarrierSwitchPending();
+}
+
 void AudioPassthru::restoreDefaultPlaybackDevice()
 {
     data_->restoreDefaultPlaybackDevice();
