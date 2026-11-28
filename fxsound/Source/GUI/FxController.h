@@ -24,6 +24,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include <JuceHeader.h>
 #include <functional>
 #include <atomic>
+#include <map>
 #include "FxModel.h"
 #include "FxTheme.h"
 #include "FxAudioControls.h"
@@ -137,15 +138,18 @@ public:
 
 	juce::Array<DeviceConfig> getDeviceConfigs();
     void saveDeviceConfigs(const juce::Array<DeviceConfig>& device_configs);
-	bool isOutputDeviceConnected(const String& output_device_name);
-	bool isOutputDevicePresent(const String& output_device_name);
+	// BetterFxSound: a device row (Output preferences) is matched by endpoint id; by name only for a row with no id.
+	bool isOutputDeviceConnected(const String& output_device_id, const String& output_device_name);
+	bool isOutputDevicePresent(const String& output_device_id, const String& output_device_name);
 	SoundDevice getPreferredOutput();
-	int compareOutputDevicePriority(const String& output_device_name1, const String& output_device_name2, const juce::Array<DeviceConfig>& device_configs);
+	int compareOutputDevicePriority(const SoundDevice& output_device1, const SoundDevice& output_device2, const juce::Array<DeviceConfig>& device_configs);
 	// Re-reads the device priority (Output preferences) and elects the carrier again.
 	void refreshOutputList();
 	// Name of the only enabled output, or empty when zero or several outputs are enabled. A device's
 	// preset (Output preferences) belongs to the outputs only while that device is the one output on.
 	const String& getOutputName();
+	// Endpoint id of the only enabled output, or empty, as getOutputName().
+	String getOutputId();
     bool isNewOutputPrioritized();
     void setNewOutputPrioritized(bool prioritize_new_devices);
 
@@ -283,12 +287,12 @@ private:
 	void onSystemResume();
 	
     void initOutputs(std::vector<SoundDevice>& sound_devices);
-	void updateOutputs(std::vector<SoundDevice>& sound_devices, const StringArray& new_device_names);
+	void updateOutputs(std::vector<SoundDevice>& sound_devices, const StringArray& new_device_ids);
 	void clearOutputRestore();
-    void selectProcessingOutput(std::vector<SoundDevice>& sound_devices, const StringArray& new_device_names);
+    void selectProcessingOutput(std::vector<SoundDevice>& sound_devices, const StringArray& new_device_ids);
 	void syncPlaybackAvailability();
-	void syncOutputsWhileOff(std::vector<SoundDevice>& sound_devices, const StringArray& new_device_names);
-	StringArray findNewDeviceNames(const std::vector<SoundDevice>& sound_devices);
+	void syncOutputsWhileOff(std::vector<SoundDevice>& sound_devices, const StringArray& new_device_ids);
+	StringArray findNewDeviceIds(const std::vector<SoundDevice>& sound_devices);
 
 	void sortByDeviceConfigPriority(std::vector<SoundDevice>& devices);
 
@@ -308,9 +312,12 @@ private:
 	OutputEntry& getOutputEntry(const String& id);
 	const SoundDevice* findActiveOutput(const String& id) const;
 	bool refreshActiveOutputs(const std::vector<SoundDevice>& sound_devices);
-	bool enableNewOutputs(const StringArray& new_device_names);
-	SoundDevice electCarrier();
-	void applyCarrier();
+	bool migrateOutputEntries();
+	bool isEndpointListed(const String& id) const;
+	bool isRecentOutputArrival(const String& id) const;
+	bool enableNewOutputs(const StringArray& new_device_ids);
+	SoundDevice electCarrier(const String& keep_id);
+	void applyCarrier(const String& keep_id);
 	void requestCarrier(const SoundDevice& device);
 	void pushOutputsToEngine();
 	void flushOutputsToEngine();
@@ -352,7 +359,6 @@ private:
     String language_;
 	bool dfx_enabled_;
 	bool authenticated_;
-	bool output_changed_;
     bool playback_device_available_;
 	bool system_sleeping_;
 	String output_device_name_;		// See getOutputName()
@@ -363,6 +369,22 @@ private:
 	String requested_carrier_id_;	// Asked for with setAsPlaybackDevice(), not confirmed by a reinit yet
 	bool no_enabled_output_present_ = false;	// Logged once: every enabled output is disconnected, silence
 	StringArray failed_carrier_ids_;	// Asked for but not taken by the engine; skipped until the devices change
+	// BetterFxSound: a switch the engine did not take after a reinit is asked for again; only one missed
+	// MAX_CARRIER_MISSES times in a row, with nothing else to explain it, goes to failed_carrier_ids_.
+	static constexpr int MAX_CARRIER_MISSES = 2;
+	String missed_carrier_id_;
+	int missed_carrier_count_ = 0;
+	// BetterFxSound: a requested switch with no reinit after CARRIER_REQUEST_TIMEOUT ticks (the engine's stop
+	// request can be lost) is asked for again, up to MAX_CARRIER_REQUEST_RETRIES times, then given up on.
+	static constexpr int CARRIER_REQUEST_TIMEOUT = 10;	// 10 ticks * 100 ms = 1 s
+	static constexpr int MAX_CARRIER_REQUEST_RETRIES = 3;
+	int carrier_request_ticks_ = 0;
+	int carrier_request_retries_ = 0;
+	// BetterFxSound: when each present output appeared (Time::getMillisecondCounter()). Windows and drivers often
+	// make an arriving device the default, and the engine's rules take a device just added: for
+	// NEW_OUTPUT_SETTLE_MS such a carrier change is not taken as the user's choice.
+	static constexpr uint32 NEW_OUTPUT_SETTLE_MS = 10000;
+	std::map<String, uint32> output_arrival_ms_;
 	// pushOutputsToEngine() stores the outputs here and flushOutputsToEngine() hands them to the engine with
 	// lock_ released (setOutputs() may wait for removed outputs' render threads to stop, on the message thread).
 	std::vector< ::OutputConfig> pending_engine_outputs_;
