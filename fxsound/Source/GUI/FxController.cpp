@@ -823,6 +823,17 @@ void FxController::printStatus()
 	}
 }
 
+// BetterFxSound: the FxSound virtual device is in the list.
+static bool isVirtualDevicePresent(const std::vector<SoundDevice>& sound_devices)
+{
+	for (auto& sound_device : sound_devices)
+	{
+		if (!sound_device.isRealDevice && sound_device.deviceFriendlyName.find(L"FxSound Audio Enhancer") != std::wstring::npos)
+			return true;
+	}
+	return false;
+}
+
 void FxController::init(FxMainWindow* main_window, FxSystemTrayView* system_tray_view, AudioPassthru* audio_passthru)
 {
 	if (!isTimerRunning())
@@ -861,76 +872,122 @@ void FxController::init(FxMainWindow* main_window, FxSystemTrayView* system_tray
 
 		if (!dfx_enabled_ && !SysInfo::isRemoteSession())
 		{
-			main_window_->removeFromDesktop();
-			auto* error_message = new FxDeviceErrorMessage();
-			error_message->enterModalState(true, ModalCallbackFunction::create([](int)
-			{
-				JUCEApplication::getInstance()->systemRequestedQuit();
-			}), true);
+			// BetterFxSound: at logon the virtual endpoint can come up after FxSound starts (the engine only waits
+			// about a second for it). Not an error yet: wait for it a while, then complete init or show the error.
+			logMessage("FxSound Audio Enhancer not present yet, waiting for it");
+			waitForVirtualDevice(Time::getMillisecondCounter());
 			return;
 		}
 
-		audio_passthru_->registerCallback(this);
+		completeInit();
+	}
+}
 
-		auto path = File(File::addTrailingSeparator(File::getSpecialLocation(File::SpecialLocationType::userApplicationDataDirectory).getFullPathName()) + L"FxSound\\Presets");
-		if (!path.exists())
+void FxController::waitForVirtualDevice(uint32 wait_start_ms)
+{
+	if (audio_passthru_ == nullptr)
+		return;	// Shut down meanwhile
+
+	if (!dfx_enabled_)
+	{
+		std::vector<SoundDevice> sound_devices;
 		{
-			path.createDirectory();
+			ScopedLock auto_lock(lock_);
+			sound_devices = audio_passthru_->getSoundDevices(false);
 		}
-
-		setPowerState(settings_.getBool("power"));
-
-		initPresets();
-
-		auto preset_name = settings_.getString("preset");
-		setPreset(preset_name);
-
-		showView();
-
-		auto theme_mode = settings_.getInt("theme_mode", 0);
-		if (theme_mode < 0 || theme_mode >= static_cast<int>(FxThemeMode::NumModes))
+		if (isVirtualDevicePresent(sound_devices))
 		{
-			theme_mode = 0;
+			output_devices_ = sound_devices;
+			initOutputs(output_devices_);
 		}
-		if (FxTheme::getThemeMode() != static_cast<FxThemeMode>(theme_mode))
-		{
-			FxTheme::setThemeMode(static_cast<FxThemeMode>(theme_mode));
-			main_window_->sendLookAndFeelChange();
+	}
 
-			auto* theme = dynamic_cast<FxTheme*>(&LookAndFeel::getDefaultLookAndFeel());
-			if (theme != nullptr)
-			{
-				theme->loadFont(language_);
-			}
+	if (dfx_enabled_)
+	{
+		logMessage("FxSound Audio Enhancer present");
+		completeInit();
+		return;
+	}
+
+	if (Time::getMillisecondCounter() - wait_start_ms < VIRTUAL_DEVICE_WAIT_MS)
+	{
+		// The controller lives as long as the process (getInstance()).
+		Timer::callAfterDelay(VIRTUAL_DEVICE_POLL_MS, [this, wait_start_ms]() {
+			waitForVirtualDevice(wait_start_ms);
+		});
+		return;
+	}
+
+	main_window_->removeFromDesktop();
+	auto* error_message = new FxDeviceErrorMessage();
+	error_message->enterModalState(true, ModalCallbackFunction::create([](int)
+	{
+		JUCEApplication::getInstance()->systemRequestedQuit();
+	}), true);
+}
+
+void FxController::completeInit()
+{
+	audio_passthru_->registerCallback(this);
+
+	auto path = File(File::addTrailingSeparator(File::getSpecialLocation(File::SpecialLocationType::userApplicationDataDirectory).getFullPathName()) + L"FxSound\\Presets");
+	if (!path.exists())
+	{
+		path.createDirectory();
+	}
+
+	setPowerState(settings_.getBool("power"));
+
+	initPresets();
+
+	auto preset_name = settings_.getString("preset");
+	setPreset(preset_name);
+
+	showView();
+
+	auto theme_mode = settings_.getInt("theme_mode", 0);
+	if (theme_mode < 0 || theme_mode >= static_cast<int>(FxThemeMode::NumModes))
+	{
+		theme_mode = 0;
+	}
+	if (FxTheme::getThemeMode() != static_cast<FxThemeMode>(theme_mode))
+	{
+		FxTheme::setThemeMode(static_cast<FxThemeMode>(theme_mode));
+		main_window_->sendLookAndFeelChange();
+
+		auto* theme = dynamic_cast<FxTheme*>(&LookAndFeel::getDefaultLookAndFeel());
+		if (theme != nullptr)
+		{
+			theme->loadFont(language_);
 		}
+	}
 
-		survey_tip_ = !settings_.getBool("survey_displayed");
+	survey_tip_ = !settings_.getBool("survey_displayed");
 
-		if (!settings_.getBool("run_minimized"))
+	if (!settings_.getBool("run_minimized"))
+	{
+		showMainWindow();
+	}
+	else
+	{
+		hideMainWindow();
+	}
+
+	auto power = FxModel::getModel().getPowerState();
+	main_window_->setIcon(power, false);
+	system_tray_view_->setStatus(power, false);
+
+	HMODULE user32_module = GetModuleHandleW(L"user32.dll");
+	if (user32_module != nullptr)
+	{
+		auto register_suspend_resume_notification = reinterpret_cast<RegisterSuspendResumeNotificationFunc>(
+			GetProcAddress(user32_module, "RegisterSuspendResumeNotification"));
+		unregister_suspend_resume_notification_ = reinterpret_cast<UnregisterSuspendResumeNotificationFunc>(
+			GetProcAddress(user32_module, "UnregisterSuspendResumeNotification"));
+
+		if (register_suspend_resume_notification != nullptr && unregister_suspend_resume_notification_ != nullptr)
 		{
-			showMainWindow();
-		}
-		else
-		{
-			hideMainWindow();
-		}
-
-		auto power = FxModel::getModel().getPowerState();
-		main_window_->setIcon(power, false);
-		system_tray_view_->setStatus(power, false);
-
-		HMODULE user32_module = GetModuleHandleW(L"user32.dll");
-		if (user32_module != nullptr)
-		{
-			auto register_suspend_resume_notification = reinterpret_cast<RegisterSuspendResumeNotificationFunc>(
-				GetProcAddress(user32_module, "RegisterSuspendResumeNotification"));
-			unregister_suspend_resume_notification_ = reinterpret_cast<UnregisterSuspendResumeNotificationFunc>(
-				GetProcAddress(user32_module, "UnregisterSuspendResumeNotification"));
-
-			if (register_suspend_resume_notification != nullptr && unregister_suspend_resume_notification_ != nullptr)
-			{
-				powerNotify_ = register_suspend_resume_notification(message_window_.getHandle(), DEVICE_NOTIFY_WINDOW_HANDLE);
-			}
+			powerNotify_ = register_suspend_resume_notification(message_window_.getHandle(), DEVICE_NOTIFY_WINDOW_HANDLE);
 		}
 	}
 }
@@ -1565,13 +1622,7 @@ void FxController::initOutputs(std::vector<SoundDevice>& sound_devices)
 		}
 	}
 
-	for (auto& sound_device : sound_devices)
-	{
-		if (!sound_device.isRealDevice && sound_device.deviceFriendlyName.find(L"FxSound Audio Enhancer") != std::wstring::npos)
-		{
-			dfx_enabled_ = true;
-		}
-	}
+	dfx_enabled_ = isVirtualDevicePresent(sound_devices);
 
 	refreshActiveOutputs(sound_devices);
 	// BetterFxSound: the devices present at start did not just arrive.
@@ -1778,11 +1829,35 @@ void FxController::updateOutputs(std::vector<SoundDevice>& sound_devices, const 
 				{
 					failover_output_id_ = carrier_id_;
 					hdmi_failover_counter_ = 0;
-					hdmi_reconnect_pending_ = true;
+					// BetterFxSound: the muted hold silenced every output. With another enabled output present it
+					// keeps playing: a carrier is elected among them now, and HDMI back in time is the carrier again.
+					bool other_output_present = false;
+					for (auto& device : active_output_devices_)
+					{
+						String id(device.pwszID.c_str());
+						auto* other = findOutputEntry(id);
+						if (other != nullptr && other->enabled && !failed_carrier_ids_.contains(id))
+						{
+							other_output_present = true;
+							break;
+						}
+					}
+					hdmi_return_pending_ = other_output_present;
+					hdmi_reconnect_pending_ = !other_output_present;
 					break;
 				}
 			}
 		}
+	}
+
+	// BetterFxSound: HDMI back in time while the other outputs played: the carrier again (if still enabled).
+	// timerCallback() ends the wait otherwise.
+	if (hdmi_return_pending_ &&
+		(findActiveOutput(failover_output_id_) != nullptr || hdmi_failover_counter_ >= HDMI_FAILOVER_INTERVAL))
+	{
+		if (findActiveOutput(failover_output_id_) != nullptr)
+			returned_carrier_id = failover_output_id_;
+		clearOutputRestore();
 	}
 
 	if (hdmi_reconnect_pending_ &&
@@ -2025,13 +2100,17 @@ void FxController::powerOn(bool on)
 					pushOutputsToEngine();
 				}
 
-				if (no_output_)
+				// BetterFxSound: processing starts unmuted, whatever muted the engine while off (no output, or a
+				// sleep mute whose resume did not clear it). Only a sleep under way keeps it.
+				no_output_ = false;
+				if (!system_sleeping_ && !hdmi_reconnect_pending_)
 				{
-					no_output_ = false;
 					audio_passthru_->mute(false);
 				}
 			}
 
+			// The engine takes the devices over again at its next reinit.
+			engine_handed_back_ = false;
 			startTimer(100);
 		}
 	}
@@ -2050,18 +2129,40 @@ void FxController::powerOn(bool on)
 			return;
 		}
 
-		if (hdmi_reconnect_pending_)
+		// BetterFxSound: a sleep under way keeps its mute, onSystemResume() clears it.
+		if (hdmi_reconnect_pending_ && !system_sleeping_)
 		{
 			audio_passthru_->mute(false);
-			clearOutputRestore();
 		}
+		clearOutputRestore();
 
-		if (isTimerRunning())
+		const bool was_processing = isTimerRunning();
+		if (was_processing)
 		{
 			stopTimer();
 		}
 
-		audio_passthru_->restoreDefaultPlaybackDevice();
+		// BetterFxSound: handed back once per stop. Already off (a session event, or setPowerState() at init or
+		// unlock calling here again), another hand-back would make the device it picks the Windows default again,
+		// over a default the user chose meanwhile. Done again only while the virtual device is the Windows default
+		// (nothing would be heard).
+		bool hand_back = was_processing || !engine_handed_back_;
+		if (!hand_back)
+		{
+			for (const auto& device : audio_passthru_->getSoundDevices(false))
+			{
+				if (device.isDFXDevice && device.isDefaultDevice)
+				{
+					hand_back = true;
+					break;
+				}
+			}
+		}
+		if (hand_back)
+		{
+			audio_passthru_->restoreDefaultPlaybackDevice();
+			engine_handed_back_ = true;
+		}
 	}
 }
 
@@ -2372,6 +2473,11 @@ void FxController::timerCallback()
 			auto sound_devices = audio_passthru_->getSoundDevices(true);
 			updateOutputs(sound_devices, StringArray());
 		}
+		// BetterFxSound: the unmuted wait (another output plays meanwhile) just ends: the carrier is already elected.
+		if (!system_sleeping_ && (hdmi_return_pending_ && ++hdmi_failover_counter_ >= HDMI_FAILOVER_INTERVAL))
+		{
+			clearOutputRestore();
+		}
 
 		// BetterFxSound: a carrier switch is confirmed by the reinit it causes (updateOutputs() clears the
 		// request). The engine's stop request can be lost (a new processing thread starting just after it), and
@@ -2564,7 +2670,9 @@ void FxController::onSystemSuspend()
 		system_sleeping_ = true;
 	}
 
-	if (FxModel::getModel().getPowerState())
+	// BetterFxSound: whatever the power state, so the mute and its clearing on resume do not depend on the power
+	// being the same at both (it can be switched in between). The mute does nothing while processing is off.
+	if (audio_passthru_ != nullptr)
 	{
 		audio_passthru_->mute(true);
 	}
@@ -2574,11 +2682,17 @@ void FxController::onSystemResume()
 {
 	ScopedLock auto_lock(lock_);
 
-	hdmi_failover_counter_ = 0;
+	// BetterFxSound: once per sleep. The resume is notified more than once (PBT_APMRESUMEAUTOMATIC, then
+	// PBT_APMRESUMESUSPEND on the first user input, possibly seconds later, each through the broadcast and the
+	// registered notification). Acting again restarted a running HDMI wait, all outputs muted meanwhile. The
+	// wait count restarts on suspend only.
+	if (!system_sleeping_)
+		return;
 
 	system_sleeping_ = false;
 
-	if (!hdmi_reconnect_pending_ && FxModel::getModel().getPowerState())
+	// The sleep mute is cleared whatever the power state (see onSystemSuspend()); a muted HDMI wait keeps it.
+	if (!hdmi_reconnect_pending_ && audio_passthru_ != nullptr)
 	{
 		audio_passthru_->mute(false);
 	}
@@ -2589,6 +2703,7 @@ void FxController::clearOutputRestore()
 	failover_output_id_ = String();
 	hdmi_failover_counter_ = 0;
 	hdmi_reconnect_pending_ = false;
+	hdmi_return_pending_ = false;
 }
 
 void FxController::enableHotkeys(bool enable)

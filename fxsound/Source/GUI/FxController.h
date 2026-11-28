@@ -285,6 +285,9 @@ private:
 	void handleSoundDeviceChange(bool processing);
 	void onSystemSuspend();
 	void onSystemResume();
+	// BetterFxSound: the rest of init() once the FxSound virtual device is present, and the bounded wait for it.
+	void completeInit();
+	void waitForVirtualDevice(uint32 wait_start_ms);
 	
     void initOutputs(std::vector<SoundDevice>& sound_devices);
 	void updateOutputs(std::vector<SoundDevice>& sound_devices, const StringArray& new_device_ids);
@@ -361,6 +364,13 @@ private:
 	bool authenticated_;
     bool playback_device_available_;
 	bool system_sleeping_;
+	// BetterFxSound: restoreDefaultPlaybackDevice() done and processing not started since. Another hand-back
+	// (a session event while off) would set the Windows default again over the user's own choice.
+	bool engine_handed_back_ = false;
+	// BetterFxSound: at logon the virtual endpoint can come up after FxSound starts. init() waits this long for
+	// it, checking every VIRTUAL_DEVICE_POLL_MS, before the device error.
+	static constexpr uint32 VIRTUAL_DEVICE_WAIT_MS = 15000;
+	static constexpr int VIRTUAL_DEVICE_POLL_MS = 500;
 	String output_device_name_;		// See getOutputName()
 
 	// BetterFxSound outputs rework (guarded by lock_).
@@ -398,10 +408,14 @@ private:
 	// HDMI_FAILOVER_INTERVAL timer ticks. The count restarts on suspend (the timer does not tick while
 	// asleep) so HDMI also gets that time after wake. If HDMI is back in time it is reused, otherwise
 	// it is treated as a physical disconnect and the preferred output is selected.
+	// BetterFxSound: the muted hold only when no other enabled output is present. Otherwise the other outputs
+	// keep playing: a carrier is elected among them at once, and the HDMI output, if back within the same
+	// time, is the carrier again (hdmi_return_pending_, not muted).
 	static constexpr int HDMI_FAILOVER_INTERVAL = 30;	// 30 ticks * 100 ms = 3 s
 	String failover_output_id_;
 	int hdmi_failover_counter_;
 	bool hdmi_reconnect_pending_;	// HDMI output lost, waiting for it to reconnect
+	bool hdmi_return_pending_ = false;	// HDMI output lost while another enabled output plays, it is the carrier again if back in time
 	std::vector<SoundDevice> active_output_devices_;
 	std::vector<SoundDevice> output_devices_;
 	bool always_on_top_;
