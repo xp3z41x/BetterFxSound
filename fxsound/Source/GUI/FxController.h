@@ -410,6 +410,12 @@ private:
 	// BetterFxSound: the delay each output had when the running (or last) delay measurement started, by id. Those are
 	// the delays it was measured with: applyDelayCalibrationResults() removes them, whatever the delays are by then.
 	std::map<String, int> calibration_delays_;
+	// The carrier when the measurement started, and the delay the engine actually played it with: it delays the
+	// carrier by at most MAIN_DELAY_FRAMES - 1 frames at the processing rate (about 341 ms at 192 kHz), so a larger
+	// delay is played shorter. calibration_carrier_max_delay_ms_ is the largest whole delay it plays in full.
+	String calibration_carrier_id_;
+	double calibration_carrier_delay_ms_ = 0.0;
+	int calibration_carrier_max_delay_ms_ = 500;
 	// Why FxSound itself stopped the measurement (see getDelayCalibrationInterruption()), empty if it did not.
 	String calibration_interruption_;
 	void interruptDelayCalibration(const String& reason);

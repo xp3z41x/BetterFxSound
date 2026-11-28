@@ -31,6 +31,8 @@ public:
 	// BetterFxSound: id of the Windows default playback device (eRender, eMultimedia) as Windows reports it now,
 	// empty if it cannot be read.
 	static std::wstring getDefaultAudioOutputId();
+	// BetterFxSound: shared-mode (mix format) sample rate of the playback device with this id, 0 if it cannot be read.
+	static DWORD getAudioDeviceSampleRate(const std::wstring& device_id);
     static bool isServiceRunning(LPCWSTR service_name);
     static bool canSupportHotkeys();
 	static bool isRemoteSession();

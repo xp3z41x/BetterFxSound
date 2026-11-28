@@ -1887,6 +1887,8 @@ void FxController::updateOutputs(std::vector<SoundDevice>& sound_devices, const 
 	// timerCallback() ends the wait.
 	if (hdmi_reconnect_pending_)
 	{
+		// BetterFxSound: a delay measurement would go on playing its test sound into the muted engine.
+		interruptDelayCalibration(TRANS("An output was disconnected during the measurement. Synchronize again."));
 		if (FxModel::getModel().getPowerState())
 		{
 			audio_passthru_->mute(true);
@@ -3190,12 +3192,35 @@ void FxController::setNewOutputPrioritized(bool prioritize)
 	settings_.setBool("prioritize_new_output", prioritize);
 }
 
+// BetterFxSound: size of the engine's carrier delay line in frames (AudioPassthruPrivate::kMainDelayFrames).
+static constexpr double MAIN_DELAY_FRAMES = 65536.0;
+
 // Message thread, with lock_ not held by the caller.
 bool FxController::startDelayCalibration()
 {
 	// BetterFxSound: the outputs still queued for the engine reach it first, so the delays recorded below are the
 	// ones it measures with (it applies them before the measurement starts).
 	flushOutputsToEngine();
+
+	// BetterFxSound: the processing rate (the FxSound virtual device's), read with lock_ released: it opens the
+	// device through COM.
+	std::wstring virtual_device_id;
+	{
+		ScopedLock auto_lock(lock_);
+
+		if (audio_passthru_ == nullptr)
+			return false;
+
+		for (const auto& device : audio_passthru_->getSoundDevices(false))
+		{
+			if (device.isDFXDevice)
+			{
+				virtual_device_id = device.pwszID;
+				break;
+			}
+		}
+	}
+	const DWORD processing_rate = SysInfo::getAudioDeviceSampleRate(virtual_device_id);
 
 	{
 		ScopedLock auto_lock(lock_);
@@ -3210,6 +3235,20 @@ bool FxController::startDelayCalibration()
 			if (entry.id.isNotEmpty())
 				calibration_delays_[entry.id] = entry.delay_ms;
 		}
+
+		// BetterFxSound: the engine plays the carrier's delay at the processing rate (the FxSound virtual device's)
+		// with at most MAIN_DELAY_FRAMES - 1 frames, so above about 341 ms at 192 kHz it plays less than was asked.
+		calibration_carrier_id_ = carrier_id_;
+		calibration_carrier_max_delay_ms_ = 500;
+		double carrier_delay_cap_ms = 500.0;
+		if (processing_rate > 0)
+		{
+			carrier_delay_cap_ms = (MAIN_DELAY_FRAMES - 1) * 1000.0 / processing_rate;
+			// Largest whole delay whose frame count stays below MAIN_DELAY_FRAMES.
+			calibration_carrier_max_delay_ms_ = jlimit(0, 500, (int)((MAIN_DELAY_FRAMES * 1000.0 - 1.0) / processing_rate));
+		}
+		auto carrier_delay = calibration_delays_.find(calibration_carrier_id_);
+		calibration_carrier_delay_ms_ = carrier_delay != calibration_delays_.end() ? jmin((double)jlimit(0, 500, carrier_delay->second), carrier_delay_cap_ms) : 0.0;
 	}
 
 	return audio_passthru_->startDelayCalibration();
@@ -3221,9 +3260,10 @@ void FxController::cancelDelayCalibration()
 		audio_passthru_->cancelDelayCalibration();
 }
 
-// BetterFxSound: FxSound stops processing (turned off, sleep): a running measurement would go on hearing nothing, or
-// end with repetitions recorded while nothing played, and keep its solo output and the engine's deferred output
-// changes until it ends. Stop it, and say why. The engine applies its deferred changes once it is no longer running.
+// BetterFxSound: FxSound stops processing (turned off, sleep, muted HDMI wait): a running measurement would go on
+// hearing nothing, or end with repetitions recorded while nothing played, and keep its solo output and the engine's
+// deferred output changes until it ends. Stop it, and say why. The engine applies its deferred changes once it is no
+// longer running.
 void FxController::interruptDelayCalibration(const String& reason)
 {
 	ScopedLock auto_lock(lock_);
@@ -3286,9 +3326,16 @@ String FxController::applyDelayCalibrationResults()
 
 	// BetterFxSound: the delay the output was measured with, recorded when the measurement started, not the one it
 	// has now (a delay changed meanwhile was not measured: the engine holds the outputs' changes back while it runs).
-	auto measuredDelay = [this](const String& id) {
+	// For the carrier, the delay the engine actually played (its delay line is shorter than 500 ms at high rates).
+	auto measuredDelay = [this](const String& id) -> double {
+		if (id.isNotEmpty() && id == calibration_carrier_id_)
+			return calibration_carrier_delay_ms_;
 		auto it = calibration_delays_.find(id);
-		return it != calibration_delays_.end() ? it->second : 0;
+		return it != calibration_delays_.end() ? (double)it->second : 0.0;
+	};
+	// The largest delay the output plays in full.
+	auto maxDelay = [this](const String& id) {
+		return (id.isNotEmpty() && id == calibration_carrier_id_) ? calibration_carrier_max_delay_ms_ : 500;
 	};
 
 	// Each measurement includes the delay the output already had. Remove it to get the output's own
@@ -3296,8 +3343,7 @@ String FxController::applyDelayCalibrationResults()
 	bool any_measured = false;
 	bool any_unmeasured = false;
 	double slowest = 0.0;
-	double measured_total_sum = 0.0;
-	int measured_count = 0;
+	std::vector<double> measured_totals;
 	for (auto& result : results)
 	{
 		if (!result.measured)
@@ -3309,31 +3355,96 @@ String FxController::applyDelayCalibrationResults()
 		auto own_latency = result.latency_ms - measuredDelay(String(result.device_id.c_str()));
 		slowest = any_measured ? jmax(slowest, own_latency) : own_latency;
 		any_measured = true;
-		measured_total_sum += result.latency_ms;
-		measured_count++;
+		measured_totals.push_back(result.latency_ms);
 	}
 
 	if (!any_measured)
 		return TRANS("No output could be heard clearly, so no delay was changed. Turn the volume up, move the microphone closer and try again.");
 
-	// BetterFxSound: an output not heard keeps the total latency (own latency plus delay) it had, which is only known
-	// as what it was in step with: the measured outputs' total latencies, averaged (all the same once synchronized).
-	// Aligning the measured outputs to the slowest of them alone would move them away from it, typically when the
-	// output not heard was the slowest one (Bluetooth, HDMI). So they are aligned to that total instead, or, when
-	// one of them is now slower than it, to that slower one, and the outputs not heard follow by the same amount.
+	// BetterFxSound: enabled outputs that got no test sound, because they were not connected when the measurement
+	// started (or came after). Like the outputs not heard, they keep the total latency they had.
+	StringArray absent_ids;
+	for (const auto& entry : output_entries_)
+	{
+		if (!entry.enabled || entry.id.isEmpty() || calibration_delays_.find(entry.id) == calibration_delays_.end())
+			continue;
+
+		bool in_results = false;
+		for (auto& result : results)
+		{
+			if (String(result.device_id.c_str()) == entry.id)
+				in_results = true;
+		}
+		if (!in_results)
+			absent_ids.add(entry.id);
+	}
+
+	// BetterFxSound: an output not measured (not heard, or not connected) keeps the total latency (own latency plus
+	// delay) it had, which is only known as what it was in step with: the total shared by the measured outputs that
+	// were in step (most of them within MEASURED_IN_STEP_MS of their median; an output added or set by hand since the
+	// last synchronization is left out). Aligning the measured outputs to the slowest of them alone would move them
+	// away from it, typically when the output not measured was the slowest one (Bluetooth, HDMI). So they are
+	// aligned to that total instead, or, when one of them is now slower than it, to that slower one, and the outputs
+	// not measured follow by the same amount. With no such majority that total is unknown: the measured outputs are
+	// aligned to the slowest of them, the others keep their delays and the user is told to synchronize again.
+	static constexpr double MEASURED_IN_STEP_MS = 40.0;
+	const bool any_not_measured = any_unmeasured || absent_ids.size() > 0;
 	double reference = slowest;
 	int unmeasured_shift = 0;
-	if (any_unmeasured)
+	bool previous_total_unknown = false;
+	if (any_not_measured)
 	{
-		auto previous_total = measured_total_sum / measured_count;
-		reference = jmax(slowest, previous_total);
-		unmeasured_shift = roundToInt(reference - previous_total);
+		std::sort(measured_totals.begin(), measured_totals.end());
+		const size_t count = measured_totals.size();
+		const double median = (count % 2 == 1) ? measured_totals[count / 2]
+			: (measured_totals[count / 2 - 1] + measured_totals[count / 2]) / 2.0;
+		double in_step_sum = 0.0;
+		size_t in_step_count = 0;
+		for (auto total : measured_totals)
+		{
+			if (std::abs(total - median) <= MEASURED_IN_STEP_MS)
+			{
+				in_step_sum += total;
+				in_step_count++;
+			}
+		}
+
+		if (in_step_count * 2 > count)
+		{
+			auto previous_total = in_step_sum / (double)in_step_count;
+			reference = jmax(slowest, previous_total);
+			unmeasured_shift = roundToInt(reference - previous_total);
+		}
+		else
+		{
+			previous_total_unknown = true;
+		}
 	}
 
 	StringArray lines;
 	StringArray not_heard;
 	StringArray not_heard_moved;
+	StringArray not_connected;
+	StringArray not_connected_moved;
 	bool clamped = false;
+
+	// Keeps its delay, or follows the measured outputs by the amount they moved past its total latency. False when
+	// it keeps it.
+	auto shiftNotMeasured = [&](const String& id, StringArray& moved, const String& name) {
+		if (unmeasured_shift == 0)
+			return false;
+		const int max_delay = maxDelay(id);
+		const int wanted = roundToInt(measuredDelay(id)) + unmeasured_shift;
+		const int delay = jlimit(0, max_delay, wanted);
+		if (delay == getOutputEntry(id).delay_ms)
+			return false;
+		if (wanted > max_delay)
+			clamped = true;
+
+		getOutputEntry(id).delay_ms = delay;
+		moved.add(name + ": " + String(delay) + " ms");
+		return true;
+	};
 
 	for (auto& result : results)
 	{
@@ -3342,26 +3453,17 @@ String FxController::applyDelayCalibrationResults()
 
 		if (!result.measured)
 		{
-			// Keeps its delay, or follows the others by the amount they moved past its total latency.
-			auto delay = jlimit(0, 500, measuredDelay(id) + unmeasured_shift);
-			if (unmeasured_shift == 0 || delay == getOutputEntry(id).delay_ms)
-			{
+			if (!shiftNotMeasured(id, not_heard_moved, name))
 				not_heard.add(name);
-				continue;
-			}
-			if (delay == 500)
-				clamped = true;
-
-			getOutputEntry(id).delay_ms = delay;
-			not_heard_moved.add(name + ": " + String(delay) + " ms");
 			continue;
 		}
 
 		auto own_latency = result.latency_ms - measuredDelay(id);
 		auto delay = roundToInt(reference - own_latency);
-		if (delay > 500)
+		const int max_delay = maxDelay(id);
+		if (delay > max_delay)
 		{
-			delay = 500;
+			delay = max_delay;
 			clamped = true;
 		}
 		delay = jmax(0, delay);
@@ -3373,20 +3475,11 @@ String FxController::applyDelayCalibrationResults()
 
 	// Outputs that are turned on but got no test sound, because they were not connected when the
 	// measurement started. Without this they would just seem to have stayed silent.
-	StringArray not_connected;
-	for (const auto& entry : output_entries_)
+	for (const auto& id : absent_ids)
 	{
-		if (!entry.enabled || entry.id.isEmpty())
-			continue;
-
-		bool measured = false;
-		for (auto& result : results)
-		{
-			if (String(result.device_id.c_str()) == entry.id)
-				measured = true;
-		}
-		if (!measured && findActiveOutput(entry.id) == nullptr)
-			not_connected.add(nameOf(entry.id));
+		auto name = nameOf(id);
+		if (!shiftNotMeasured(id, not_connected_moved, name))
+			not_connected.add(name);
 	}
 
 	saveOutputSettings();
@@ -3400,8 +3493,12 @@ String FxController::applyDelayCalibrationResults()
 		summary += " " + TRANS("Not heard clearly, moved with the others:") + " " + not_heard_moved.joinIntoString(", ") + ".";
 	if (not_connected.size() > 0)
 		summary += " " + TRANS("Not connected, not measured:") + " " + not_connected.joinIntoString(", ") + ".";
+	if (not_connected_moved.size() > 0)
+		summary += " " + TRANS("Not connected, moved with the others:") + " " + not_connected_moved.joinIntoString(", ") + ".";
+	if (previous_total_unknown)
+		summary += " " + TRANS("The outputs measured were not in step before, so the ones not measured may now be out of step with them. Synchronize again with every output connected and audible.");
 	if (clamped)
-		summary += " " + TRANS("Some devices differ by more than 500 ms, the maximum delay.");
+		summary += " " + TRANS("Some devices differ by more than the maximum delay.");
 	return summary;
 }
 
