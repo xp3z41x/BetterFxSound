@@ -476,6 +476,33 @@ int AudioPassthruPrivate::processTimer()
 		multi_output_.retryFailedOutputs();
 	}
 
+	if (!b_need_to_start_thread)
+	{
+		/*
+		* BetterFxSound: setting the carrier to 100% failed, it is tried again (applyAdditionalOutputs() bounds the
+		* attempts). And a removed additional output whose render thread outlived the wait for it no longer hands its
+		* device back late, on that thread, where it undid a newer take-over of the device (the output enabled again, or
+		* the device made the carrier): the engine's sweep, with the devices in use now, does it here instead.
+		*/
+		bool apply = false;
+		{
+			std::lock_guard<std::mutex> lock(config_mutex_);
+			if (carrier_volume_retry_ && (GetTickCount() - carrier_volume_retry_tick_) >= kCarrierVolumeRetryMs)
+			{
+				carrier_volume_retry_ = false;
+				apply = true;
+			}
+		}
+		if (multi_output_.takeLateExits())
+			apply = true;
+		if (apply)
+			applyAdditionalOutputs();
+
+		/* BetterFxSound: the carrier's device changed its own level right after the take-over, see reassertCarrierFullVolume() */
+		if (s_sndDevices_.playbackFullVolumeReassert.exchange(FALSE) != FALSE)
+			reassertCarrierFullVolume();
+	}
+
 	/*
 	* BetterFxSound: an active device whose channel count could not be read at the last enumeration (it was being
 	* reconfigured) is read again shortly, by the refresh below: no notification follows once it can be read.
@@ -548,7 +575,13 @@ int AudioPassthruPrivate::processTimer()
 			std::lock_guard<std::mutex> lock(config_mutex_);
 			pending_carrier_id_.clear();
 			carrier_full_volume_id_.clear();
+			deferred_carrier_enable_id_.clear();
+			carrier_volume_retry_ = false;
+			carrier_volume_failures_ = 0;
 		}
+		/* BetterFxSound: applyAdditionalOutputs() below starts the take-over window again when it sets the carrier to 100% */
+		s_sndDevices_.engineTookOverPlaybackTick = 0;
+		s_sndDevices_.playbackFullVolumeReassert = FALSE;
 
 		if (statusFlag != SND_DEVICES_DEVICE_OPERATION_COMPLETED)
 		{
@@ -1188,6 +1221,7 @@ void AudioPassthruPrivate::applyAdditionalOutputs()
 	std::wstring set_full_volume_id;	// Carrier device to set to 100% and unmute, after the lock is released
 	float carrier_own_level = 1.0f;		// And its own setting, recorded as owed before that
 	BOOL carrier_own_mute = FALSE;
+	bool carrier_keeps_users_level = false;	// BetterFxSound: the user set the carrier's own level meanwhile, it is kept
 	std::vector<std::wstring> in_use;	// Devices the engine drives now: what is owed to them stays owed
 
 	{
@@ -1251,11 +1285,20 @@ void AudioPassthruPrivate::applyAdditionalOutputs()
 			carrier_id == s_sndDevices_.savedPlaybackDeviceID;
 
 		// carrier_enabled_ last, with release: the processing thread reads it first (acquire), so once it
-		// sees this carrier enabled it also sees this carrier's delay, channel mode and trim.
+		// sees this carrier enabled it also sees this carrier's delay, channel mode and trim. BetterFxSound: a carrier
+		// that stops playing is silenced at once; one that plays is published at the end of this block (see there).
 		main_delay_ms_.store(carrier_delay_ms, std::memory_order_relaxed);
 		main_channel_mode_.store(static_cast<int>(carrier_channel_mode), std::memory_order_relaxed);
 		carrier_trim_.store(outputTrimGain(carrier_volume_percent), std::memory_order_relaxed);
-		carrier_enabled_.store(carrier_plays, std::memory_order_release);
+		if (!carrier_plays)
+		{
+			deferred_carrier_enable_id_.clear();
+			carrier_enabled_.store(false, std::memory_order_release);
+		}
+
+		/* BetterFxSound: the user changed the carrier's own level while the engine held it at 100%: it keeps it (the
+		   reinits used to set it to 100% again each time), see sndDevicesHdlType::playbackLevelIsUsers. */
+		carrier_keeps_users_level = carrier_setting_saved && (s_sndDevices_.playbackLevelIsUsers.load() != FALSE);
 
 		/*
 		* The real device of an enabled carrier is set to 100% and unmuted when the engine starts using it: after
@@ -1340,6 +1383,27 @@ void AudioPassthruPrivate::applyAdditionalOutputs()
 			for (const auto& output : effective_outputs_)
 				in_use.push_back(output.device_id);
 		}
+
+		/*
+		* BetterFxSound: a carrier that starts playing while its device is still to be set to 100% (it was handed back
+		* when it was disabled, or the reinit just saved its own level) is held silent until that is done, after the
+		* lock: it faded in at its own level times the app's gain, then jumped up when the device got to 100% (after the
+		* router change, which may wait for outputs being removed). One that already plays keeps playing.
+		*/
+		if (carrier_plays)
+		{
+			const bool hold_carrier = !set_full_volume_id.empty() && !carrier_keeps_users_level &&
+				!carrier_enabled_.load(std::memory_order_relaxed);
+			if (hold_carrier)
+			{
+				deferred_carrier_enable_id_ = carrier_id;
+			}
+			else
+			{
+				deferred_carrier_enable_id_.clear();
+				carrier_enabled_.store(true, std::memory_order_release);
+			}
+		}
 	}
 
 	/*
@@ -1351,15 +1415,86 @@ void AudioPassthruPrivate::applyAdditionalOutputs()
 	if (!set_full_volume_id.empty())
 	{
 		owedVolumeRecord(set_full_volume_id, carrier_own_level, carrier_own_mute);
-		s_sndDevices_.engineSetPlaybackLevel = 1.0f;
-		s_sndDevices_.engineSetPlaybackMute = FALSE;
-		s_sndDevices_.engineSetPlaybackTick = GetTickCount();
-		setDeviceFullVolumeById(set_full_volume_id, &s_sndDevices_.guidThisApplication);
+		bool full_volume_set = true;
+		if (!carrier_keeps_users_level)
+		{
+			sndDevicesNoteEngineSetPlayback(&s_sndDevices_, 1.0f, FALSE, carrier_own_mute);
+			full_volume_set = setDeviceFullVolumeById(set_full_volume_id, &kEngineVolumeEventContext);
+			if (full_volume_set)
+			{
+				/* BetterFxSound: the device may still send its own stored level shortly (see engineTookOverPlaybackTick) */
+				DWORD took_over_tick = GetTickCount();
+				if (took_over_tick == 0)
+					took_over_tick = 1;
+				s_sndDevices_.engineTookOverPlaybackTick = took_over_tick;
+				carrier_reasserts_ = 0;
+			}
+		}
+
+		{
+			std::lock_guard<std::mutex> lock(config_mutex_);
+			/*
+			* BetterFxSound: a failed take-over (the endpoint not ready yet after a connect or a resume) was marked done all
+			* the same, and the carrier played at its own level times the app's gain until the next reinit. It is tried
+			* again shortly (processTimer()), a few times.
+			*/
+			if (full_volume_set)
+			{
+				carrier_volume_failures_ = 0;
+			}
+			else
+			{
+				if (carrier_full_volume_id_ == set_full_volume_id)
+					carrier_full_volume_id_.clear();
+				if (carrier_volume_failures_ < kCarrierVolumeRetries)
+				{
+					carrier_volume_failures_++;
+					carrier_volume_retry_ = true;
+					carrier_volume_retry_tick_ = GetTickCount();
+				}
+			}
+
+			/* A carrier held silent for this plays from here on, unless a later change stopped or replaced it meanwhile */
+			if (deferred_carrier_enable_id_ == set_full_volume_id)
+			{
+				deferred_carrier_enable_id_.clear();
+				carrier_enabled_.store(true, std::memory_order_release);
+			}
+		}
 	}
 
 	/* A device the engine no longer uses (output turned off while it is the carrier, back after an unplug, left at
 	   100% by a crash) gets its own setting back. */
 	handBackUnusedDevices(in_use);
+}
+
+/*
+* FUNCTION: reassertCarrierFullVolume()
+* DESCRIPTION: BetterFxSound. The carrier's device changed its own level within a few seconds of the engine setting it to
+* 100% (a Bluetooth headset with absolute volume sends its stored level once connected): it is set to 100% again, a few
+* times at most per take-over. A change the user makes later is kept (sndDevicesHdlType::playbackLevelIsUsers).
+*/
+void AudioPassthruPrivate::reassertCarrierFullVolume()
+{
+	std::wstring carrier_id;
+	{
+		std::lock_guard<std::mutex> lock(config_mutex_);
+		if (handed_back_ || parked_ || carrier_full_volume_id_.empty())
+			return;
+		carrier_id = carrier_full_volume_id_;
+	}
+	if (carrier_reasserts_ >= kCarrierReasserts || s_sndDevices_.playbackLevelIsUsers.load() != FALSE)
+	{
+		/* The device keeps changing it: the window ends, its next change is recorded as its own setting */
+		s_sndDevices_.engineTookOverPlaybackTick = 0;
+		return;
+	}
+	if (!s_sndDevices_.playbackSettingsAreSaved || carrier_id != s_sndDevices_.savedPlaybackDeviceID)
+		return;
+
+	carrier_reasserts_++;
+	sndDevicesNoteEngineSetPlayback(&s_sndDevices_, 1.0f, FALSE, s_sndDevices_.savedPlaybackMute);
+	setDeviceFullVolumeById(carrier_id, &kEngineVolumeEventContext);
 }
 
 /*
@@ -1381,7 +1516,13 @@ void AudioPassthruPrivate::handBackUnusedDevices(const std::vector<std::wstring>
 			continue;
 		if (!isDevicePresent(id))
 			continue;
-		handBackOwedVolumeById(id);
+		/* BetterFxSound: the carrier's device handed back here (parked, or the carrier output turned off) is no longer
+		   held at 100%, nor at a level the user set meanwhile: the next take-over sets 100% again */
+		if (handBackOwedVolumeById(id) && s_sndDevices_.playbackSettingsAreSaved && id == s_sndDevices_.savedPlaybackDeviceID)
+		{
+			s_sndDevices_.engineTookOverPlaybackTick = 0;
+			s_sndDevices_.playbackLevelIsUsers = FALSE;
+		}
 	}
 }
 

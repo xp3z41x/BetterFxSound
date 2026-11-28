@@ -77,6 +77,9 @@ private:
 	// Puts the own level and mute back on every present device that is owed them (OwedVolume.h) and is not in
 	// in_use, the devices the engine drives right now. UI/timer thread, never under config_mutex_ (COM calls).
 	void handBackUnusedDevices(const std::vector<std::wstring>& in_use);
+	// BetterFxSound: sets the carrier's device to 100% and unmuted again, after the device changed its own level right
+	// after the take-over (a Bluetooth headset sending its stored volume). UI/timer thread.
+	void reassertCarrierFullVolume();
 	bool isDevicePresent(const std::wstring& device_id) const;
 	// BetterFxSound: present and usable as an output (2 channels or more), the controller's own test.
 	bool isOutputPresent(const std::wstring& device_id) const;
@@ -131,6 +134,20 @@ private:
 	std::wstring pending_carrier_id_;			// Asked for by setAsPlaybackDevice(), until the next reinit
 	bool apply_pending_ = false;				// A change arrived during a measurement, apply it afterwards
 	std::wstring carrier_full_volume_id_;		// Carrier whose device was set to 100% and unmuted since the last reinit
+	// BetterFxSound: a carrier that starts playing is held silent until its device is at 100% (applyAdditionalOutputs()),
+	// so it does not play at its own level first and then jump. Which carrier, until then.
+	std::wstring deferred_carrier_enable_id_;
+	// BetterFxSound: setting the carrier to 100% failed (endpoint not ready yet after a connect or a resume). It is tried
+	// again from processTimer() after kCarrierVolumeRetryMs, kCarrierVolumeRetries times at most per reinit.
+	bool carrier_volume_retry_ = false;
+	DWORD carrier_volume_retry_tick_ = 0;
+	int carrier_volume_failures_ = 0;
+	static constexpr int kCarrierVolumeRetries = 5;
+	static constexpr DWORD kCarrierVolumeRetryMs = 1000;
+	// BetterFxSound: times the carrier was set to 100% again after its device changed its own level right after the
+	// take-over (sndDevicesHdlType::playbackFullVolumeReassert), since that take-over. UI/timer thread only.
+	int carrier_reasserts_ = 0;
+	static constexpr int kCarrierReasserts = 3;
 	bool handed_back_ = false;					// restoreDefaultPlaybackDevice() called, until processing starts again
 	bool parked_ = false;						// The last reinit failed, until one succeeds or power off
 	std::wstring failed_carrier_id_;			// Carrier reported as failed (getFailedCarrierId()), until a reinit succeeds

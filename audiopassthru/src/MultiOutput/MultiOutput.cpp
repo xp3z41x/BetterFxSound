@@ -33,6 +33,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include <mutex>
 #include <new>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "MultiOutput.h"
@@ -241,13 +242,64 @@ namespace
 	}
 
 	// Puts a device's own setting back. The level first: some drivers clear the mute flag as a side effect of a
-	// level change.
+	// level change. BetterFxSound: tagged as the engine's change (kEngineVolumeEventContext), so no volume callback
+	// takes it for the user's.
 	bool restoreVolume(IAudioEndpointVolume* volume, float level, BOOL mute)
 	{
-		const bool level_ok = SUCCEEDED(volume->SetMasterVolumeLevelScalar(level, NULL));
-		const bool mute_ok = SUCCEEDED(volume->SetMute(mute, NULL));
+		const bool level_ok = SUCCEEDED(volume->SetMasterVolumeLevelScalar(level, &kEngineVolumeEventContext));
+		const bool mute_ok = SUCCEEDED(volume->SetMute(mute, &kEngineVolumeEventContext));
 		return level_ok && mute_ok;
 	}
+
+	// BetterFxSound: watches an additional output's device for changes of its own level and mute that the engine did not
+	// make (the user's, headset buttons, a Bluetooth device's absolute volume). It only raises the output's flag: the
+	// output's render thread reads the device's setting and deals with it (SecondaryOutput::handleVolumeNoticeLocked()),
+	// nothing is done on the thread that delivers the notification. Registered while the output's stream is open.
+	class VolumeWatch : public IAudioEndpointVolumeCallback
+	{
+	public:
+		explicit VolumeWatch(const std::shared_ptr<std::atomic<bool>>& notice) : ref_count_(1), notice_(notice) {}
+
+		ULONG STDMETHODCALLTYPE AddRef() override
+		{
+			return static_cast<ULONG>(InterlockedIncrement(&ref_count_));
+		}
+
+		ULONG STDMETHODCALLTYPE Release() override
+		{
+			const LONG count = InterlockedDecrement(&ref_count_);
+			if (count == 0)
+				delete this;
+			return static_cast<ULONG>(count);
+		}
+
+		HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override
+		{
+			if (ppv == nullptr)
+				return E_POINTER;
+			if (riid == __uuidof(IUnknown) || riid == __uuidof(IAudioEndpointVolumeCallback))
+			{
+				*ppv = static_cast<IAudioEndpointVolumeCallback*>(this);
+				AddRef();
+				return S_OK;
+			}
+			*ppv = nullptr;
+			return E_NOINTERFACE;
+		}
+
+		HRESULT STDMETHODCALLTYPE OnNotify(PAUDIO_VOLUME_NOTIFICATION_DATA data) override
+		{
+			if (data != nullptr && data->guidEventContext != kEngineVolumeEventContext && notice_ != nullptr)
+				notice_->store(true, std::memory_order_release);
+			return S_OK;
+		}
+
+		virtual ~VolumeWatch() {}
+
+	private:
+		volatile LONG ref_count_;
+		const std::shared_ptr<std::atomic<bool>> notice_;
+	};
 
 	// ---- Owed volume record (OwedVolume.h) ----
 
@@ -298,6 +350,42 @@ namespace
 		OwedSetting value = { level, mute ? 1u : 0u };
 		RegSetValueExW(key, device_id.c_str(), 0, REG_BINARY, reinterpret_cast<const BYTE*>(&value), sizeof(value));
 		RegCloseKey(key);
+	}
+
+	// BetterFxSound: counts the take-overs of each device (an additional output's or the carrier's), so a hand-back that
+	// ran at the same time as a newer take-over of the same device can tell (restoreOwedVolume()). Kept for the process's
+	// lifetime: one entry per device ever taken over. Under owedVolumeMutex().
+	std::vector<std::pair<std::wstring, unsigned>>& volumeGenerationsLocked()
+	{
+		static std::vector<std::pair<std::wstring, unsigned>> generations;
+		return generations;
+	}
+
+	unsigned volumeGeneration(const std::wstring& device_id)
+	{
+		std::lock_guard<std::mutex> lock(owedVolumeMutex());
+		for (const auto& entry : volumeGenerationsLocked())
+		{
+			if (entry.first == device_id)
+				return entry.second;
+		}
+		return 0;
+	}
+
+	void bumpVolumeGeneration(const std::wstring& device_id)
+	{
+		if (device_id.empty())
+			return;
+		std::lock_guard<std::mutex> lock(owedVolumeMutex());
+		for (auto& entry : volumeGenerationsLocked())
+		{
+			if (entry.first == device_id)
+			{
+				entry.second++;
+				return;
+			}
+		}
+		volumeGenerationsLocked().push_back(std::make_pair(device_id, 1u));
 	}
 }
 
@@ -361,6 +449,42 @@ std::vector<std::wstring> owedVolumeDevices()
 	return devices;
 }
 
+namespace
+{
+	// BetterFxSound: puts the setting owed to the device back on it and forgets it (true when nothing is owed any more).
+	// If the device or its volume control is not available, it stays owed (false). device may be null, then it is looked
+	// up by its ID. A take-over of the same device that ran meanwhile (an output enabled again, the device made the
+	// carrier: bumpVolumeGeneration()) wins: the device is set to 100% again and stays owed (false). A hand-back that
+	// was slow in a driver call used to undo it, and erase the record the newer owner relied on.
+	bool restoreOwedVolume(const std::wstring& device_id, IMMDevice* device)
+	{
+		const unsigned generation = volumeGeneration(device_id);
+		float level = 1.0f;
+		BOOL mute = FALSE;
+		if (!owedVolumeGet(device_id, &level, &mute))
+			return true;
+
+		bool superseded = false;
+		auto hand_back = [&](IAudioEndpointVolume* volume) -> bool
+		{
+			if (!restoreVolume(volume, level, mute))
+				return false;
+			if (volumeGeneration(device_id) != generation)
+			{
+				superseded = true;
+				setFullVolume(volume, &kEngineVolumeEventContext);
+			}
+			return true;
+		};
+
+		const bool done = (device != nullptr) ? withEndpointVolume(device, hand_back) : withEndpointVolumeById(device_id, hand_back);
+		if (!done || superseded)
+			return false;
+		owedVolumeErase(device_id);
+		return true;
+	}
+}
+
 /*
  * One additional output device.
  *
@@ -403,17 +527,22 @@ public:
 	static constexpr double kPhaseCapSecs = 0.100;            // Time since the last write counted in the level of an empty queue at most
 	static constexpr int kDeviceAllowanceMs = 10;             // Device queue counted in the target (a 20 ms buffer less a period; kept with the 30 ms buffer, see kDeviceBufferHns)
 	static constexpr int kDeviceHeadroomUseMs = 20;           // A larger device queue may take this much of the ring's headroom
+	static constexpr DWORD kFullVolumeRetryMs = 1000;         // BetterFxSound: a take-over whose 100% failed is tried again after this
+	static constexpr int kFullVolumeAttempts = 5;             // BetterFxSound: that many times at most
+	static constexpr DWORD kReassertMs = 5000;                // BetterFxSound: a device's own level change this soon after the take-over is not the user's
+	static constexpr int kMaxReasserts = 3;                   // BetterFxSound: 100% set again that many times at most per take-over
 
 	// Creates the output and starts its render thread. The thread holds its own reference to the output, so the
 	// output is freed only once the thread no longer uses it (see requestStop()).
-	static std::shared_ptr<SecondaryOutput> create(const AdditionalOutputConfig& config, const std::shared_ptr<std::atomic<bool>>& driven)
+	static std::shared_ptr<SecondaryOutput> create(const AdditionalOutputConfig& config, const std::shared_ptr<std::atomic<bool>>& driven,
+		const std::shared_ptr<std::atomic<bool>>& late_exits)
 	{
-		std::shared_ptr<SecondaryOutput> output(new SecondaryOutput(config, driven));
+		std::shared_ptr<SecondaryOutput> output(new SecondaryOutput(config, driven, late_exits));
 		DWORD error = ERROR_SUCCESS;
 		if (output->stop_event_ != NULL && output->audio_event_ != NULL)
 		{
 			auto* thread_reference = new std::shared_ptr<SecondaryOutput>(output);
-			output->thread_ = CreateThread(NULL, 0, threadProc, thread_reference, 0, NULL);
+			output->thread_ = CreateThread(NULL, 0, threadProc, thread_reference, 0, &output->thread_id_);
 			if (output->thread_ == NULL)
 			{
 				error = GetLastError();
@@ -445,10 +574,26 @@ public:
 	// uses this object any more.
 	~SecondaryOutput()
 	{
+		// BetterFxSound: on the render thread, the output was removed while that thread was stuck in a driver call, and
+		// the router gave up waiting for it: the device may have been taken over again since (the output enabled again,
+		// or the device made the carrier), and handing it back here undid that (the new owner then played at the device's
+		// own level times the app's gain, and its record was erased). The engine's sweep, which knows the devices in use
+		// now, hands it back instead (MultiOutputRouter::takeLateExits()).
+		// An output whose render thread never started never took its device over: nothing to hand back (the router
+		// replaces it with a new output for the same device, which may have taken it over already).
+		const bool late = (thread_id_ != 0 && GetCurrentThreadId() == thread_id_);
+		const bool started = (thread_ != NULL);
+
 		if (thread_ != NULL)
 			CloseHandle(thread_);
 
 		// The engine stops using the device: its own level and mute go back on it.
+		if (late)
+		{
+			if (late_exits_ != nullptr)
+				late_exits_->store(true);
+		}
+		else if (started)
 		{
 			std::lock_guard<std::mutex> lock(volume_mutex_);
 			handBackVolumeLocked(nullptr);
@@ -502,27 +647,112 @@ public:
 	}
 
 private:
-	// Takes the device over or hands it back for the engine's driving state. Caller holds volume_mutex_.
+	// Takes the device over or hands it back for the engine's driving state. Caller holds volume_mutex_. BetterFxSound:
+	// a take-over whose 100% could not be set is tried again. Stopping to drive ends a level the user set meanwhile: the
+	// next take-over sets 100% again (as for the carrier).
 	void applyDrivenLocked(bool driven)
 	{
 		if (driven)
 		{
-			if (!volume_taken_ && stream_open_.load() && !stopping_.load())
+			if ((!volume_taken_ || full_volume_pending_) && stream_open_.load() && !stopping_.load())
+			{
+				full_volume_attempts_ = 0;
 				takeOverVolumeLocked(nullptr);
+			}
 		}
 		else
 		{
+			user_level_ = false;
 			handBackVolumeLocked(nullptr);
 		}
 	}
 
-	// BetterFxSound: render thread, outside render(): a driving change that setDriven() could not apply.
+	// BetterFxSound: render thread, outside render(): a driving change that setDriven() could not apply. Not once the
+	// output is being removed: removal hands the device back (~SecondaryOutput()).
 	void applyDeferredDriven()
 	{
 		if (!volume_recheck_.load(std::memory_order_relaxed) || !volume_recheck_.exchange(false))
 			return;
 		std::lock_guard<std::mutex> lock(volume_mutex_);
+		if (stopping_.load())
+			return;
 		applyDrivenLocked(driven_ != nullptr && driven_->load());
+	}
+
+	// BetterFxSound: render thread, outside render(): the device volume work left to this thread. A take-over whose 100%
+	// could not be set is tried again, and a change of the device's own setting (VolumeWatch) is looked at. Skipped
+	// while the UI thread holds volume_mutex_ (it is done on a later pass).
+	void applyVolumeWork(DWORD now)
+	{
+		const bool notice = volume_notice_ != nullptr && volume_notice_->load(std::memory_order_acquire);
+		if (!notice && !volume_retry_.load(std::memory_order_relaxed))
+			return;
+
+		std::unique_lock<std::mutex> lock(volume_mutex_, std::try_to_lock);
+		if (!lock.owns_lock())
+			return;
+
+		if (volume_retry_.load(std::memory_order_relaxed) && now - volume_retry_tick_ >= kFullVolumeRetryMs)
+		{
+			volume_retry_.store(false);
+			if (full_volume_pending_ && stream_open_.load() && !stopping_.load() && driven_ != nullptr && driven_->load())
+				takeOverVolumeLocked(device_);
+		}
+
+		if (notice)
+		{
+			volume_notice_->store(false);
+			handleVolumeNoticeLocked(now);
+		}
+	}
+
+	// BetterFxSound: the device's own level or mute changed while the stream is open, not by the engine. The device's
+	// setting now is read (a driver's late report of an earlier change is then simply the current setting). While the
+	// engine holds it at 100%: a change within kReassertMs of the take-over is the device's own (a Bluetooth device with
+	// absolute volume sending its stored level once connected), 100% is set again, a few times at most; a later one is
+	// the user's: the device keeps it, it is owed back to it instead of the old one, and a reopen of the stream does not
+	// set 100% again (user_level_), until the engine stops driving the outputs. Nothing watched it: such a change stacked
+	// on the app's gain, was lost at the hand-back, and was overwritten by 100% at the next reopen. Render thread, caller
+	// holds volume_mutex_.
+	void handleVolumeNoticeLocked(DWORD now)
+	{
+		if (!volume_taken_ || stopping_.load() || endpoint_volume_ == nullptr || driven_ == nullptr || !driven_->load())
+			return;
+
+		float level = 1.0f;
+		BOOL mute = FALSE;
+		if (FAILED(endpoint_volume_->GetMasterVolumeLevelScalar(&level)) || FAILED(endpoint_volume_->GetMute(&mute)))
+			return;
+		const bool at_full = (level >= 0.99f) && (mute == FALSE);
+
+		if (!user_level_)
+		{
+			if (at_full)
+				return;	// At our 100%
+			if (took_over_tick_ != 0 && now - took_over_tick_ < kReassertMs && reasserts_ < kMaxReasserts)
+			{
+				reasserts_++;
+				setFullVolume(endpoint_volume_, &kEngineVolumeEventContext);
+				return;
+			}
+		}
+
+		owedVolumeUpdate(device_id_, level, mute);
+		user_level_ = !at_full;
+		took_over_tick_ = 0;
+		full_volume_pending_ = false;
+		volume_retry_.store(false);
+	}
+
+	// BetterFxSound: render thread. The stream was lost or could not be opened while the device may still be there (an
+	// app opened it in exclusive mode, a format change, a stall): the device is not FxSound's until the stream opens
+	// again, which takes it over again (openClient()). It stayed at our 100% and unmuted, so an app holding it in
+	// exclusive mode played at its full hardware level. Not once the output is being removed (~SecondaryOutput()).
+	void handBackAfterLoss()
+	{
+		std::lock_guard<std::mutex> lock(volume_mutex_);
+		if (volume_taken_ && !stopping_.load())
+			handBackVolumeLocked(nullptr);
 	}
 
 public:
@@ -651,8 +881,11 @@ public:
 	}
 
 private:
-	SecondaryOutput(const AdditionalOutputConfig& config, const std::shared_ptr<std::atomic<bool>>& driven)
-		: device_id_(config.device_id), driven_(driven), ring_(static_cast<size_t>(kRingFrames) * kMaxChannels, 0.0f)
+	SecondaryOutput(const AdditionalOutputConfig& config, const std::shared_ptr<std::atomic<bool>>& driven,
+		const std::shared_ptr<std::atomic<bool>>& late_exits)
+		: device_id_(config.device_id), driven_(driven), late_exits_(late_exits),
+		  volume_notice_(std::make_shared<std::atomic<bool>>(false)),
+		  ring_(static_cast<size_t>(kRingFrames) * kMaxChannels, 0.0f)
 	{
 		applyConfig(config);
 		// Fade in from silence: the master volume is applied on top of the trim.
@@ -714,6 +947,8 @@ private:
 			const UINT32 pending = pending_rate_.load(std::memory_order_acquire);
 			const DWORD now = GetTickCount();
 
+			applyVolumeWork(now);
+
 			// BetterFxSound: the device is opened once audio comes, in its own mix format, and only opened again after it
 			// failed. A new processing rate (a carrier in the other rate family) only sets the ring up again: the stream
 			// keeps running. It used to be closed, opened again and primed, a dropout of seconds on Bluetooth.
@@ -726,6 +961,7 @@ private:
 				if (!openClient())
 				{
 					closeClient();
+					handBackAfterLoss();
 					// BetterFxSound: a device that keeps failing (held in exclusive mode, a driver that does not come back)
 					// is tried less often. The error is reported (lastError()).
 					failures++;
@@ -754,6 +990,7 @@ private:
 				last_error_.store(FAILED(render_error_) ? render_error_ : E_FAIL);
 				active_format_.store(0, std::memory_order_release);
 				closeClient();
+				handBackAfterLoss();
 				failures++;
 				next_retry = now + (failures > kRetriesBeforeBackoff ? kRetryLongMs : kRetryMs);
 			}
@@ -980,18 +1217,39 @@ private:
 		padding_after_ = buffer_frames_;
 		last_progress_tick_ = GetTickCount();
 
+		// BetterFxSound: the device's own level and mute are watched while the stream is open (handleVolumeNoticeLocked()).
+		// Without it the stream plays all the same.
+		if (SUCCEEDED(device_->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, NULL, reinterpret_cast<void**>(&endpoint_volume_))) &&
+			endpoint_volume_ != nullptr)
+		{
+			VolumeWatch* watch = new (std::nothrow) VolumeWatch(volume_notice_);
+			if (watch != nullptr)
+			{
+				if (SUCCEEDED(endpoint_volume_->RegisterControlChangeNotify(watch)))
+					volume_watch_ = watch;
+				else
+					watch->Release();
+			}
+		}
+
 		// The device's own volume, once per stream open, never while rendering. While the engine drives the
 		// outputs it records the device's own level and mute, then sets 100% and unmuted so they do not stack
 		// on the app's gain. While it does not (FxSound off, the device may be the Windows default and play
 		// the apps' sound directly), it puts back a setting still owed to the device, for example after the
 		// device was unplugged while taken over and has just come back. An output being removed leaves it.
+		// BetterFxSound: it did hand the device back when it was removed while this thread opened the stream, so a
+		// thread that came back from the driver after the router stopped waiting for it undid a newer take-over of the
+		// device. Its removal (~SecondaryOutput()) or the engine's sweep does it.
 		{
 			std::lock_guard<std::mutex> lock(volume_mutex_);
 			stream_open_.store(true);
-			if (driven_ != nullptr && driven_->load() && !stopping_.load())
-				takeOverVolumeLocked(device_);
-			else
-				handBackVolumeLocked(device_);
+			if (!stopping_.load())
+			{
+				if (driven_ != nullptr && driven_->load())
+					takeOverVolumeLocked(device_);
+				else
+					handBackVolumeLocked(device_);
+			}
 		}
 		return true;
 	}
@@ -1000,9 +1258,19 @@ private:
 	// device is still at our 100% and the recorded setting is its own), then sets it to 100% and unmuted. If the
 	// device's setting can't be read, the device is left alone. Caller holds volume_mutex_. device may be null,
 	// then the device is looked up by its ID.
+	// BetterFxSound: a level the user set on the device while the engine drove it is kept (user_level_, see
+	// handleVolumeNoticeLocked()). The change is tagged as the engine's (kEngineVolumeEventContext): when the device is
+	// also the carrier for a moment (right after a reinit made it the carrier), the carrier's callback recorded our 100%
+	// as the user's own level. A take-over whose 100% could not be set (the endpoint not ready yet after a connect or a
+	// resume) was marked done all the same and never tried again: it is tried again from the render thread
+	// (applyVolumeWork()), kFullVolumeAttempts times at most.
 	void takeOverVolumeLocked(IMMDevice* device)
 	{
-		auto take_over = [this](IAudioEndpointVolume* volume) -> bool
+		bumpVolumeGeneration(device_id_);
+
+		bool forced = false;
+		bool full_volume_set = false;
+		auto take_over = [this, &forced, &full_volume_set](IAudioEndpointVolume* volume) -> bool
 		{
 			float level = 1.0f;
 			BOOL mute = FALSE;
@@ -1012,44 +1280,59 @@ private:
 					return false;
 				owedVolumeRecord(device_id_, level, mute);
 			}
-			setFullVolume(volume, NULL);
 			volume_taken_ = true;
+			if (user_level_)
+				return true;
+			forced = true;
+			full_volume_set = setFullVolume(volume, &kEngineVolumeEventContext);
 			return true;
 		};
 
-		if (device != nullptr)
-			withEndpointVolume(device, take_over);
-		else
-			withEndpointVolumeById(device_id_, take_over);
+		const bool done = (device != nullptr) ? withEndpointVolume(device, take_over) : withEndpointVolumeById(device_id_, take_over);
+		if (done && (!forced || full_volume_set))
+		{
+			full_volume_pending_ = false;
+			full_volume_attempts_ = 0;
+			volume_retry_.store(false);
+			if (forced)
+			{
+				took_over_tick_ = GetTickCount();
+				if (took_over_tick_ == 0)
+					took_over_tick_ = 1;
+				reasserts_ = 0;
+			}
+			return;
+		}
+
+		full_volume_attempts_++;
+		full_volume_pending_ = (full_volume_attempts_ < kFullVolumeAttempts);
+		volume_retry_tick_ = GetTickCount();
+		volume_retry_.store(full_volume_pending_);
 	}
 
 	// Puts the device's own level and mute back if they are owed (whoever took the device over: this output, an
 	// earlier one for the same device, or a run of the app that crashed). If the device is not there, the setting
 	// stays owed and is put back later (next stream open while not driven, power off, removal, or the engine's
 	// sweep of devices it does not use). Caller holds volume_mutex_. device may be null, then the device is looked
-	// up by its ID.
+	// up by its ID. BetterFxSound: a newer take-over of the device that ran meanwhile wins (restoreOwedVolume()).
 	void handBackVolumeLocked(IMMDevice* device)
 	{
 		volume_taken_ = false;
-
-		float level = 1.0f;
-		BOOL mute = FALSE;
-		if (!owedVolumeGet(device_id_, &level, &mute))
-			return;
-
-		auto hand_back = [level, mute](IAudioEndpointVolume* volume) -> bool
-		{
-			return restoreVolume(volume, level, mute);
-		};
-
-		const bool done = (device != nullptr) ? withEndpointVolume(device, hand_back) : withEndpointVolumeById(device_id_, hand_back);
-		if (done)
-			owedVolumeErase(device_id_);
+		full_volume_pending_ = false;
+		full_volume_attempts_ = 0;
+		volume_retry_.store(false);
+		took_over_tick_ = 0;
+		restoreOwedVolume(device_id_, device);
 	}
 
 	void closeClient()
 	{
 		stream_open_.store(false);
+		// BetterFxSound: the device's own setting is watched only while the stream is open (openClient()).
+		if (endpoint_volume_ != nullptr && volume_watch_ != nullptr)
+			endpoint_volume_->UnregisterControlChangeNotify(volume_watch_);
+		safeRelease(volume_watch_);
+		safeRelease(endpoint_volume_);
 		if (client_ != nullptr && running_)
 			client_->Stop();
 		running_ = false;
@@ -1502,6 +1785,10 @@ private:
 
 	const std::wstring device_id_;
 	const std::shared_ptr<std::atomic<bool>> driven_;	// The router's flag
+	const std::shared_ptr<std::atomic<bool>> late_exits_;	// BetterFxSound: the router's, see ~SecondaryOutput()
+	const std::shared_ptr<std::atomic<bool>> volume_notice_;	// BetterFxSound: raised by VolumeWatch, shared with it
+	DWORD thread_id_ = 0;	// BetterFxSound: the render thread's, see ~SecondaryOutput()
+	std::atomic<bool> volume_retry_{ false };	// BetterFxSound: a take-over is to be tried again (applyVolumeWork())
 	std::atomic<bool> stream_open_{ false };	// Written by the render thread
 	std::atomic<bool> stopping_{ false };		// requestStop() was called: the device is not taken over any more
 	std::atomic<HRESULT> last_error_{ S_OK };	// BetterFxSound: last failed open or render, S_OK once a stream opened (lastError())
@@ -1512,6 +1799,13 @@ private:
 	// on/off and removal (UI thread), always under volume_mutex_ and never while rendering.
 	std::mutex volume_mutex_;
 	bool volume_taken_ = false;		// This output set the device to 100% since it last handed it back
+	// BetterFxSound, also under volume_mutex_:
+	bool user_level_ = false;		// The user set the device's own level while driven: it keeps it (handleVolumeNoticeLocked())
+	bool full_volume_pending_ = false;	// Setting 100% failed, it is tried again (takeOverVolumeLocked())
+	int full_volume_attempts_ = 0;	// Failed attempts since the take-over started
+	DWORD volume_retry_tick_ = 0;	// When the last attempt failed
+	DWORD took_over_tick_ = 0;		// When the device was last set to 100% by a take-over, 0 = not held there now
+	int reasserts_ = 0;				// 100% set again since then (handleVolumeNoticeLocked())
 	std::atomic<int> delay_ms_{ 0 };
 	std::atomic<int> channel_mode_{ 0 };
 	std::atomic<float> target_gain_{ 1.0f };
@@ -1536,6 +1830,8 @@ private:
 
 	// Render thread only.
 	IMMDevice* device_ = nullptr;
+	IAudioEndpointVolume* endpoint_volume_ = nullptr;	// BetterFxSound: while the stream is open, with volume_watch_ registered
+	VolumeWatch* volume_watch_ = nullptr;
 	IAudioClient* client_ = nullptr;
 	IAudioRenderClient* render_ = nullptr;
 	UINT32 buffer_frames_ = 0;
@@ -1573,6 +1869,8 @@ private:
 
 bool setDeviceFullVolumeById(const std::wstring& device_id, const GUID* event_context)
 {
+	// BetterFxSound: a take-over (the carrier's): a hand-back of the device running at the same time leaves it at 100%.
+	bumpVolumeGeneration(device_id);
 	return withEndpointVolumeById(device_id, [event_context](IAudioEndpointVolume* volume) -> bool
 	{
 		return setFullVolume(volume, event_context);
@@ -1581,18 +1879,7 @@ bool setDeviceFullVolumeById(const std::wstring& device_id, const GUID* event_co
 
 bool handBackOwedVolumeById(const std::wstring& device_id)
 {
-	float level = 1.0f;
-	BOOL mute = FALSE;
-	if (!owedVolumeGet(device_id, &level, &mute))
-		return true;
-
-	const bool done = withEndpointVolumeById(device_id, [level, mute](IAudioEndpointVolume* volume) -> bool
-	{
-		return restoreVolume(volume, level, mute);
-	});
-	if (done)
-		owedVolumeErase(device_id);
-	return done;
+	return restoreOwedVolume(device_id, nullptr);
 }
 
 void applyOutputChannelMode(float* buffer, UINT32 frames, UINT32 channels, OutputChannelMode mode)
@@ -1638,6 +1925,7 @@ namespace
 {
 	// How long removing outputs waits, in all, for their render threads to exit. A thread still busy after that
 	// (stuck in a driver call) frees its output itself when it is done, so this only bounds the UI thread's wait.
+	// BetterFxSound: such an output leaves its device's owed volume to the engine's sweep (takeLateExits()).
 	constexpr DWORD kStopWaitMs = 2000;
 
 	void stopOutputs(std::vector<std::shared_ptr<SecondaryOutput>>& outputs)
@@ -1655,7 +1943,8 @@ namespace
 }
 
 MultiOutputRouter::MultiOutputRouter()
-	: driven_(std::make_shared<std::atomic<bool>>(false))
+	: driven_(std::make_shared<std::atomic<bool>>(false)),
+	  late_exits_(std::make_shared<std::atomic<bool>>(false))
 {
 	InitializeSRWLock(&lock_);
 }
@@ -1742,7 +2031,7 @@ void MultiOutputRouter::configureLocked(const std::vector<AdditionalOutputConfig
 			// indexes) and created again by retryFailedOutputs(). The exception used to leave the exclusive lock held.
 			try
 			{
-				output = SecondaryOutput::create(config, driven_);
+				output = SecondaryOutput::create(config, driven_, late_exits_);
 			}
 			catch (const std::bad_alloc&)
 			{
@@ -1868,6 +2157,11 @@ void MultiOutputRouter::setDriven(bool driven)
 bool MultiOutputRouter::isDriven() const
 {
 	return driven_->load();
+}
+
+bool MultiOutputRouter::takeLateExits()
+{
+	return late_exits_->load() && late_exits_->exchange(false);
 }
 
 void MultiOutputRouter::write(const float* data, UINT32 frames, UINT32 channels, UINT32 sample_rate, int solo_index)

@@ -127,6 +127,13 @@ int PT_DECLSPEC sndDevicesInit(PT_HANDLE *hp_sndDevices, CSlout *hp_slout, int i
 	cast_handle->engineSetPlaybackLevel = -1.0f;
 	cast_handle->engineSetPlaybackMute = FALSE;
 	cast_handle->engineSetPlaybackTick = 0;
+	cast_handle->engineSetPlaybackFromMute = FALSE;
+	cast_handle->engineSetPlaybackPrevLevel = -1.0f;
+	cast_handle->engineSetPlaybackPrevMute = FALSE;
+	cast_handle->engineSetPlaybackPrevTick = 0;
+	cast_handle->engineTookOverPlaybackTick = 0;
+	cast_handle->playbackFullVolumeReassert = FALSE;
+	cast_handle->playbackLevelIsUsers = FALSE;
 
 	for(i=0; i<SND_DEVICES_MAX_NUM_DEVICES; i++)
 	{

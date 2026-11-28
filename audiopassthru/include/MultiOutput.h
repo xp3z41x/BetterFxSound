@@ -42,7 +42,8 @@ class SecondaryOutput;
 bool setDeviceFullVolumeById(const std::wstring& device_id, const GUID* event_context);
 
 // BetterFxSound: puts the device's own level and mute back if the engine owes them (see OwedVolume.h), then forgets
-// them. Returns false if something is owed and the device or its volume control is not available (it stays owed).
+// them. Returns false if something is owed and the device or its volume control is not available (it stays owed), or
+// if the device was taken over again meanwhile (it is then left at 100% and stays owed).
 // For devices the engine does not use (any more). Never from an audio processing or render loop.
 bool handBackOwedVolumeById(const std::wstring& device_id);
 
@@ -69,7 +70,8 @@ void applyOutputChannelMode(float* buffer, UINT32 frames, UINT32 channels, Outpu
  *  - Each output's render thread holds a reference to its output, so an output that is removed while its
  *    thread is stuck in a driver call (a Bluetooth device going away can block WASAPI calls for seconds) is
  *    never freed under it: removal waits for the threads for a bounded time, and a thread that is still busy
- *    finishes and frees its output on its own.
+ *    finishes and frees its output on its own. BetterFxSound: it then leaves the device's volume to the engine's sweep
+ *    (takeLateExits()).
  */
 class MultiOutputRouter
 {
@@ -108,6 +110,12 @@ public:
 	// Whether the engine drives the outputs (see setDriven()). Only then do they take their devices over.
 	bool isDriven() const;
 
+	// BetterFxSound: true once (then cleared) after a removed output's render thread, which the router stopped waiting
+	// for, has exited. Such an output leaves its device's owed volume to the engine's sweep (handBackOwedVolumeById() for
+	// the devices not in use), which the caller then runs: handing it back late, on that thread, undid a newer take-over
+	// of the device. UI/timer thread.
+	bool takeLateExits();
+
 	// Audio thread: queues one block of processed, interleaved 32 bit float audio.
 	// solo_index >= 0: only that output gets the audio, the others get silence.
 	// solo_index == -1: every output here gets silence (the carrier output is being measured).
@@ -134,6 +142,8 @@ private:
 	DWORD skipped_tick_ = 0;
 	// Read by the outputs' render threads, which may outlive the router (see above), hence shared.
 	std::shared_ptr<std::atomic<bool>> driven_;
+	// BetterFxSound: set by an output freed late on its render thread (takeLateExits()). Shared for the same reason.
+	std::shared_ptr<std::atomic<bool>> late_exits_;
 	// shared_ptr so that setDriven() can keep the outputs alive while it works on them without the lock.
 	// Only the UI thread holds extra references, so an output is never destroyed on the audio thread.
 	std::vector<std::shared_ptr<SecondaryOutput>> outputs_;

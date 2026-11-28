@@ -521,6 +521,24 @@ struct sndDevicesHdlType {
 	std::atomic<float> engineSetPlaybackLevel;
 	std::atomic<BOOL> engineSetPlaybackMute;
 	std::atomic<DWORD> engineSetPlaybackTick;
+	// BetterFxSound: the engine writes the level, then the mute, and a driver may report the level change on its own:
+	// the new level with the mute the device had before (engineSetPlaybackFromMute). A late report of the engine's
+	// previous change (engineSetPlaybackPrev*, when the engine changes the device again within a few seconds) is not
+	// the user's either. Written with sndDevicesNoteEngineSetPlayback(), before engineSetPlaybackTick.
+	std::atomic<BOOL> engineSetPlaybackFromMute;
+	std::atomic<float> engineSetPlaybackPrevLevel;
+	std::atomic<BOOL> engineSetPlaybackPrevMute;
+	std::atomic<DWORD> engineSetPlaybackPrevTick;
+	// BetterFxSound: when the engine last set the carrier's device to 100% and unmuted when it started using it, 0 when it
+	// does not hold the device now. A change of the device's own level a few seconds after that (a Bluetooth device with
+	// absolute volume sending its stored level once it is connected) is not taken for the user's: the callback asks for
+	// 100% again (playbackFullVolumeReassert, applied by AudioPassthruPrivate::processTimer()).
+	std::atomic<DWORD> engineTookOverPlaybackTick;
+	std::atomic<BOOL> playbackFullVolumeReassert;
+	// BetterFxSound: the user changed the carrier's own level or mute while the engine held it at 100%: the device keeps
+	// that setting (it is also the owed one) and a reinit does not set it to 100% again, until the engine hands the
+	// device back (sndDevices_RestoreSavedPlaybackDeviceSettings()). The same policy as the additional outputs.
+	std::atomic<BOOL> playbackLevelIsUsers;
 
 	int noBufferCount;			// This is a count of how many times no buffers were available in a DoRecording call.
 	int WindowsSilentBufferCount;				// This is a buffer specified by the Windows flag to be all zeros.
@@ -537,6 +555,20 @@ struct sndDevicesHdlType {
 
 	void (*deviceChangeCallback)();
 };
+
+// BetterFxSound: notes a level and mute the engine is about to set on the carrier's device, and the mute the device has
+// before it, so the playback volume callback does not take a driver's report of them for the user's own change. The
+// previous change is kept as well (see engineSetPlaybackPrev*).
+inline void sndDevicesNoteEngineSetPlayback(struct sndDevicesHdlType *cast_handle, float level, BOOL mute, BOOL from_mute)
+{
+	cast_handle->engineSetPlaybackPrevLevel = cast_handle->engineSetPlaybackLevel.load();
+	cast_handle->engineSetPlaybackPrevMute = cast_handle->engineSetPlaybackMute.load();
+	cast_handle->engineSetPlaybackPrevTick = cast_handle->engineSetPlaybackTick.load();
+	cast_handle->engineSetPlaybackLevel = level;
+	cast_handle->engineSetPlaybackMute = mute;
+	cast_handle->engineSetPlaybackFromMute = from_mute;
+	cast_handle->engineSetPlaybackTick = GetTickCount();
+}
 
 _COM_SMARTPTR_TYPEDEF(IMMDevice, __uuidof(IMMDevice));
 _COM_SMARTPTR_TYPEDEF(IMMDeviceEnumerator, __uuidof(IMMDeviceEnumerator));

@@ -259,11 +259,10 @@ static void sndDevices_RestoreSavedPlaybackDeviceSettings(struct sndDevicesHdlTy
 		{
 			HRESULT hrLevel = S_OK;
 
-			// BetterFxSound: noted, so that the driver reporting this change back is not taken for the user's.
-			if( cast_handle->savedPlaybackLevelIsSaved )
-				cast_handle->engineSetPlaybackLevel = cast_handle->savedPlaybackLevel;
-			cast_handle->engineSetPlaybackMute = cast_handle->savedPlaybackMute;
-			cast_handle->engineSetPlaybackTick = GetTickCount();
+			// BetterFxSound: noted, so that the driver reporting this change back is not taken for the user's. The device
+			// is at our 100% and unmuted before it (the level is set first: unmuted with the level put back, then muted).
+			sndDevicesNoteEngineSetPlayback(cast_handle, cast_handle->savedPlaybackLevelIsSaved ? cast_handle->savedPlaybackLevel : cast_handle->engineSetPlaybackLevel.load(),
+				cast_handle->savedPlaybackMute, FALSE);
 
 			// BetterFxSound: the level first, then mute: some drivers clear the mute flag as a side effect of a level change.
 			if( cast_handle->savedPlaybackLevelIsSaved )
@@ -276,6 +275,11 @@ static void sndDevices_RestoreSavedPlaybackDeviceSettings(struct sndDevicesHdlTy
 			pEndptVol->Release();
 		}
 	}
+
+	// BetterFxSound: the engine no longer holds the device at 100%, nor keeps a level the user set on it meanwhile.
+	cast_handle->engineTookOverPlaybackTick = 0;
+	cast_handle->playbackFullVolumeReassert = FALSE;
+	cast_handle->playbackLevelIsUsers = FALSE;
 
 	// BetterFxSound: the owed volume record follows.
 	if( restored )
@@ -374,6 +378,10 @@ int PT_DECLSPEC sndDevicesInitialSetupPlaybackDevice(PT_HANDLE *hp_sndDevices, i
 			{
 				float owedLevel;
 				BOOL owedMute;
+
+				// BetterFxSound: a device the engine starts using is set to 100% (see playbackLevelIsUsers).
+				cast_handle->engineTookOverPlaybackTick = 0;
+				cast_handle->playbackLevelIsUsers = FALSE;
 
 				if( owedVolumeGet(playbackDeviceID, &owedLevel, &owedMute) )
 				{
