@@ -135,6 +135,20 @@ int PT_DECLSPEC sndDevicesInit(PT_HANDLE *hp_sndDevices, CSlout *hp_slout, int i
 	cast_handle->playbackFullVolumeReassert = FALSE;
 	cast_handle->playbackTakeOversPending = 0;
 	cast_handle->playbackLevelIsUsers = FALSE;
+	cast_handle->playbackCallbackIsOnSavedDevice = FALSE;
+	wcscpy(cast_handle->handedBackPlaybackDeviceID, L"");
+	cast_handle->handedBackPlaybackMute = FALSE;
+	cast_handle->handedBackPlaybackLevel = 1.0f;
+	cast_handle->handedBackPlaybackLevelIsSaved = FALSE;
+	cast_handle->handedBackPlaybackIsPending = FALSE;
+	{
+		std::lock_guard<std::mutex> lock(cast_handle->virtualDefaultMutex);
+		cast_handle->virtualDefaultGuardArmed = FALSE;
+		cast_handle->virtualDefaultGuardHint = FALSE;
+		wcscpy(cast_handle->pickedDefaultID, L"");
+		cast_handle->pickedDefaultSequence = 0;
+	}
+	InterlockedExchange(&(cast_handle->defaultPickSequence), 0);
 
 	for(i=0; i<SND_DEVICES_MAX_NUM_DEVICES; i++)
 	{
@@ -324,6 +338,9 @@ int PT_DECLSPEC sndDevices_ReleaseAllAudioObjects(PT_HANDLE *hp_sndDevices)
 		}
 		pEndptVolCapture->Release();
 	}
+
+	// BetterFxSound: the callback is about to leave the device whose setting is saved.
+	cast_handle->playbackCallbackIsOnSavedDevice = FALSE;
 
 	// Turn off playback device volume control callback
 	if (pEndptVolPlayback != NULL)

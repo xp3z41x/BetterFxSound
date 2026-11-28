@@ -31,7 +31,10 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include <mmdeviceapi.h>
 #include <endpointvolume.h>
 #include <string>
+#include <new>
 
+// This is the include file for the "hidden" IPolicyConfig MS functions.
+#include "PolicyConfig.h"
 
 #include "slout.h"
 #include "mry.h"
@@ -245,6 +248,90 @@ static void sndDevicesCallbackPublishDefault(struct sndDevicesHdlType *cast_hand
 	InterlockedExchange(&(cast_handle->enumerationSequence), sequence + 2);
 }
 
+// BetterFxSound: a real device made the Windows default while the processing runs, see
+// sndDevicesHdlType::virtualDefaultMutex. One work item per notification, which owns this.
+struct sndDevicesVirtualDefaultWork
+{
+	struct sndDevicesHdlType *cast_handle;
+	LONG sequence;
+	wchar_t pickedID[PT_MAX_GENERIC_STRLEN];
+	wchar_t dfxID[PT_MAX_GENERIC_STRLEN];
+};
+
+// Runs on a thread pool thread: the notification callback must not change the default device itself (an MMDevice API
+// call from a notification callback can deadlock). Puts the virtual device back as the default, if the processing still
+// runs (under the lock, so never after sndDevicesRestoreDefaultDevice() handed the devices back), and records the device
+// picked for the next run of the device rules, which makes it the carrier as it did when it found it the default.
+static DWORD WINAPI sndDevicesVirtualDefaultWorker(LPVOID pv_work)
+{
+	sndDevicesVirtualDefaultWork *work = (sndDevicesVirtualDefaultWork *)pv_work;
+	struct sndDevicesHdlType *cast_handle;
+	IPolicyConfigVista *pPolicyConfig = NULL;
+	int selectionMode = SND_DEVICES_AUTO_SELECT_DEFAULT_DEVICE_ON;
+	HRESULT hrInit;
+	HRESULT hr;
+
+	if (work == NULL)
+		return(0);
+
+	cast_handle = work->cast_handle;
+	hrInit = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+
+	// Only when the device rules make the virtual device the default themselves.
+	if (sndDevicesGetDefaultDeviceSelectionMode((PT_HANDLE *)cast_handle, &selectionMode) != OKAY)
+		selectionMode = SND_DEVICES_AUTO_SELECT_DEFAULT_DEVICE_OFF;
+
+	if (selectionMode == SND_DEVICES_AUTO_SELECT_DEFAULT_DEVICE_ON)
+	{
+		std::lock_guard<std::mutex> lock(cast_handle->virtualDefaultMutex);
+
+		if (cast_handle->virtualDefaultGuardArmed)
+		{
+			hr = CoCreateInstance(__uuidof(CPolicyConfigVistaClient), NULL, CLSCTX_ALL, __uuidof(IPolicyConfigVista), (LPVOID *)&pPolicyConfig);
+			if (SUCCEEDED(hr) && (pPolicyConfig != NULL))
+			{
+				hr = pPolicyConfig->SetDefaultEndpoint(work->dfxID, eConsole);
+				pPolicyConfig->Release();
+
+				// The newest pick wins, work items may run in any order.
+				if (SUCCEEDED(hr) && ((LONG)((ULONG)work->sequence - (ULONG)cast_handle->pickedDefaultSequence) > 0))
+				{
+					wcscpy_s(cast_handle->pickedDefaultID, PT_MAX_GENERIC_STRLEN, work->pickedID);
+					cast_handle->pickedDefaultSequence = work->sequence;
+				}
+			}
+		}
+	}
+
+	if (SUCCEEDED(hrInit))
+		CoUninitialize();
+
+	delete work;
+
+	return(0);
+}
+
+// Queues sndDevicesVirtualDefaultWorker() for a real device made the default. Cheap, nothing blocks.
+static void sndDevicesQueueVirtualDefault(struct sndDevicesHdlType *cast_handle, LPCWSTR pwstrDeviceId)
+{
+	sndDevicesVirtualDefaultWork *work;
+
+	if ((cast_handle->virtualDefaultGuardHint.load() == FALSE) || (cast_handle->dfxDeviceID[0] == L'\0'))
+		return;
+
+	work = new (std::nothrow) sndDevicesVirtualDefaultWork;
+	if (work == NULL)
+		return;
+
+	work->cast_handle = cast_handle;
+	work->sequence = InterlockedIncrement(&(cast_handle->defaultPickSequence));
+	wcsncpy_s(work->pickedID, PT_MAX_GENERIC_STRLEN, pwstrDeviceId, _TRUNCATE);
+	wcsncpy_s(work->dfxID, PT_MAX_GENERIC_STRLEN, cast_handle->dfxDeviceID, _TRUNCATE);
+
+	if (!QueueUserWorkItem(sndDevicesVirtualDefaultWorker, work, WT_EXECUTEDEFAULT))
+		delete work;
+}
+
 // Callback methods for device-event notifications.
 
 HRESULT STDMETHODCALLTYPE CsndDevicesMMNotificationClient::OnDefaultDeviceChanged(
@@ -290,6 +377,10 @@ HRESULT STDMETHODCALLTYPE CsndDevicesMMNotificationClient::OnDefaultDeviceChange
 		//  return(NOT_OKAY);
 
 	  InterlockedExchange(&(cast_handle->stopAudioCaptureAndPlaybackLoop), 1);
+
+	  // BetterFxSound: while the processing runs, the virtual device is put back as the default at once (it held every
+	  // app's sound on that device, unprocessed and at 100%, until the reinit did it).
+	  sndDevicesQueueVirtualDefault(cast_handle, pwstrDeviceId);
   }
 
   // Ignore the notification for the device selected in the application.

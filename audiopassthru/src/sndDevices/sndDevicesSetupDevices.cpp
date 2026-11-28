@@ -234,8 +234,9 @@ int PT_DECLSPEC sndDevicesFinalSetupCaptureDevice(PT_HANDLE *hp_sndDevices, int 
  * BetterFxSound: if the device is no longer present, its setting stays owed (OwedVolume.h, with the latest own
  * setting known here) and goes back on the device when it is next seen while the engine does not use it, or is
  * saved from there if the device becomes the carrier again. Once it is put back, nothing is owed any more.
+ * BetterFxSound: returns TRUE when the setting was put back on the device.
  */
-static void sndDevices_RestoreSavedPlaybackDeviceSettings(struct sndDevicesHdlType *cast_handle)
+static BOOL sndDevices_RestoreSavedPlaybackDeviceSettings(struct sndDevicesHdlType *cast_handle)
 {
 	IMMDevice *pDevice = NULL;
 	IAudioEndpointVolume *pEndptVol = NULL;
@@ -244,7 +245,7 @@ static void sndDevices_RestoreSavedPlaybackDeviceSettings(struct sndDevicesHdlTy
 	BOOL restored = FALSE;
 
 	if( !cast_handle->playbackSettingsAreSaved )
-		return;
+		return(FALSE);
 
 	if( (sndDevices_UtilsGetIndexFromID((PT_HANDLE *)cast_handle, cast_handle->savedPlaybackDeviceID, &deviceIndex) == OKAY) &&
 		(deviceIndex >= 0) && (deviceIndex < SND_DEVICES_MAX_NUM_DEVICES) )
@@ -297,6 +298,8 @@ static void sndDevices_RestoreSavedPlaybackDeviceSettings(struct sndDevicesHdlTy
 			owedVolumeUpdate(cast_handle->savedPlaybackDeviceID, owedLevel, cast_handle->savedPlaybackMute);
 		}
 	}
+
+	return(restored);
 }
 
 /*
@@ -402,6 +405,11 @@ int PT_DECLSPEC sndDevicesInitialSetupPlaybackDevice(PT_HANDLE *hp_sndDevices, i
 					cast_handle->playbackSettingsAreSaved = TRUE;
 				}
 			}
+
+			// BetterFxSound: the callback registered below is on the device the saved setting belongs to (see
+			// playbackCallbackIsOnSavedDevice).
+			cast_handle->playbackCallbackIsOnSavedDevice = (cast_handle->playbackSettingsAreSaved &&
+				(wcscmp(cast_handle->savedPlaybackDeviceID, playbackDeviceID) == 0)) ? TRUE : FALSE;
 		}
 
 		// Setup playback device volume control callback
@@ -615,10 +623,41 @@ int PT_DECLSPEC sndDevicesRestoreDefaultDevice(PT_HANDLE *hp_sndDevices, int *ip
 	// using it, so without this the apps would play at full level as soon as FxSound is off.
 	// Note the FxSound mute setting is not lost by this: it stays on the DFX device, which Windows
 	// remembers, so muting FxSound and restarting it comes back muted.
-	// Note also that playbackSettingsAreSaved is deliberately left set. On a power off the process
-	// carries on running, and the saved mute setting and level are still the device's true own setting
-	// (the playback volume callback keeps them up to date while FxSound is off).
-	sndDevices_RestoreSavedPlaybackDeviceSettings(cast_handle);
+	// BetterFxSound: once the setting is back on the device, it is no longer kept as saved: the next reinit reads the
+	// device's own setting afresh. It used to stay saved, relying on the playback volume callback to keep it up to date
+	// while FxSound is off, which it does not reliably do (the callback stops matching the device once the list is read
+	// again, and is dead once the device reconnects), so a power on later took the stale setting for the device's own and
+	// put it back over what the user had set meanwhile. If it could not be put back (the device is away), it stays saved
+	// and owed (OwedVolume.h).
+	// The virtual device is no longer put back as the default by the device notification worker from here on (see
+	// virtualDefaultMutex), and a device picked as the default while processing no longer applies.
+	{
+		std::lock_guard<std::mutex> lock(cast_handle->virtualDefaultMutex);
+		cast_handle->virtualDefaultGuardArmed = FALSE;
+		cast_handle->virtualDefaultGuardHint = FALSE;
+		cast_handle->pickedDefaultID[0] = L'\0';
+	}
+	{
+		const BOOL settingIsSaved = cast_handle->playbackSettingsAreSaved;
+		wchar_t handedBackID[PT_MAX_GENERIC_STRLEN];
+		const BOOL handedBackMute = cast_handle->savedPlaybackMute;
+		const float handedBackLevel = cast_handle->savedPlaybackLevel;
+		const BOOL handedBackLevelIsSaved = cast_handle->savedPlaybackLevelIsSaved;
+		wcscpy_s(handedBackID, PT_MAX_GENERIC_STRLEN, cast_handle->savedPlaybackDeviceID);
+
+		if( settingIsSaved && sndDevices_RestoreSavedPlaybackDeviceSettings(cast_handle) )
+		{
+			cast_handle->playbackSettingsAreSaved = FALSE;
+			cast_handle->playbackCallbackIsOnSavedDevice = FALSE;
+
+			// BetterFxSound: what the device was given back, see handedBackPlaybackIsPending.
+			wcscpy_s(cast_handle->handedBackPlaybackDeviceID, PT_MAX_GENERIC_STRLEN, handedBackID);
+			cast_handle->handedBackPlaybackMute = handedBackMute;
+			cast_handle->handedBackPlaybackLevel = handedBackLevel;
+			cast_handle->handedBackPlaybackLevelIsSaved = handedBackLevelIsSaved;
+			cast_handle->handedBackPlaybackIsPending = TRUE;
+		}
+	}
 
 	//Check to see if the user has selected the playback device.
 	if( sndDeviceReadFromRegistry(hp_sndDevices, REG_CURRENT_USER, SND_DEVICES_REGISTRY_USER_SELECTED_PLAYBACK_WIDE, userSelectedPlaybackID) != OKAY )

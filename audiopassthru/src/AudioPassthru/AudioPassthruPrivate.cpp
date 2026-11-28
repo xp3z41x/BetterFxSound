@@ -579,6 +579,10 @@ int AudioPassthruPrivate::processTimer()
 		};
 		TakeOverPending take_over_pending(s_sndDevices_.playbackTakeOversPending);
 
+		/* BetterFxSound: until the processing thread runs again, a real device made the Windows default is left to the
+		   reinit, as before (sndDevicesHdlType::virtualDefaultMutex) */
+		sndDevicesSetVirtualDefaultGuard(hp_sndDevices_, FALSE);
+
 		/* Reinit the sndDevices module */
 		if (sndDevicesReInit(hp_sndDevices_, SND_DEVICES_INIT_FOR_PROCESSING, &numRealDevices, &DfxDeviceEnabledFlag, &statusFlag) != OKAY)
 			return(NOT_OKAY);
@@ -655,6 +659,11 @@ int AudioPassthruPrivate::processTimer()
 			s_sndDevices_.carrierDelayTailFrames = 0;
 
 			hProcessingThread_ = CreateThread(NULL, 0, processingThread, (LPVOID)this, 0L, &ProcessingThreadID_);
+
+			/* BetterFxSound: processing, with the virtual device as the default: a real device made the default from here
+			   on is undone at once (sndDevicesHdlType::virtualDefaultMutex) */
+			if (hProcessingThread_ != NULL)
+				sndDevicesSetVirtualDefaultGuard(hp_sndDevices_, TRUE);
 
 			/* BetterFxSound: the devices could be set up, a later failure retries quickly again */
 			park_retry_timed_ = false;
@@ -1569,6 +1578,12 @@ void AudioPassthruPrivate::handBackUnusedDevices(const std::vector<std::wstring>
 	   wait for it): a take-over it is still running would undo this sweep's hand-back and the record would be gone. */
 	const std::vector<std::wstring> pending = multi_output_.pendingVolumeDevices();
 
+	bool handed_back;
+	{
+		std::lock_guard<std::mutex> lock(config_mutex_);
+		handed_back = handed_back_;
+	}
+
 	for (const auto& id : owedVolumeDevices())
 	{
 		if (std::find(in_use.begin(), in_use.end(), id) != in_use.end())
@@ -1583,6 +1598,14 @@ void AudioPassthruPrivate::handBackUnusedDevices(const std::vector<std::wstring>
 		{
 			s_sndDevices_.engineTookOverPlaybackTick = 0;
 			s_sndDevices_.playbackLevelIsUsers = FALSE;
+			/* BetterFxSound: while FxSound is off (the carrier could not be handed back at power off, and is back now) the
+			   setting is no longer kept as saved either, as after a hand-back at power off: the next power on reads the
+			   device's own setting afresh, instead of putting this one back over what the user sets meanwhile */
+			if (handed_back)
+			{
+				s_sndDevices_.playbackSettingsAreSaved = FALSE;
+				s_sndDevices_.playbackCallbackIsOnSavedDevice = FALSE;
+			}
 		}
 	}
 }

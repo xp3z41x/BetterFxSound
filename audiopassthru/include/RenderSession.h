@@ -23,6 +23,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 #include <windows.h>
 #include <Audioclient.h>
+#include <audiopolicy.h>
 
 /*
  * BetterFxSound: the audio session of every stream the engine renders (the carrier, the additional outputs and the
@@ -41,10 +42,27 @@ const GUID kRenderSessionGuid = { 0x5c0a9e3b, 0x71d2, 0x4f86, { 0xb3, 0xa4, 0x9e
 const DWORD kRenderSessionFlags = AUDCLNT_SESSIONFLAGS_DISPLAY_HIDE | AUDCLNT_STREAMFLAGS_NOPERSIST;
 
 // Sets the session of an initialized client to 100% and unmuted. Never on an audio processing or render loop.
+// BetterFxSound: and opts it out of the Windows communications ducking. The virtual device is the communications default
+// too while FxSound processes (sndDevicesSetCommunicationsDefault()), so a call is played through these sessions: ducking
+// them for the call ("reduce other sounds") lowered the call itself. The other apps' sounds are still ducked, on the
+// virtual device, before FxSound captures them. IAudioSessionControl2::SetDuckingPreference() is Windows 7 and later;
+// where it is missing the session is left as it is.
 inline void resetRenderSessionVolume(IAudioClient* client)
 {
 	if (client == nullptr)
 		return;
+
+	IAudioSessionControl* control = nullptr;
+	if (SUCCEEDED(client->GetService(__uuidof(IAudioSessionControl), reinterpret_cast<void**>(&control))) && control != nullptr)
+	{
+		IAudioSessionControl2* control2 = nullptr;
+		if (SUCCEEDED(control->QueryInterface(__uuidof(IAudioSessionControl2), reinterpret_cast<void**>(&control2))) && control2 != nullptr)
+		{
+			control2->SetDuckingPreference(TRUE);
+			control2->Release();
+		}
+		control->Release();
+	}
 
 	ISimpleAudioVolume* volume = nullptr;
 	if (SUCCEEDED(client->GetService(__uuidof(ISimpleAudioVolume), reinterpret_cast<void**>(&volume))) && volume != nullptr)

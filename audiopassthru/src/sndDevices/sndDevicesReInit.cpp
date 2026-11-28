@@ -52,6 +52,7 @@ int PT_DECLSPEC sndDevicesReInit(PT_HANDLE *hp_sndDevices, int i_initType, int *
 	int captureAllocSize, playbackAllocSize;
 	int captureBufferChannelsForAllocation;
 	BOOL captureMuteState;
+	unsigned long masterSequence;
     
 	cast_handle = (struct sndDevicesHdlType *)hp_sndDevices;
 
@@ -181,6 +182,39 @@ int PT_DECLSPEC sndDevicesReInit(PT_HANDLE *hp_sndDevices, int i_initType, int *
 			// publish it as the software gain applied to every output. It is no longer copied to the real
 			// playback device. If the carrier is an enabled output, its real device is set to 100% and unmuted
 			// after the reinit, by AudioPassthruPrivate::applyAdditionalOutputs().
+			// BetterFxSound: at the first reinit after a power off, the carrier being the device that was handed back then
+			// (its own setting is read afresh by sndDevicesInitialSetupPlaybackDevice()): if the user changed its volume or
+			// mute while FxSound was off (the volume keys and the tray act on it then), the master takes that setting.
+			// Otherwise the outputs came back at the master's old level, or silent with the master still muted, once the
+			// device was at 100% again. With no change while off the master is left as it was (muting FxSound and
+			// turning it off and on again stays muted).
+			if( cast_handle->handedBackPlaybackIsPending )
+			{
+				cast_handle->handedBackPlaybackIsPending = FALSE;
+
+				if( cast_handle->playbackSettingsAreSaved &&
+					(wcscmp(cast_handle->handedBackPlaybackDeviceID, cast_handle->savedPlaybackDeviceID) == 0) )
+				{
+					const BOOL muteChanged = ((cast_handle->savedPlaybackMute != FALSE) != (cast_handle->handedBackPlaybackMute != FALSE)) ? TRUE : FALSE;
+					const float levelDiff = cast_handle->savedPlaybackLevel - cast_handle->handedBackPlaybackLevel;
+					const BOOL levelChanged = (cast_handle->savedPlaybackLevelIsSaved && cast_handle->handedBackPlaybackLevelIsSaved &&
+						((levelDiff > 0.005f) || (levelDiff < -0.005f))) ? TRUE : FALSE;
+
+					if( muteChanged || levelChanged )
+					{
+						// The level first, then mute: some drivers clear the mute flag as a side effect of a level change.
+						if( cast_handle->savedPlaybackLevelIsSaved )
+							cast_handle->pEndptVolCapture->SetMasterVolumeLevelScalar(cast_handle->savedPlaybackLevel, &(cast_handle->guidThisApplication));
+						cast_handle->pEndptVolCapture->SetMute(cast_handle->savedPlaybackMute, &(cast_handle->guidThisApplication));
+					}
+				}
+			}
+
+			// BetterFxSound: published below only if the volume callback published nothing since this point (see
+			// masterVolumePublishIfUnchanged()): a change notified meanwhile is newer than the two reads below, and
+			// was overwritten by them.
+			masterSequence = masterVolumeSequence();
+
 			hr = cast_handle->pEndptVolCapture->GetMute(&captureMuteState);
 			if (hr != S_OK)
 			{
@@ -197,7 +231,7 @@ int PT_DECLSPEC sndDevicesReInit(PT_HANDLE *hp_sndDevices, int i_initType, int *
 				SND_DEVICES_SET_STATUS_AND_RETURN_OK(SND_DEVICES_GET_MASTER_VOLUME_FAILED);
 			}
 
-			masterVolumePublish(captureVolScalar, captureMuteState != FALSE);
+			masterVolumePublishIfUnchanged(captureVolScalar, captureMuteState != FALSE, masterSequence);
 
 			// Setup capture and playback buffers
 			cast_handle->bufferSizeMilliSecs = SND_DEVICES_CAPTURE_BUFFER_DEFAULT_SIZE_MILLI_SECS;

@@ -26,6 +26,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include <Functiondiscoverykeys_devpkey.h>
 #include <endpointvolume.h>
 #include <atomic>
+#include <mutex>
 #include "slout.h"
 
 #define PT_MAX_GENERIC_STRLEN          512
@@ -172,6 +173,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #define SND_DEVICES_REGISTRY_USER_SELECTED_PLAYBACK_WIDE		L"user_selected_playback"
 #define SND_DEVICES_REGISTRY_DEFAULT_DEVICE_SELECTION_MODE	L"default_device_mode"
 #define SND_DEVICES_REGISTRY_USER_BUFFER_SIZE					L"user_buffer_size"
+// BetterFxSound: the communications default the user had before the virtual device was made the default for that role too
+#define SND_DEVICES_REGISTRY_PRIOR_COMMUNICATIONS_WIDE		L"prior_communications_default"
 
 /* Registry related defines, local machine */
 #define SND_DEVICES_REGISTRY_DFX_GUID								L"dfx_guid"
@@ -513,6 +516,33 @@ struct sndDevicesHdlType {
 	float savedPlaybackLevel;		// Its volume level, 0..1 as IAudioEndpointVolume reports it.
 	BOOL savedPlaybackLevelIsSaved;	// FALSE if the level could not be read; then only mute is put back.
 	BOOL playbackSettingsAreSaved;	// TRUE when the values above hold a valid setting.
+	// BetterFxSound: TRUE while the playback volume callback is registered on the device the values above belong to. The
+	// callback used to check that by the device's index in the list (pwszID[playbackDeviceNum]), which a reinit resets and
+	// an enumeration rewrites: a change the user made then was dropped, and an old level was put back later. Set by
+	// sndDevicesInitialSetupPlaybackDevice() before it registers the callback, cleared before the callback is unregistered.
+	std::atomic<BOOL> playbackCallbackIsOnSavedDevice;
+	// BetterFxSound: the own setting put back on the carrier's device at the last power off (sndDevicesRestoreDefaultDevice()),
+	// pending until the next reinit that sets the devices up. If that device is the carrier again and its own setting is
+	// no longer this one (the user changed its volume or mute while FxSound was off), the virtual device (the master) takes
+	// the new one, so FxSound comes back at the level the user was just listening at. UI/timer thread only.
+	wchar_t handedBackPlaybackDeviceID[PT_MAX_GENERIC_STRLEN];
+	BOOL handedBackPlaybackMute;
+	float handedBackPlaybackLevel;
+	BOOL handedBackPlaybackLevelIsSaved;
+	BOOL handedBackPlaybackIsPending;
+	// BetterFxSound: while the processing runs, a real device made the Windows default (in the Windows flyout, or by an app)
+	// played every app's sound straight to it, unprocessed and at the 100% the engine holds it at, until the next reinit
+	// made the virtual device the default again (up to half a second). The device notification now has a worker thread
+	// put the virtual device back at once (sndDevicesDeviceCallbacks.cpp), and records the device picked
+	// (pickedDefaultID), which the next run of the device rules takes as the default the user chose. All of these under
+	// virtualDefaultMutex, which also orders that worker against the hand-back at power off (sndDevicesRestoreDefaultDevice()):
+	// the worker never makes the virtual device the default again once the devices are handed back.
+	std::mutex virtualDefaultMutex;
+	BOOL virtualDefaultGuardArmed;		// TRUE while the processing thread runs (sndDevicesSetVirtualDefaultGuard()).
+	std::atomic<BOOL> virtualDefaultGuardHint;	// Its value, read without the lock by the notification callback.
+	wchar_t pickedDefaultID[PT_MAX_GENERIC_STRLEN];
+	LONG pickedDefaultSequence;			// Sequence of the notification pickedDefaultID came from.
+	volatile LONG defaultPickSequence;	// Counts the notifications that queued the worker.
 	// BetterFxSound: the last level and mute this app set on the playback device, and when (GetTickCount()). Some
 	// drivers (Bluetooth with absolute volume) report such a change back a second time, without this app's event
 	// context; the playback volume callback must not take that for the user's own setting.
@@ -618,6 +648,7 @@ int PT_DECLSPEC sndDevicesRequestTargetedPlaybackDevice(PT_HANDLE *, wchar_t *, 
 int PT_DECLSPEC sndDevicesSetIconFileName(PT_HANDLE *, int, wchar_t *, int *);
 int PT_DECLSPEC sndDevicesSetDeviceName(PT_HANDLE *, int, wchar_t *, int *);
 int PT_DECLSPEC sndDevicesSetDefaultDeviceSelectionMode(PT_HANDLE *, int);
+int PT_DECLSPEC sndDevicesSetVirtualDefaultGuard(PT_HANDLE *, BOOL);
 int PT_DECLSPEC sndDevicesSetDeviceEnabledStatus(PT_HANDLE *, int, BOOL, int *);
 int PT_DECLSPEC sndDevicesSetDeviceEnabledStatusFromGuid(PT_HANDLE *, wchar_t *, BOOL, int *);
 int PT_DECLSPEC sndDevicesSetDfxDeviceSampleRateAndChannels(PT_HANDLE *, int, int, int *);

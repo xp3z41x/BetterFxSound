@@ -111,6 +111,28 @@ int PT_DECLSPEC sndDevicesImplementDeviceRules(PT_HANDLE *hp_sndDevices, int *ip
 		current_defaultNum = SND_DEVICES_DEVICE_NOT_PRESENT;
 	dfxNum = cast_handle->dfxDeviceNum;
 
+	// BetterFxSound: a real device made the default while the processing ran was put back to the virtual device at once
+	// (sndDevicesHdlType::virtualDefaultMutex). It is still the default the user chose: it is taken as the current default,
+	// as it was when the virtual device was only put back here. Consumed by this run of the rules.
+	{
+		wchar_t pickedID[PT_MAX_GENERIC_STRLEN];
+		int pickedNum = SND_DEVICES_DEVICE_NOT_PRESENT;
+
+		{
+			std::lock_guard<std::mutex> lock(cast_handle->virtualDefaultMutex);
+			wcscpy_s(pickedID, PT_MAX_GENERIC_STRLEN, cast_handle->pickedDefaultID);
+			cast_handle->pickedDefaultID[0] = L'\0';
+		}
+
+		if( (pickedID[0] != L'\0') && ((current_defaultNum == dfxNum) || (current_defaultNum == SND_DEVICES_DEVICE_NOT_PRESENT)) )
+		{
+			if( sndDevices_UtilsGetActiveIndexFromID(hp_sndDevices, pickedID, &pickedNum) != OKAY )
+				return(NOT_OKAY);
+			if( (pickedNum != SND_DEVICES_DEVICE_NOT_PRESENT) && (pickedNum != dfxNum) && (pickedNum < cast_handle->totalNumDevices) )
+				current_defaultNum = pickedNum;
+		}
+	}
+
 	// Get the default device selection mode (in currently implementation always on).
 	if( sndDevicesGetDefaultDeviceSelectionMode(hp_sndDevices, &defaultSelectionAutoMode) != OKAY )
 		return(NOT_OKAY);

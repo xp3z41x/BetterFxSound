@@ -31,6 +31,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include <mmdeviceapi.h>
 #include <endpointvolume.h>
 #include <atomic>
+#include <mutex>
 
 #include "slout.h"
 #include "mry.h"
@@ -43,7 +44,12 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 // Starts at unity until the first read in sndDevicesReInit().
 static std::atomic<float> s_masterVolumeGain(1.0f);
 
-void masterVolumePublish(float level_scalar, bool muted)
+// BetterFxSound: orders the two publishers (the volume callback and the reinit's read), see masterVolumePublishIfUnchanged().
+// Never taken by the audio threads, which only load s_masterVolumeGain.
+static std::mutex s_masterVolumeMutex;
+static unsigned long s_masterVolumeSequence = 0;
+
+static void masterVolumeStore(float level_scalar, bool muted)
 {
 	float gain = 0.0f;
 
@@ -57,6 +63,29 @@ void masterVolumePublish(float level_scalar, bool muted)
 	}
 
 	s_masterVolumeGain.store(gain, std::memory_order_relaxed);
+}
+
+void masterVolumePublish(float level_scalar, bool muted)
+{
+	std::lock_guard<std::mutex> lock(s_masterVolumeMutex);
+	s_masterVolumeSequence++;
+	masterVolumeStore(level_scalar, muted);
+}
+
+unsigned long masterVolumeSequence()
+{
+	std::lock_guard<std::mutex> lock(s_masterVolumeMutex);
+	return s_masterVolumeSequence;
+}
+
+bool masterVolumePublishIfUnchanged(float level_scalar, bool muted, unsigned long sequence)
+{
+	std::lock_guard<std::mutex> lock(s_masterVolumeMutex);
+	if (s_masterVolumeSequence != sequence)
+		return false;
+	s_masterVolumeSequence++;
+	masterVolumeStore(level_scalar, muted);
+	return true;
 }
 
 float masterVolumeGain()
@@ -252,9 +281,9 @@ HRESULT STDMETHODCALLTYPE CsndDevicesAudioEndpointVolumeCallbackPlayback::OnNoti
 			return S_OK;
 	}
 
-	if (cast_handle->playbackSettingsAreSaved &&
-		 (cast_handle->playbackDeviceNum >= 0) && (cast_handle->playbackDeviceNum < SND_DEVICES_MAX_NUM_DEVICES) &&
-		 (wcscmp(cast_handle->savedPlaybackDeviceID, cast_handle->pwszID[cast_handle->playbackDeviceNum]) == 0))
+	// BetterFxSound: the callback is on the device the saved setting belongs to. It used to compare the saved device with
+	// the list entry at playbackDeviceNum, which a reinit resets and an enumeration rewrites, so changes were dropped.
+	if (cast_handle->playbackSettingsAreSaved && (cast_handle->playbackCallbackIsOnSavedDevice.load() != FALSE))
 	{
 		const bool atFullVolume = (pNotify->fMasterVolume >= 0.99f) && (pNotify->bMuted == FALSE);
 
