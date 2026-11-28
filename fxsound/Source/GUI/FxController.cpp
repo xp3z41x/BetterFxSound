@@ -2543,6 +2543,9 @@ LRESULT CALLBACK FxController::eventCallback(HWND hwnd, const UINT message, cons
 
 		if (w_param == login_event || w_param == WTS_SESSION_UNLOCK)
 		{
+			// BetterFxSound: a logon or unlock means the system is awake: ends a sleep whose resume was missed
+			// (does nothing otherwise), before the power state is applied again.
+			controller->onSystemResume();
 			controller->setPowerState(controller->settings_.getBool("power"));
 		}
 		else if (w_param == WTS_CONSOLE_DISCONNECT)
@@ -2564,6 +2567,28 @@ void FxController::timerCallback()
 	// BetterFxSound: no 200 ms sleep after a carrier switch request any more. It blocked the message thread and
 	// skipped a tick, lengthening the dropout; processTimer() below already reinits once the processing thread
 	// has stopped for the switch.
+
+	// BetterFxSound: a sleep whose resume was never notified must not keep every output muted for good (see
+	// sleep_ticks_). Ticks only arrive while the system is awake.
+	{
+		const int64 now_ms = Time::currentTimeMillis();
+		bool missed_resume = false;
+		{
+			ScopedLock auto_lock(lock_);
+			if (system_sleeping_)
+			{
+				const bool slept = last_timer_tick_ms_ != 0 && now_ms - last_timer_tick_ms_ >= SLEEP_GAP_MS;
+				missed_resume = slept || ++sleep_ticks_ >= SLEEP_RESUME_TIMEOUT;
+			}
+		}
+		last_timer_tick_ms_ = now_ms;
+		if (missed_resume)
+		{
+			logMessage("No resume notified after the suspend, ending the sleep state");
+			onSystemResume();
+		}
+	}
+
 	{
 		// No suspend followed the HDMI removal (physical disconnect), or HDMI did not return within
 		// the wait after wake: continue on the available output as per preference.
@@ -2795,6 +2820,7 @@ void FxController::onSystemSuspend()
 		ScopedLock auto_lock(lock_);
 
 		hdmi_failover_counter_ = 0;
+		sleep_ticks_ = 0;
 
 		system_sleeping_ = true;
 	}

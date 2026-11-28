@@ -372,6 +372,15 @@ private:
 	bool authenticated_;
     bool playback_device_available_;
 	bool system_sleeping_;
+	// BetterFxSound: fallback for a resume that is never notified (a vetoed or aborted suspend, some Modern Standby
+	// transitions): left set, system_sleeping_ would keep every output muted for good. Timer ticks are counted from
+	// the suspend notification, and the time of the last tick is kept: a tick arriving after a gap of at least
+	// SLEEP_GAP_MS means the system slept and is awake again; SLEEP_RESUME_TIMEOUT ticks in a row with no such gap
+	// mean the suspend never happened. Either clears the sleep as onSystemResume() does. Message thread only.
+	int sleep_ticks_ = 0;
+	int64 last_timer_tick_ms_ = 0;
+	static constexpr int SLEEP_RESUME_TIMEOUT = 600;	// 600 ticks * 100 ms = 60 s
+	static constexpr int64 SLEEP_GAP_MS = 5000;
 	// BetterFxSound: restoreDefaultPlaybackDevice() done and processing not started since. Another hand-back
 	// (a session event while off) would set the Windows default again over the user's own choice.
 	// True from the start: a new process has not processed yet, so starting (or logging on) with FxSound off
