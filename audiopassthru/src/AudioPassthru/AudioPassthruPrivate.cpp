@@ -1435,16 +1435,20 @@ void AudioPassthruPrivate::applyAdditionalOutputs()
 	* COM calls, outside the lock. The change is tagged with this app's GUID, so the playback volume callback
 	* does not take it for the user's own mute setting (the one handed back when FxSound stops driving the device).
 	* The device's own setting is recorded as owed first (kept if one is owed already: the reinit then saved it
-	* from the record, see sndDevicesInitialSetupPlaybackDevice()), so it survives an unplug or a crash.
+	* from the record, see sndDevicesInitialSetupPlaybackDevice()), so it survives an unplug or a crash. BetterFxSound:
+	* when 100% is set, the take-over records it itself (setDeviceFullVolumeById()): a hand-back of the device between a
+	* record written here and the take-over erased it, and the device was left at 100% with nothing owed.
 	*/
 	if (!set_full_volume_id.empty())
 	{
-		owedVolumeRecord(set_full_volume_id, carrier_own_level, carrier_own_mute);
+		if (carrier_keeps_users_level)
+			owedVolumeRecord(set_full_volume_id, carrier_own_level, carrier_own_mute);
 		bool full_volume_set = true;
 		if (!carrier_keeps_users_level)
 		{
 			sndDevicesNoteEngineSetPlayback(&s_sndDevices_, 1.0f, FALSE, carrier_own_mute);
-			full_volume_set = setDeviceFullVolumeById(set_full_volume_id, &kEngineVolumeEventContext);
+			full_volume_set = setDeviceFullVolumeById(set_full_volume_id, &kEngineVolumeEventContext, true, carrier_own_level,
+				carrier_own_mute);
 			if (full_volume_set)
 			{
 				/* BetterFxSound: the device may still send its own stored level shortly (see engineTookOverPlaybackTick) */
@@ -1551,7 +1555,7 @@ void AudioPassthruPrivate::reassertCarrierFullVolume()
 
 	carrier_reasserts_++;
 	sndDevicesNoteEngineSetPlayback(&s_sndDevices_, 1.0f, FALSE, s_sndDevices_.savedPlaybackMute);
-	setDeviceFullVolumeById(carrier_id, &kEngineVolumeEventContext);
+	setDeviceFullVolumeById(carrier_id, &kEngineVolumeEventContext, false, 1.0f, FALSE);
 }
 
 /*

@@ -38,8 +38,10 @@ class SecondaryOutput;
 // when the engine starts using the device, never from an audio processing or render loop.
 // event_context tags the change in the device's volume notifications (NULL is allowed).
 // Returns false if the device or its volume control is not available. The caller saves the device's
-// own setting first, and makes sure it is never used on the FxSound virtual device.
-bool setDeviceFullVolumeById(const std::wstring& device_id, const GUID* event_context);
+// own setting first, and makes sure it is never used on the FxSound virtual device. BetterFxSound: if record_own,
+// own_level and own_mute are recorded as owed (OwedVolume.h) once the take-over runs, unless a setting is owed already.
+bool setDeviceFullVolumeById(const std::wstring& device_id, const GUID* event_context, bool record_own, float own_level,
+	BOOL own_mute);
 
 // BetterFxSound: reads a present device's own endpoint level (0..1) and mute. False if the device or its volume control
 // is not available. Never from an audio processing or render loop.
