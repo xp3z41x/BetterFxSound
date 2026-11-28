@@ -136,3 +136,27 @@ int PT_DECLSPEC sndDevices_UtilsGetIndexFromID(PT_HANDLE *hp_sndDevices, wchar_t
 
 	return(OKAY);
 }
+/*
+ * FUNCTION: sndDevices_UtilsGetActiveIndexFromID()
+ * DESCRIPTION: BetterFxSound. Like sndDevices_UtilsGetIndexFromID(), but SND_DEVICES_DEVICE_NOT_PRESENT unless the device
+ * is active. The list also holds unplugged endpoints (a sleeping HDMI monitor, headphones out of their jack), which
+ * cannot be opened: the device rules took such a device again as the carrier, and the reinit then failed.
+ */
+int PT_DECLSPEC sndDevices_UtilsGetActiveIndexFromID(PT_HANDLE *hp_sndDevices, wchar_t *wcp_ID, int *ip_index)
+{
+	struct sndDevicesHdlType *cast_handle;
+	int i_index;
+
+	cast_handle = (struct sndDevicesHdlType *)hp_sndDevices;
+
+	*ip_index = SND_DEVICES_DEVICE_NOT_PRESENT;
+
+	if( sndDevices_UtilsGetIndexFromID(hp_sndDevices, wcp_ID, &i_index) != OKAY )
+		return(NOT_OKAY);
+
+	if( (i_index >= 0) && (i_index < SND_DEVICES_MAX_NUM_DEVICES) &&
+		(cast_handle->deviceState[i_index] == DEVICE_STATE_ACTIVE) )
+		*ip_index = i_index;
+
+	return(OKAY);
+}

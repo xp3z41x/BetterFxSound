@@ -1627,6 +1627,15 @@ void FxController::updateOutputs(std::vector<SoundDevice>& sound_devices, const 
 		failed_carrier_ids_.clear();
 	}
 
+	// BetterFxSound: the engine could not open this carrier at its last reinits (held by an exclusive-mode app, a
+	// format it does not take) and keeps retrying it: another enabled output is elected below instead.
+	String engine_failed_carrier_id(audio_passthru_->getFailedCarrierId().c_str());
+	if (engine_failed_carrier_id.isNotEmpty() && !failed_carrier_ids_.contains(engine_failed_carrier_id))
+	{
+		logMessage("Output could not be opened by the audio engine: " + engine_failed_carrier_id);
+		failed_carrier_ids_.add(engine_failed_carrier_id);
+	}
+
 	// The carrier the engine is using after this reinit.
 	String engine_carrier_id;
 	for (auto& sound_device : sound_devices)
@@ -1642,12 +1651,17 @@ void FxController::updateOutputs(std::vector<SoundDevice>& sound_devices, const 
 	{
 		// A switch asked for with setAsPlaybackDevice(). If the engine did not take it although the device
 		// is there, don't ask for it again until the devices change, so this can't loop.
-		if (engine_carrier_id != requested_carrier_id_ && findActiveOutput(requested_carrier_id_) != nullptr)
+		// BetterFxSound: only judged after the reinit that takes the request. A device list refresh can come
+		// first, still naming the old carrier: that blacklisted the requested carrier until the devices changed.
+		if (!audio_passthru_->isCarrierSwitchPending())
 		{
-			logMessage("Output switch not taken by the audio engine: " + requested_carrier_id_);
-			failed_carrier_ids_.addIfNotAlreadyThere(requested_carrier_id_);
+			if (engine_carrier_id != requested_carrier_id_ && findActiveOutput(requested_carrier_id_) != nullptr)
+			{
+				logMessage("Output switch not taken by the audio engine: " + requested_carrier_id_);
+				failed_carrier_ids_.addIfNotAlreadyThere(requested_carrier_id_);
+			}
+			requested_carrier_id_.clear();
 		}
-		requested_carrier_id_.clear();
 	}
 	else if (engine_carrier_id.isNotEmpty() && engine_carrier_id != carrier_id_ && !list_changed && !hdmi_reconnect_pending_)
 	{
@@ -2902,8 +2916,21 @@ String FxController::applyDelayCalibrationResults()
 		any_measured = true;
 	}
 
+	// BetterFxSound: outputs whose device could not be opened (held by another app, a failing driver) got no test
+	// sound. They used to be reported as not heard clearly.
+	StringArray not_opened;
+	for (auto& result : results)
+	{
+		if (result.unavailable)
+			not_opened.add(nameOf(String(result.device_id.c_str())));
+	}
+
 	if (!any_measured)
+	{
+		if (not_opened.size() > 0)
+			return TRANS("No output was measured, so no delay was changed.") + " " + TRANS("Could not be opened (in use by another app?), not measured:") + " " + not_opened.joinIntoString(", ") + ".";
 		return TRANS("No output could be heard clearly, so no delay was changed. Turn the volume up, move the microphone closer and try again.");
+	}
 
 	StringArray lines;
 	StringArray not_heard;
@@ -2916,8 +2943,9 @@ String FxController::applyDelayCalibrationResults()
 
 		if (!result.measured)
 		{
-			// Keeps its delay.
-			not_heard.add(name);
+			// Keeps its delay. BetterFxSound: one that could not be opened is in not_opened.
+			if (!result.unavailable)
+				not_heard.add(name);
 			continue;
 		}
 
@@ -2960,6 +2988,8 @@ String FxController::applyDelayCalibrationResults()
 	String summary = TRANS("Delays set:") + " " + lines.joinIntoString(", ") + ".";
 	if (not_heard.size() > 0)
 		summary += " " + TRANS("Not heard clearly, left unchanged:") + " " + not_heard.joinIntoString(", ") + ".";
+	if (not_opened.size() > 0)
+		summary += " " + TRANS("Could not be opened (in use by another app?), not measured:") + " " + not_opened.joinIntoString(", ") + ".";
 	if (not_connected.size() > 0)
 		summary += " " + TRANS("Not connected, not measured:") + " " + not_connected.joinIntoString(", ") + ".";
 	if (clamped)
@@ -3274,7 +3304,8 @@ void FxController::loadOutputSettings(const std::vector<SoundDevice>& sound_devi
 				entry.id = main_id;
 				entry.name = main_name;
 				entry.enabled = true;
-				entry.delay_ms = jlimit(0, 500, settings_.getInt("main_output_delay_ms", 0));
+				// BetterFxSound: a delay from the old keys belongs to delay model 1 (see the check below), so it starts at 0.
+				entry.delay_ms = 0;
 				entry.channel_mode = toOutputChannelMode(settings_.getInt("main_output_channel_mode", 0));
 				addEntry(entry);
 				save = true;
@@ -3341,6 +3372,30 @@ void FxController::loadOutputSettings(const std::vector<SoundDevice>& sound_devi
 
 		// With no device at all, try again on the next start rather than saving an empty set (= silence).
 		save = !output_entries_.empty();
+	}
+
+	// BetterFxSound: saved delays are relative to the engine's path latency (AudioPassthru::kDelayModelVersion). Delays
+	// synced or tuned before every path was padded to a common latency (v1.0.0 and v1.0.1 stored no model, = 1) already
+	// include the carrier/router path difference, which the engine now adds itself, so they would put the carrier late
+	// by that difference. They are cleared, and the outputs need to be synchronized again.
+	const int delay_model = settings_.getInt("output_delay_model", 1);
+	if (delay_model != AudioPassthru::kDelayModelVersion)
+	{
+		bool cleared = false;
+		for (auto& entry : output_entries_)
+		{
+			if (entry.delay_ms != 0)
+			{
+				entry.delay_ms = 0;
+				cleared = true;
+			}
+		}
+		if (cleared)
+		{
+			save = true;
+			logMessage("Output delays from delay model " + String(delay_model) + " cleared (now " + String(AudioPassthru::kDelayModelVersion) + "): synchronize the outputs again");
+		}
+		settings_.setInt("output_delay_model", AudioPassthru::kDelayModelVersion);
 	}
 
 	for (auto* key : legacy_keys)

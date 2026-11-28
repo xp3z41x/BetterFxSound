@@ -104,6 +104,18 @@ int PT_DECLSPEC sndDevicesInit(PT_HANDLE *hp_sndDevices, CSlout *hp_slout, int i
 	cast_handle->pEndptVolPlayback  = NULL;
 	cast_handle->ignoreVolumeCallbacks = FALSE;
 	cast_handle->ignoreDeviceCallbacks = FALSE;
+	cast_handle->enumeratedDefaultDeviceNum = SND_DEVICES_DEVICE_NOT_PRESENT;
+	wcscpy(cast_handle->dfxDeviceID, L"");
+	InterlockedExchange(&(cast_handle->deviceListIsStale), 0);
+	InterlockedExchange(&(cast_handle->deviceFormatChanged), 0);
+	cast_handle->carrierDelayTailFrames = 0;
+	cast_handle->capturedBlockIsSilenceFill = FALSE;
+	cast_handle->channelCacheCount = 0;
+	cast_handle->activeDeviceIsUnprobed = FALSE;
+	InterlockedExchange(&(cast_handle->channelProbeIsPending), 0);
+	cast_handle->lastEnumerationTick = 0;
+	wcscpy(cast_handle->requestedPlaybackID, L"");
+	cast_handle->outputsAreManaged = FALSE;
 
 	// No playback device has been used yet, so there is no mute setting of one to hold onto.
 	// Note these must survive a re-init, they are only reset here in the one time init call.
@@ -115,6 +127,31 @@ int PT_DECLSPEC sndDevicesInit(PT_HANDLE *hp_sndDevices, CSlout *hp_slout, int i
 	cast_handle->engineSetPlaybackLevel = -1.0f;
 	cast_handle->engineSetPlaybackMute = FALSE;
 	cast_handle->engineSetPlaybackTick = 0;
+	cast_handle->engineSetPlaybackFromMute = FALSE;
+	cast_handle->engineSetPlaybackPrevLevel = -1.0f;
+	cast_handle->engineSetPlaybackPrevMute = FALSE;
+	cast_handle->engineSetPlaybackPrevTick = 0;
+	cast_handle->engineTookOverPlaybackTick = 0;
+	cast_handle->playbackFullVolumeReassert = FALSE;
+	cast_handle->playbackTakeOversPending = 0;
+	cast_handle->playbackLevelIsUsers = FALSE;
+	cast_handle->playbackCallbackIsOnSavedDevice = FALSE;
+	wcscpy(cast_handle->handedBackPlaybackDeviceID, L"");
+	cast_handle->handedBackPlaybackMute = FALSE;
+	cast_handle->handedBackPlaybackLevel = 1.0f;
+	cast_handle->handedBackPlaybackLevelIsSaved = FALSE;
+	cast_handle->handedBackPlaybackIsPending = FALSE;
+	// BetterFxSound: a hand-back made at the last exit of the app still counts (sndDevicesLoadHandedBackRecord()).
+	sndDevicesLoadHandedBackRecord(hp_sndDevices);
+	{
+		std::lock_guard<std::mutex> lock(cast_handle->virtualDefaultMutex);
+		cast_handle->virtualDefaultGuardArmed = FALSE;
+		cast_handle->virtualDefaultGuardHint = FALSE;
+		wcscpy(cast_handle->pickedDefaultID, L"");
+		cast_handle->pickedDefaultSequence = 0;
+		cast_handle->virtualDefaultGuardEpoch++;
+	}
+	InterlockedExchange(&(cast_handle->defaultPickSequence), 0);
 
 	for(i=0; i<SND_DEVICES_MAX_NUM_DEVICES; i++)
 	{
@@ -248,7 +285,7 @@ int PT_DECLSPEC sndDevicesFree(PT_HANDLE *hp_sndDevices)
 	} */
 
 	// Force the recording thread to exit.
-	cast_handle->stopAudioCaptureAndPlaybackLoop = 1;
+	InterlockedExchange(&(cast_handle->stopAudioCaptureAndPlaybackLoop), 1);
 
 	if( (cast_handle->initializationMode == SND_DEVICES_INIT_FOR_PROCESSING))
 	{
@@ -304,6 +341,9 @@ int PT_DECLSPEC sndDevices_ReleaseAllAudioObjects(PT_HANDLE *hp_sndDevices)
 		}
 		pEndptVolCapture->Release();
 	}
+
+	// BetterFxSound: the callback is about to leave the device whose setting is saved.
+	cast_handle->playbackCallbackIsOnSavedDevice = FALSE;
 
 	// Turn off playback device volume control callback
 	if (pEndptVolPlayback != NULL)

@@ -41,6 +41,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "u_sndDevices.h"
 #include "sndDevices.h"
 #include "OwedVolume.h"
+#include "RenderSession.h"
 
 /*
  * FUNCTION: sndDevicesInitialSetupCaptureDevice()
@@ -233,8 +234,12 @@ int PT_DECLSPEC sndDevicesFinalSetupCaptureDevice(PT_HANDLE *hp_sndDevices, int 
  * BetterFxSound: if the device is no longer present, its setting stays owed (OwedVolume.h, with the latest own
  * setting known here) and goes back on the device when it is next seen while the engine does not use it, or is
  * saved from there if the device becomes the carrier again. Once it is put back, nothing is owed any more.
+ * BetterFxSound: returns TRUE when the setting was put back on the device. Then, if fp_heldLevel is not NULL, the level
+ * and mute the device actually holds afterwards are read back into fp_heldLevel/bp_heldLevelIsRead/bp_heldMute: a driver
+ * with stepped volume (hardware dB steps, Bluetooth absolute volume) stores the nearest step, not the level asked for.
  */
-static void sndDevices_RestoreSavedPlaybackDeviceSettings(struct sndDevicesHdlType *cast_handle)
+static BOOL sndDevices_RestoreSavedPlaybackDeviceSettings(struct sndDevicesHdlType *cast_handle, float *fp_heldLevel = NULL,
+	BOOL *bp_heldLevelIsRead = NULL, BOOL *bp_heldMute = NULL)
 {
 	IMMDevice *pDevice = NULL;
 	IAudioEndpointVolume *pEndptVol = NULL;
@@ -243,7 +248,7 @@ static void sndDevices_RestoreSavedPlaybackDeviceSettings(struct sndDevicesHdlTy
 	BOOL restored = FALSE;
 
 	if( !cast_handle->playbackSettingsAreSaved )
-		return;
+		return(FALSE);
 
 	if( (sndDevices_UtilsGetIndexFromID((PT_HANDLE *)cast_handle, cast_handle->savedPlaybackDeviceID, &deviceIndex) == OKAY) &&
 		(deviceIndex >= 0) && (deviceIndex < SND_DEVICES_MAX_NUM_DEVICES) )
@@ -258,11 +263,10 @@ static void sndDevices_RestoreSavedPlaybackDeviceSettings(struct sndDevicesHdlTy
 		{
 			HRESULT hrLevel = S_OK;
 
-			// BetterFxSound: noted, so that the driver reporting this change back is not taken for the user's.
-			if( cast_handle->savedPlaybackLevelIsSaved )
-				cast_handle->engineSetPlaybackLevel = cast_handle->savedPlaybackLevel;
-			cast_handle->engineSetPlaybackMute = cast_handle->savedPlaybackMute;
-			cast_handle->engineSetPlaybackTick = GetTickCount();
+			// BetterFxSound: noted, so that the driver reporting this change back is not taken for the user's. The device
+			// is at our 100% and unmuted before it (the level is set first: unmuted with the level put back, then muted).
+			sndDevicesNoteEngineSetPlayback(cast_handle, cast_handle->savedPlaybackLevelIsSaved ? cast_handle->savedPlaybackLevel : cast_handle->engineSetPlaybackLevel.load(),
+				cast_handle->savedPlaybackMute, FALSE);
 
 			// BetterFxSound: the level first, then mute: some drivers clear the mute flag as a side effect of a level change.
 			if( cast_handle->savedPlaybackLevelIsSaved )
@@ -272,9 +276,33 @@ static void sndDevices_RestoreSavedPlaybackDeviceSettings(struct sndDevicesHdlTy
 
 			restored = SUCCEEDED(hrLevel) && SUCCEEDED(hr);
 
+			// BetterFxSound: what the device holds now, see the description.
+			if( restored && (fp_heldLevel != NULL) && (bp_heldLevelIsRead != NULL) && (bp_heldMute != NULL) )
+			{
+				float heldLevel = 0.0f;
+				BOOL heldMute = FALSE;
+
+				*fp_heldLevel = cast_handle->savedPlaybackLevel;
+				*bp_heldLevelIsRead = cast_handle->savedPlaybackLevelIsSaved;
+				*bp_heldMute = cast_handle->savedPlaybackMute;
+
+				if( SUCCEEDED(pEndptVol->GetMasterVolumeLevelScalar(&heldLevel)) )
+				{
+					*fp_heldLevel = heldLevel;
+					*bp_heldLevelIsRead = TRUE;
+				}
+				if( SUCCEEDED(pEndptVol->GetMute(&heldMute)) )
+					*bp_heldMute = heldMute;
+			}
+
 			pEndptVol->Release();
 		}
 	}
+
+	// BetterFxSound: the engine no longer holds the device at 100%, nor keeps a level the user set on it meanwhile.
+	cast_handle->engineTookOverPlaybackTick = 0;
+	cast_handle->playbackFullVolumeReassert = FALSE;
+	cast_handle->playbackLevelIsUsers = FALSE;
 
 	// BetterFxSound: the owed volume record follows.
 	if( restored )
@@ -292,6 +320,8 @@ static void sndDevices_RestoreSavedPlaybackDeviceSettings(struct sndDevicesHdlTy
 			owedVolumeUpdate(cast_handle->savedPlaybackDeviceID, owedLevel, cast_handle->savedPlaybackMute);
 		}
 	}
+
+	return(restored);
 }
 
 /*
@@ -374,6 +404,10 @@ int PT_DECLSPEC sndDevicesInitialSetupPlaybackDevice(PT_HANDLE *hp_sndDevices, i
 				float owedLevel;
 				BOOL owedMute;
 
+				// BetterFxSound: a device the engine starts using is set to 100% (see playbackLevelIsUsers).
+				cast_handle->engineTookOverPlaybackTick = 0;
+				cast_handle->playbackLevelIsUsers = FALSE;
+
 				if( owedVolumeGet(playbackDeviceID, &owedLevel, &owedMute) )
 				{
 					// BetterFxSound: the engine set this device to 100% earlier and could not hand it back yet (it was
@@ -393,6 +427,11 @@ int PT_DECLSPEC sndDevicesInitialSetupPlaybackDevice(PT_HANDLE *hp_sndDevices, i
 					cast_handle->playbackSettingsAreSaved = TRUE;
 				}
 			}
+
+			// BetterFxSound: the callback registered below is on the device the saved setting belongs to (see
+			// playbackCallbackIsOnSavedDevice).
+			cast_handle->playbackCallbackIsOnSavedDevice = (cast_handle->playbackSettingsAreSaved &&
+				(wcscmp(cast_handle->savedPlaybackDeviceID, playbackDeviceID) == 0)) ? TRUE : FALSE;
 		}
 
 		// Setup playback device volume control callback
@@ -467,11 +506,13 @@ int PT_DECLSPEC sndDevicesFinalSetupPlaybackDevice(PT_HANDLE *hp_sndDevices, int
 		return(NOT_OKAY);
 
 	// The volume control hide flag can only be used on Win7.
+	// BetterFxSound: the engine's private render session, hidden and not persisted, shared with the additional outputs
+	// (RenderSession.h). It was the default session, persisted, whose flags the first stream on the device decided.
 	if( procInfo & OPERATING_SYSTEM_VISTA )
-		StreamFlags = 0;
+		StreamFlags = AUDCLNT_STREAMFLAGS_NOPERSIST;
 	else
 		// The AUDCLNT_SESSIONFLAGS_DISPLAY_HIDE flag hides extra occurences of our volume control in Mixer dialog.
-		StreamFlags = AUDCLNT_SESSIONFLAGS_DISPLAY_HIDE;
+		StreamFlags = kRenderSessionFlags;
 
 	// Must call GetMixFormat on the freshly activated client; a copied WAVEFORMATEX is not accepted by Initialize.
 	pwfx = NULL;
@@ -497,14 +538,14 @@ int PT_DECLSPEC sndDevicesFinalSetupPlaybackDevice(PT_HANDLE *hp_sndDevices, int
 		SAFE_RELEASE(cast_handle->pAudioClientPlayback);
 		hr = cast_handle->pPlaybackDevice->Activate(cast_handle->IID_IAudioClient, CLSCTX_ALL, NULL, (void**)&cast_handle->pAudioClientPlayback);
 		if (SUCCEEDED(hr) && cast_handle->pAudioClientPlayback != NULL)
-			hr = cast_handle->pAudioClientPlayback->Initialize(AUDCLNT_SHAREMODE_SHARED, StreamFlags, cast_handle->hnsRequestedDurationPlayback, 0, pClosestMatch, NULL);
+			hr = cast_handle->pAudioClientPlayback->Initialize(AUDCLNT_SHAREMODE_SHARED, StreamFlags, cast_handle->hnsRequestedDurationPlayback, 0, pClosestMatch, &kRenderSessionGuid);
 		else
 			hr = E_FAIL;
 	}
 	else
 	{
 		// Format is supported (S_OK) or IsFormatSupported gave no match — try pwfx directly.
-		hr = cast_handle->pAudioClientPlayback->Initialize(AUDCLNT_SHAREMODE_SHARED, StreamFlags, cast_handle->hnsRequestedDurationPlayback, 0, pwfx, NULL);
+		hr = cast_handle->pAudioClientPlayback->Initialize(AUDCLNT_SHAREMODE_SHARED, StreamFlags, cast_handle->hnsRequestedDurationPlayback, 0, pwfx, &kRenderSessionGuid);
 		CoTaskMemFree(pwfx);
 		pwfx = NULL;
 
@@ -514,7 +555,7 @@ int PT_DECLSPEC sndDevicesFinalSetupPlaybackDevice(PT_HANDLE *hp_sndDevices, int
 			SAFE_RELEASE(cast_handle->pAudioClientPlayback);
 			hr = cast_handle->pPlaybackDevice->Activate(cast_handle->IID_IAudioClient, CLSCTX_ALL, NULL, (void**)&cast_handle->pAudioClientPlayback);
 			if (SUCCEEDED(hr) && cast_handle->pAudioClientPlayback != NULL)
-				hr = cast_handle->pAudioClientPlayback->Initialize(AUDCLNT_SHAREMODE_SHARED, StreamFlags, cast_handle->hnsRequestedDurationPlayback, 0, pClosestMatch, NULL);
+				hr = cast_handle->pAudioClientPlayback->Initialize(AUDCLNT_SHAREMODE_SHARED, StreamFlags, cast_handle->hnsRequestedDurationPlayback, 0, pClosestMatch, &kRenderSessionGuid);
 			else
 				hr = E_FAIL;
 		}
@@ -528,6 +569,9 @@ int PT_DECLSPEC sndDevicesFinalSetupPlaybackDevice(PT_HANDLE *hp_sndDevices, int
 		*ip_status = SND_DEVICES_AUDIO_CLIENT_INIT_FAILED;
 		SND_DEVICES_SET_STATUS_AND_RETURN_OK(SND_DEVICES_AUDIO_CLIENT_INIT_FAILED);
 	}
+
+	// BetterFxSound: the session's own level and mute at 100% and unmuted, so only the app's gain applies (RenderSession.h).
+	resetRenderSessionVolume(cast_handle->pAudioClientPlayback);
 
 	// Get the actual size of the allocated buffer in sample sets, which are called frames.
 	hr = cast_handle->pAudioClientPlayback->GetBufferSize(&cast_handle->bufferFrameSizePlayback);
@@ -601,44 +645,80 @@ int PT_DECLSPEC sndDevicesRestoreDefaultDevice(PT_HANDLE *hp_sndDevices, int *ip
 	// using it, so without this the apps would play at full level as soon as FxSound is off.
 	// Note the FxSound mute setting is not lost by this: it stays on the DFX device, which Windows
 	// remembers, so muting FxSound and restarting it comes back muted.
-	// Note also that playbackSettingsAreSaved is deliberately left set. On a power off the process
-	// carries on running, and the saved mute setting and level are still the device's true own setting
-	// (the playback volume callback keeps them up to date while FxSound is off).
-	sndDevices_RestoreSavedPlaybackDeviceSettings(cast_handle);
+	// BetterFxSound: once the setting is back on the device, it is no longer kept as saved: the next reinit reads the
+	// device's own setting afresh. It used to stay saved, relying on the playback volume callback to keep it up to date
+	// while FxSound is off, which it does not reliably do (the callback stops matching the device once the list is read
+	// again, and is dead once the device reconnects), so a power on later took the stale setting for the device's own and
+	// put it back over what the user had set meanwhile. If it could not be put back (the device is away), it stays saved
+	// and owed (OwedVolume.h).
+	// The virtual device is no longer put back as the default by the device notification worker from here on (see
+	// virtualDefaultMutex), and a device picked as the default while processing no longer applies.
+	{
+		std::lock_guard<std::mutex> lock(cast_handle->virtualDefaultMutex);
+		cast_handle->virtualDefaultGuardArmed = FALSE;
+		cast_handle->virtualDefaultGuardHint = FALSE;
+		cast_handle->virtualDefaultGuardEpoch++;
+		cast_handle->pickedDefaultID[0] = L'\0';
+	}
+	{
+		const BOOL settingIsSaved = cast_handle->playbackSettingsAreSaved;
+		wchar_t handedBackID[PT_MAX_GENERIC_STRLEN];
+		// BetterFxSound: what the device holds after the hand-back, read back from it (a stepped driver stores the nearest
+		// step, which the next reinit must not take for a change the user made while FxSound was off).
+		BOOL handedBackMute = cast_handle->savedPlaybackMute;
+		float handedBackLevel = cast_handle->savedPlaybackLevel;
+		BOOL handedBackLevelIsSaved = cast_handle->savedPlaybackLevelIsSaved;
+		wcscpy_s(handedBackID, PT_MAX_GENERIC_STRLEN, cast_handle->savedPlaybackDeviceID);
+
+		if( settingIsSaved && sndDevices_RestoreSavedPlaybackDeviceSettings(cast_handle, &handedBackLevel, &handedBackLevelIsSaved, &handedBackMute) )
+		{
+			cast_handle->playbackSettingsAreSaved = FALSE;
+			cast_handle->playbackCallbackIsOnSavedDevice = FALSE;
+
+			// BetterFxSound: what the device was given back, see handedBackPlaybackIsPending.
+			wcscpy_s(cast_handle->handedBackPlaybackDeviceID, PT_MAX_GENERIC_STRLEN, handedBackID);
+			cast_handle->handedBackPlaybackMute = handedBackMute;
+			cast_handle->handedBackPlaybackLevel = handedBackLevel;
+			cast_handle->handedBackPlaybackLevelIsSaved = handedBackLevelIsSaved;
+			cast_handle->handedBackPlaybackIsPending = TRUE;
+			// BetterFxSound: kept in the registry too, so a hand-back at exit counts at the next start of the app.
+			sndDevicesStoreHandedBackRecord(hp_sndDevices);
+		}
+	}
 
 	//Check to see if the user has selected the playback device.
 	if( sndDeviceReadFromRegistry(hp_sndDevices, REG_CURRENT_USER, SND_DEVICES_REGISTRY_USER_SELECTED_PLAYBACK_WIDE, userSelectedPlaybackID) != OKAY )
 		return(NOT_OKAY);
 	// Get this devices internal index if the device is active.
-	if( sndDevices_UtilsGetIndexFromID(hp_sndDevices, userSelectedPlaybackID, &userSelectedPlaybackNum) != OKAY )
+	if( sndDevices_UtilsGetActiveIndexFromID(hp_sndDevices, userSelectedPlaybackID, &userSelectedPlaybackNum) != OKAY )
 		return(NOT_OKAY);
 
 	//Get the ID for the most recent playback device.
 	if( sndDeviceReadFromRegistry(hp_sndDevices, REG_CURRENT_USER, SND_DEVICES_REGISTRY_MOST_RECENT_PLAYBACK_WIDE, mostRecentPlaybackID) != OKAY )
 		return(NOT_OKAY);
 	// Get this devices internal index if the device is active.
-	if( sndDevices_UtilsGetIndexFromID(hp_sndDevices, mostRecentPlaybackID, &mostRecentPlaybackNum) != OKAY )
+	if( sndDevices_UtilsGetActiveIndexFromID(hp_sndDevices, mostRecentPlaybackID, &mostRecentPlaybackNum) != OKAY )
 		return(NOT_OKAY);
 
 	//Get the ID and device num for the most recent default device.
 	if( sndDeviceReadFromRegistry(hp_sndDevices, REG_CURRENT_USER, SND_DEVICES_REGISTRY_MOST_RECENT_DEFAULT_WIDE, mostRecentDefaultID) != OKAY )
 		return(NOT_OKAY);
 	// Get this devices internal index if the device is active.
-	if( sndDevices_UtilsGetIndexFromID(hp_sndDevices, mostRecentDefaultID, &mostRecentDefaultNum) != OKAY )
+	if( sndDevices_UtilsGetActiveIndexFromID(hp_sndDevices, mostRecentDefaultID, &mostRecentDefaultNum) != OKAY )
 		return(NOT_OKAY);
 
 	//Get the ID and device num for the prior default device.
 	if( sndDeviceReadFromRegistry(hp_sndDevices, REG_CURRENT_USER, SND_DEVICES_REGISTRY_PRIOR_DEFAULT_WIDE, priorDefaultID) != OKAY )
 		return(NOT_OKAY);
 	// Get this devices internal index if the device is active.
-	if( sndDevices_UtilsGetIndexFromID(hp_sndDevices, priorDefaultID, &priorDefaultNum) != OKAY )
+	if( sndDevices_UtilsGetActiveIndexFromID(hp_sndDevices, priorDefaultID, &priorDefaultNum) != OKAY )
 		return(NOT_OKAY);
 
 	//Get the ID for the original default device.
 	if( sndDeviceReadFromRegistry(hp_sndDevices, REG_CURRENT_USER, SND_DEVICES_REGISTRY_ORIGINAL_DEFAULT_WIDE, originalDefaultID) != OKAY )
 		return(NOT_OKAY);
 	// Get this devices internal index if the device is active.
-	if( sndDevices_UtilsGetIndexFromID(hp_sndDevices, originalDefaultID, &originalDefaultNum) != OKAY )
+	if( sndDevices_UtilsGetActiveIndexFromID(hp_sndDevices, originalDefaultID, &originalDefaultNum) != OKAY )
 		return(NOT_OKAY);
 
 	if( userSelectedPlaybackNum != SND_DEVICES_DEVICE_NOT_PRESENT )

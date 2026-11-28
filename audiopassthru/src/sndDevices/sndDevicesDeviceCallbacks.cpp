@@ -31,7 +31,10 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include <mmdeviceapi.h>
 #include <endpointvolume.h>
 #include <string>
+#include <new>
 
+// This is the include file for the "hidden" IPolicyConfig MS functions.
+#include "PolicyConfig.h"
 
 #include "slout.h"
 #include "mry.h"
@@ -90,6 +93,249 @@ HRESULT STDMETHODCALLTYPE CsndDevicesMMNotificationClient::QueryInterface(
   return S_OK;
 }
 
+// BetterFxSound: helpers for the device notification callbacks below. The callbacks run on the audio service's
+// notification threads while the timer thread may be rewriting the device list (sndDevicesReInit(), sndDevices_GetAll()),
+// so they read each shared index once, check its bounds, and only trust the list when enumerationSequence says it was
+// not being rewritten during the read.
+
+// The format ID of PKEY_AudioEngine_DeviceFormat ({f19f064d-082c-4e27-bc73-6882a1bb8e4c}, pid 0, mmdeviceapi.h),
+// defined here so this file does not need initguid.h for it.
+static const GUID kSndDevicesAudioEngineDeviceFormatFmtid =
+	{ 0xf19f064d, 0x082c, 0x4e27, { 0xbc, 0x73, 0x68, 0x82, 0xa1, 0xbb, 0x8e, 0x4c } };
+
+// True for a capture (recording) endpoint. MMDevice endpoint IDs start with "{0.0.<flow>.", flow being 0 for render and
+// 1 for capture. The callbacks must not release the last reference to an MMDevice API object, so they cannot open the
+// endpoint to ask for its data flow. An ID in another format is treated as a playback endpoint.
+static BOOL sndDevicesCallbackIsCaptureEndpoint(LPCWSTR pwstrDeviceId)
+{
+	if ((pwstrDeviceId != NULL) && (wcsncmp(pwstrDeviceId, L"{0.0.1.", 7) == 0))
+		return(TRUE);
+
+	return(FALSE);
+}
+
+// Looks the endpoint up in the playback device list read at the last enumeration. Returns FALSE when the list cannot
+// be relied on (being rewritten, or reset by a reinit that has not enumerated yet). Otherwise returns TRUE with
+// *ip_index set to the device's index (SND_DEVICES_DEVICE_NOT_PRESENT if it is not listed) and *dp_state to its state
+// at that enumeration.
+static BOOL sndDevicesCallbackFindDevice(struct sndDevicesHdlType *cast_handle, LPCWSTR pwstrDeviceId, int *ip_index, DWORD *dp_state)
+{
+	LONG seq_before;
+	LONG seq_after;
+	int total;
+	int i;
+
+	*ip_index = SND_DEVICES_DEVICE_NOT_PRESENT;
+	*dp_state = 0;
+
+	if (pwstrDeviceId == NULL)
+		return(FALSE);
+
+	seq_before = InterlockedCompareExchange(&(cast_handle->enumerationSequence), 0, 0);
+	if ((seq_before & 1) != 0)
+		return(FALSE);
+
+	total = *(volatile int *)&(cast_handle->totalNumDevices);
+	if (total > SND_DEVICES_MAX_NUM_DEVICES)
+		total = SND_DEVICES_MAX_NUM_DEVICES;
+
+	for (i = 0; i < total; i++)
+	{
+		if (wcsncmp(cast_handle->pwszID[i], pwstrDeviceId, PT_MAX_GENERIC_STRLEN) == 0)
+		{
+			*ip_index = i;
+			*dp_state = cast_handle->deviceState[i];
+			break;
+		}
+	}
+
+	seq_after = InterlockedCompareExchange(&(cast_handle->enumerationSequence), 0, 0);
+	if ((seq_after != seq_before) || (total <= 0))
+	{
+		*ip_index = SND_DEVICES_DEVICE_NOT_PRESENT;
+		*dp_state = 0;
+		return(FALSE);
+	}
+
+	return(TRUE);
+}
+
+// True when a change of this playback endpoint must stop the processing, which interrupts the carrier and every
+// additional output: the endpoint is the virtual device or the carrier, or there is no carrier and the endpoint becomes
+// usable (b_becomes_active). Any other endpoint (an unused HDMI monitor going to sleep, a spare DAC, another app's
+// virtual device, an additional output) is left to the timer, which reads the device list again and refreshes the
+// outputs without stopping (deviceListIsStale). When the list cannot be relied on (an enumeration is rewriting it), only
+// the virtual device stops the processing: any other endpoint marks the list stale, and the timer then compares the
+// list with the system (sndCheckDeviceChanges(), same rule), which stops the processing if the change concerns the
+// carrier. If that enumeration already read the change, the comparison finds no difference: sndDevices_GetAll() then
+// stops the processing itself when the carrier or the virtual device is gone or changed to or from active. Stopping
+// on an unreliable list let the rest of a notification burst (a device connect raises about ten state changes) land
+// in the enumeration started by its first one and stop the processing anyway. A stale flag set during a reinit's
+// enumeration is kept, the reinit clears it before enumerating.
+static BOOL sndDevicesCallbackChangeStopsProcessing(struct sndDevicesHdlType *cast_handle, LPCWSTR pwstrDeviceId, BOOL b_becomes_active)
+{
+	LONG seq_before;
+	LONG seq_after;
+	int total;
+	int carrier_num;
+	BOOL is_carrier;
+
+	if (pwstrDeviceId == NULL)
+		return(TRUE);
+
+	if ((cast_handle->dfxDeviceID[0] != L'\0') &&
+		(wcsncmp(pwstrDeviceId, cast_handle->dfxDeviceID, PT_MAX_GENERIC_STRLEN) == 0))
+		return(TRUE);
+
+	seq_before = InterlockedCompareExchange(&(cast_handle->enumerationSequence), 0, 0);
+	if ((seq_before & 1) != 0)
+		return(FALSE);
+
+	total = *(volatile int *)&(cast_handle->totalNumDevices);
+	if (total > SND_DEVICES_MAX_NUM_DEVICES)
+		total = SND_DEVICES_MAX_NUM_DEVICES;
+	carrier_num = *(volatile int *)&(cast_handle->playbackDeviceNum);
+
+	is_carrier = FALSE;
+	if ((carrier_num >= 0) && (carrier_num < total))
+		is_carrier = (wcsncmp(cast_handle->pwszID[carrier_num], pwstrDeviceId, PT_MAX_GENERIC_STRLEN) == 0);
+
+	seq_after = InterlockedCompareExchange(&(cast_handle->enumerationSequence), 0, 0);
+	if (seq_after != seq_before)
+		return(FALSE);
+
+	if ((carrier_num < 0) || (carrier_num >= total))
+		return(b_becomes_active);
+
+	return(is_carrier);
+}
+
+// Records the new Windows default in defaultDeviceNum. The sequence is taken odd from an even value for the store, as
+// sndDevices_GetAll() does, so an enumeration cannot publish its own default in between and then have it overwritten
+// with an index of the list it replaced. If an enumeration is under way, nothing is stored: it publishes the default it
+// reads (and when that read came before this change, the stop flag makes the reinit run again).
+static void sndDevicesCallbackPublishDefault(struct sndDevicesHdlType *cast_handle, LPCWSTR pwstrDeviceId)
+{
+	LONG sequence;
+	int total;
+	int device_num;
+	int i;
+
+	sequence = InterlockedCompareExchange(&(cast_handle->enumerationSequence), 0, 0);
+	if ((sequence & 1) != 0)
+		return;
+	if (InterlockedCompareExchange(&(cast_handle->enumerationSequence), sequence + 1, sequence) != sequence)
+		return;
+
+	total = cast_handle->totalNumDevices;
+	if (total > SND_DEVICES_MAX_NUM_DEVICES)
+		total = SND_DEVICES_MAX_NUM_DEVICES;
+
+	device_num = SND_DEVICES_DEVICE_NOT_PRESENT;
+	for (i = 0; i < total; i++)
+	{
+		if (wcsncmp(cast_handle->pwszID[i], pwstrDeviceId, PT_MAX_GENERIC_STRLEN) == 0)
+		{
+			device_num = i;
+			break;
+		}
+	}
+
+	// A reinit that has reset the list (total not set yet) publishes the default itself.
+	if (total > 0)
+		cast_handle->defaultDeviceNum = device_num;
+
+	InterlockedExchange(&(cast_handle->enumerationSequence), sequence + 2);
+}
+
+// BetterFxSound: a real device made the Windows default while the processing runs, see
+// sndDevicesHdlType::virtualDefaultMutex. One work item per notification, which owns this.
+struct sndDevicesVirtualDefaultWork
+{
+	struct sndDevicesHdlType *cast_handle;
+	LONG sequence;
+	LONG guardEpoch;	// virtualDefaultGuardEpoch when the notification came, see there.
+	wchar_t pickedID[PT_MAX_GENERIC_STRLEN];
+	wchar_t dfxID[PT_MAX_GENERIC_STRLEN];
+};
+
+// Runs on a thread pool thread: the notification callback must not change the default device itself (an MMDevice API
+// call from a notification callback can deadlock). Puts the virtual device back as the default, if the processing still
+// runs (under the lock, so never after sndDevicesRestoreDefaultDevice() handed the devices back), and records the device
+// picked for the next run of the device rules, which makes it the carrier as it did when it found it the default.
+static DWORD WINAPI sndDevicesVirtualDefaultWorker(LPVOID pv_work)
+{
+	sndDevicesVirtualDefaultWork *work = (sndDevicesVirtualDefaultWork *)pv_work;
+	struct sndDevicesHdlType *cast_handle;
+	IPolicyConfigVista *pPolicyConfig = NULL;
+	int selectionMode = SND_DEVICES_AUTO_SELECT_DEFAULT_DEVICE_ON;
+	HRESULT hrInit;
+	HRESULT hr;
+
+	if (work == NULL)
+		return(0);
+
+	cast_handle = work->cast_handle;
+	hrInit = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+
+	// Only when the device rules make the virtual device the default themselves.
+	if (sndDevicesGetDefaultDeviceSelectionMode((PT_HANDLE *)cast_handle, &selectionMode) != OKAY)
+		selectionMode = SND_DEVICES_AUTO_SELECT_DEFAULT_DEVICE_OFF;
+
+	if (selectionMode == SND_DEVICES_AUTO_SELECT_DEFAULT_DEVICE_ON)
+	{
+		std::lock_guard<std::mutex> lock(cast_handle->virtualDefaultMutex);
+
+		// BetterFxSound: and only for the arming the notification came in: a late item must neither change the default
+		// nor record its pick once the reinit it caused has run (see virtualDefaultGuardEpoch).
+		if (cast_handle->virtualDefaultGuardArmed && (work->guardEpoch == cast_handle->virtualDefaultGuardEpoch.load()))
+		{
+			hr = CoCreateInstance(__uuidof(CPolicyConfigVistaClient), NULL, CLSCTX_ALL, __uuidof(IPolicyConfigVista), (LPVOID *)&pPolicyConfig);
+			if (SUCCEEDED(hr) && (pPolicyConfig != NULL))
+			{
+				hr = pPolicyConfig->SetDefaultEndpoint(work->dfxID, eConsole);
+				pPolicyConfig->Release();
+
+				// The newest pick wins, work items may run in any order.
+				if (SUCCEEDED(hr) && ((LONG)((ULONG)work->sequence - (ULONG)cast_handle->pickedDefaultSequence) > 0))
+				{
+					wcscpy_s(cast_handle->pickedDefaultID, PT_MAX_GENERIC_STRLEN, work->pickedID);
+					cast_handle->pickedDefaultSequence = work->sequence;
+				}
+			}
+		}
+	}
+
+	if (SUCCEEDED(hrInit))
+		CoUninitialize();
+
+	delete work;
+
+	return(0);
+}
+
+// Queues sndDevicesVirtualDefaultWorker() for a real device made the default. Cheap, nothing blocks.
+static void sndDevicesQueueVirtualDefault(struct sndDevicesHdlType *cast_handle, LPCWSTR pwstrDeviceId, LONG guardEpoch)
+{
+	sndDevicesVirtualDefaultWork *work;
+
+	if ((cast_handle->virtualDefaultGuardHint.load() == FALSE) || (cast_handle->dfxDeviceID[0] == L'\0'))
+		return;
+
+	work = new (std::nothrow) sndDevicesVirtualDefaultWork;
+	if (work == NULL)
+		return;
+
+	work->cast_handle = cast_handle;
+	work->sequence = InterlockedIncrement(&(cast_handle->defaultPickSequence));
+	work->guardEpoch = guardEpoch;
+	wcsncpy_s(work->pickedID, PT_MAX_GENERIC_STRLEN, pwstrDeviceId, _TRUNCATE);
+	wcsncpy_s(work->dfxID, PT_MAX_GENERIC_STRLEN, cast_handle->dfxDeviceID, _TRUNCATE);
+
+	if (!QueueUserWorkItem(sndDevicesVirtualDefaultWorker, work, WT_EXECUTEDEFAULT))
+		delete work;
+}
+
 // Callback methods for device-event notifications.
 
 HRESULT STDMETHODCALLTYPE CsndDevicesMMNotificationClient::OnDefaultDeviceChanged(
@@ -97,57 +343,69 @@ HRESULT STDMETHODCALLTYPE CsndDevicesMMNotificationClient::OnDefaultDeviceChange
                           LPCWSTR pwstrDeviceId)
 {  
   struct sndDevicesHdlType *cast_handle;
+  BOOL is_virtual_device;
+  int default_num;
     
   cast_handle = (struct sndDevicesHdlType *)g_sndDevicesCallbacks_hdl;
 
   if (cast_handle == NULL)
     return(S_OK);
 
-  if (cast_handle->dfxDeviceNum == SND_DEVICES_DEVICE_NOT_PRESENT)
-	return(S_OK);
-
   if (pwstrDeviceId == NULL)
+	  return(S_OK);
+
+  // BetterFxSound: only the default playback device for multimedia (the one GetAll reads and the processing follows)
+  // matters. Changes of the default recording device or of the communications device used to overwrite
+  // defaultDeviceNum, so the virtual device was no longer seen as the default.
+  if( (flow != eRender) || (role != eMultimedia) )
 	  return(S_OK);
 
   SLOUT_FIRST_LINE(L"CsndDevicesMMNotificationClient::OnDefaultDeviceChanged() enters");
 
-  if( (flow == eRender) && (role == eMultimedia) && (cast_handle->ignoreDeviceCallbacks == FALSE) )
+  // BetterFxSound: the virtual device is recognized by its ID, which is kept across reinits. This notification used
+  // to be dropped while a reinit had reset dfxDeviceNum, so a default change made then was never acted on.
+  is_virtual_device = (cast_handle->dfxDeviceID[0] != L'\0') &&
+	  (wcsncmp(pwstrDeviceId, cast_handle->dfxDeviceID, PT_MAX_GENERIC_STRLEN) == 0);
+
+  // Don't think we need to kill process thread if DFX itself is selected as default from within our code
+  if( (!is_virtual_device) && (cast_handle->ignoreDeviceCallbacks == FALSE) )
   {
 	  // If one of the DFX capture devices was set as the default and the default device has been changed, force a re-initialization.
 	  // Note- setting the flag only if a DFX device was the default is filtering out callbacks we want made.
 	  //if( (cast_handle->dfxDeviceNum == cast_handle->defaultDeviceNum) || (cast_handle->dfx48DeviceNum == cast_handle->defaultDeviceNum) )
 	  SLOUT_FIRST_LINE(L"CsndDevicesMMNotificationClient::OnDefaultDeviceChanged() setting processing thread kill flag");
 
-	  // Don't think we need to kill process thread if DFX itself is selected as default from within our code
-	  if (cast_handle->pwszID[cast_handle->dfxDeviceNum] && wcscmp(pwstrDeviceId, cast_handle->pwszID[cast_handle->dfxDeviceNum]) == 0)
-		  return(S_OK);
-
 	  //std::wstring temp_string(pwstrDeviceId);
 	  /* Set the newly targeted playback device as the default.  It will then automatically become the targeted device */
 	  //if (sndDevicesSetDeviceType(g_sndDevicesCallbacks_hdl, SND_DEVICES_DEFAULT, &temp_string[0], &i_resultFlag) != OKAY)
 		//  return(NOT_OKAY);
 
-	  cast_handle->stopAudioCaptureAndPlaybackLoop = 1;
+	  // BetterFxSound: the guard's arming is read before the stop below, so it cannot be a later arming, made after the
+	  // reinit that this stop causes (see virtualDefaultGuardEpoch).
+	  const LONG guardEpoch = cast_handle->virtualDefaultGuardEpoch.load();
+
+	  InterlockedExchange(&(cast_handle->stopAudioCaptureAndPlaybackLoop), 1);
+
+	  // BetterFxSound: while the processing runs, the virtual device is put back as the default at once (it held every
+	  // app's sound on that device, unprocessed and at 100%, until the reinit did it).
+	  sndDevicesQueueVirtualDefault(cast_handle, pwstrDeviceId, guardEpoch);
   }
 
   // Ignore the notification for the device selected in the application.
-  if (cast_handle->defaultDeviceNum != SND_DEVICES_DEVICE_NOT_PRESENT &&
-	  cast_handle->pwszID[cast_handle->defaultDeviceNum] &&
-	  wcscmp(pwstrDeviceId, cast_handle->pwszID[cast_handle->defaultDeviceNum]) == 0)
+  // BetterFxSound: the index is read once and bounds checked, a reinit can reset it at any time.
+  default_num = *(volatile int *)&(cast_handle->defaultDeviceNum);
+  if( (default_num >= 0) && (default_num < SND_DEVICES_MAX_NUM_DEVICES) &&
+	  (wcsncmp(pwstrDeviceId, cast_handle->pwszID[default_num], PT_MAX_GENERIC_STRLEN) == 0) )
   {
 	  return(S_OK);
   }
 
-  cast_handle->defaultDeviceNum = SND_DEVICES_DEVICE_NOT_PRESENT;
+  // BetterFxSound: defaultDeviceNum is only written while no enumeration can rewrite the list or publish its own
+  // default, see sndDevicesCallbackPublishDefault().
+  sndDevicesCallbackPublishDefault(cast_handle, pwstrDeviceId);
 
-  for (int i = 0; i < cast_handle->totalNumDevices; i++)
-  {
-	  if (cast_handle->pwszID[i] && wcscmp(cast_handle->pwszID[i], pwstrDeviceId) == 0)
-	  {
-		  cast_handle->defaultDeviceNum = i;
-		  break;
-	  }
-  }
+  if (is_virtual_device)
+	  return(S_OK);
 
   if (cast_handle->deviceChangeCallback != NULL)
 	  cast_handle->deviceChangeCallback();
@@ -163,15 +421,27 @@ HRESULT STDMETHODCALLTYPE CsndDevicesMMNotificationClient::OnDeviceAdded(LPCWSTR
 
   if (cast_handle == NULL)
     return(S_OK);
+
+  // BetterFxSound: a recording endpoint (a microphone, a webcam, the hands-free side of a headset) is never used for
+  // playback, so it no longer stops the processing and interrupts every output.
+  if (sndDevicesCallbackIsCaptureEndpoint(pwstrDeviceId))
+	  return(S_OK);
 	
   SLOUT_FIRST_LINE(L"CsndDevicesMMNotificationClient::OnDeviceAdded() enters");
 
   // These callbacks only appear to get hit when a device is added that didn't already have a driver installed.
+  // BetterFxSound: only the virtual device, or any device while there is no carrier, stops the processing. Another
+  // device (a new output, or a better carrier the controller may switch to) is picked up by the timer without a stop.
   if( cast_handle->ignoreDeviceCallbacks == FALSE )
   {
-	  SLOUT_FIRST_LINE(L"CsndDevicesMMNotificationClient::OnDeviceAdded() setting processing thread kill flag");
+	  if( sndDevicesCallbackChangeStopsProcessing(cast_handle, pwstrDeviceId, TRUE) )
+	  {
+		  SLOUT_FIRST_LINE(L"CsndDevicesMMNotificationClient::OnDeviceAdded() setting processing thread kill flag");
 
-	  cast_handle->stopAudioCaptureAndPlaybackLoop = 1;
+		  InterlockedExchange(&(cast_handle->stopAudioCaptureAndPlaybackLoop), 1);
+	  }
+	  else
+		  InterlockedExchange(&(cast_handle->deviceListIsStale), 1);
   }
 
   if (cast_handle->deviceChangeCallback != NULL)
@@ -183,20 +453,38 @@ HRESULT STDMETHODCALLTYPE CsndDevicesMMNotificationClient::OnDeviceAdded(LPCWSTR
 HRESULT STDMETHODCALLTYPE CsndDevicesMMNotificationClient::OnDeviceRemoved(LPCWSTR pwstrDeviceId)
 {
   struct sndDevicesHdlType *cast_handle;
+  int device_num;
+  DWORD device_state;
     
   cast_handle = (struct sndDevicesHdlType *)g_sndDevicesCallbacks_hdl;
 
   if (cast_handle == NULL)
     return(S_OK);
 
+  // BetterFxSound: a recording endpoint is never used for playback, see OnDeviceAdded().
+  if (sndDevicesCallbackIsCaptureEndpoint(pwstrDeviceId))
+	  return(S_OK);
+
   SLOUT_FIRST_LINE(L"CsndDevicesMMNotificationClient::OnDeviceRemoved() enters");
 
   // These callbacks only appear to get hit when a device is added that didn't already have a driver installed.
+  // BetterFxSound: a playback endpoint that was not in the device list (neither active nor unplugged) was not in use,
+  // so its removal does not stop the processing. Nor does a listed one that is neither the virtual device nor the
+  // carrier: the timer reads the list again and drops it from the outputs.
   if( cast_handle->ignoreDeviceCallbacks == FALSE )
   {
-	  SLOUT_FIRST_LINE(L"CsndDevicesMMNotificationClient::OnDeviceRemoved() setting processing thread kill flag");
+	  if( !sndDevicesCallbackFindDevice(cast_handle, pwstrDeviceId, &device_num, &device_state) ||
+		  (device_num != SND_DEVICES_DEVICE_NOT_PRESENT) )
+	  {
+		  if( sndDevicesCallbackChangeStopsProcessing(cast_handle, pwstrDeviceId, FALSE) )
+		  {
+			  SLOUT_FIRST_LINE(L"CsndDevicesMMNotificationClient::OnDeviceRemoved() setting processing thread kill flag");
 
-	  cast_handle->stopAudioCaptureAndPlaybackLoop = 1;
+			  InterlockedExchange(&(cast_handle->stopAudioCaptureAndPlaybackLoop), 1);
+		  }
+		  else
+			  InterlockedExchange(&(cast_handle->deviceListIsStale), 1);
+	  }
   }
 
   if (cast_handle->deviceChangeCallback != NULL)
@@ -210,7 +498,10 @@ HRESULT STDMETHODCALLTYPE CsndDevicesMMNotificationClient::OnDeviceStateChanged(
                           DWORD dwNewState)
 {
   struct sndDevicesHdlType *cast_handle;
-  int type;
+  BOOL state_changed;
+  BOOL stop_processing;
+  int device_num;
+  DWORD device_state;
     
   cast_handle = (struct sndDevicesHdlType *)g_sndDevicesCallbacks_hdl;
 
@@ -219,21 +510,13 @@ HRESULT STDMETHODCALLTYPE CsndDevicesMMNotificationClient::OnDeviceStateChanged(
 
   //SLOUT_FIRST_LINE(L"CsndDevicesMMNotificationClient::OnDeviceStateChanged() enters");
 
-  switch (dwNewState)
-  {
-  case DEVICE_STATE_ACTIVE:
-	   type = dwNewState;	// When connecting device, this gets hit around 10 times.
-      break;
-  case DEVICE_STATE_DISABLED:
-	   type = dwNewState;
-      break;
-  case DEVICE_STATE_NOTPRESENT:
-	   type = dwNewState;		// When disconnecting device, this gets hit around 12 times.
-      break;
-  case DEVICE_STATE_UNPLUGGED:
-	   type = dwNewState;
-      break;
-  }
+  // BetterFxSound: a recording endpoint is never used for playback, see OnDeviceAdded(). Bluetooth headsets toggle
+  // their hands-free endpoints whenever an app opens or closes the microphone.
+  if (sndDevicesCallbackIsCaptureEndpoint(pwstrDeviceId))
+	  return(S_OK);
+
+  // DEVICE_STATE_ACTIVE: when connecting device, this gets hit around 10 times.
+  // DEVICE_STATE_NOTPRESENT: when disconnecting device, this gets hit around 12 times.
 
   // Ignore identical callbacks from the same guid. Since device must be disconnected after being connected,
   // we should never miss a connect or disconnect event.
@@ -247,15 +530,52 @@ HRESULT STDMETHODCALLTYPE CsndDevicesMMNotificationClient::OnDeviceStateChanged(
   if( pwstrDeviceId == NULL )
 		wcscpy(cast_handle->lastDeviceAddCallbackGuid, L"");
   else
-	   wcscpy(cast_handle->lastDeviceAddCallbackGuid, pwstrDeviceId );
+	   wcsncpy_s(cast_handle->lastDeviceAddCallbackGuid, PT_MAX_GENERIC_STRLEN, pwstrDeviceId, _TRUNCATE);
 
   cast_handle->lastDeviceAddCallbackGuidtype = dwNewState;
 
+  /*
+  * BetterFxSound: only stop the processing (which interrupts every output) when the change can matter to it: the
+  * endpoint is the virtual device or the carrier and changes state from or to active, or there is no carrier and an
+  * endpoint becomes active (sndDevicesCallbackChangeStopsProcessing()). A state the last enumeration already read is
+  * ignored. Any other change (an unused HDMI monitor going to sleep, a spare DAC, a new or vanished additional output)
+  * only marks the device list stale: the timer reads it again and refreshes the outputs, without a stop. When the
+  * list cannot be relied on (an enumeration is under way), the change is treated as one, and
+  * sndDevicesCallbackChangeStopsProcessing() leaves it to the timer unless the endpoint is the virtual device.
+  */
+  state_changed = TRUE;
+  stop_processing = TRUE;
+  if (!sndDevicesCallbackFindDevice(cast_handle, pwstrDeviceId, &device_num, &device_state))
+	  stop_processing = sndDevicesCallbackChangeStopsProcessing(cast_handle, pwstrDeviceId, (dwNewState == DEVICE_STATE_ACTIVE));
+  else
+  {
+	  if (device_num != SND_DEVICES_DEVICE_NOT_PRESENT)
+	  {
+		  state_changed = (dwNewState != device_state);
+		  stop_processing = state_changed &&
+			  ((dwNewState == DEVICE_STATE_ACTIVE) || (device_state == DEVICE_STATE_ACTIVE));
+	  }
+	  else
+	  {
+		  // An unlisted endpoint joins the list (enumerated as active or unplugged) in these states only.
+		  state_changed = (dwNewState == DEVICE_STATE_ACTIVE) || (dwNewState == DEVICE_STATE_UNPLUGGED);
+		  stop_processing = (dwNewState == DEVICE_STATE_ACTIVE);
+	  }
+
+	  if (stop_processing)
+		  stop_processing = sndDevicesCallbackChangeStopsProcessing(cast_handle, pwstrDeviceId, (dwNewState == DEVICE_STATE_ACTIVE));
+  }
+
   if( cast_handle->ignoreDeviceCallbacks == FALSE )
   {
-	  SLOUT_FIRST_LINE(L"CsndDevicesMMNotificationClient::OnDeviceStateChanged() setting processing thread kill flag");
+	  if( stop_processing )
+	  {
+		  SLOUT_FIRST_LINE(L"CsndDevicesMMNotificationClient::OnDeviceStateChanged() setting processing thread kill flag");
 
-	  cast_handle->stopAudioCaptureAndPlaybackLoop = 1;
+		  InterlockedExchange(&(cast_handle->stopAudioCaptureAndPlaybackLoop), 1);
+	  }
+	  else if( state_changed )
+		  InterlockedExchange(&(cast_handle->deviceListIsStale), 1);
   }
 
   if (cast_handle->deviceChangeCallback != NULL)
@@ -273,11 +593,36 @@ HRESULT STDMETHODCALLTYPE CsndDevicesMMNotificationClient::OnPropertyValueChange
                           const PROPERTYKEY key)
 {
   struct sndDevicesHdlType *cast_handle;
-    
+
   cast_handle = (struct sndDevicesHdlType *)g_sndDevicesCallbacks_hdl;
 
   if (cast_handle == NULL)
     return(S_OK);
+
+  /*
+  * BetterFxSound: a playback endpoint's format changed (PKEY_AudioEngine_DeviceFormat). Its state stays the same, so
+  * nothing else tells: a Bluetooth headset that went mono while an app had its microphone open stayed listed as mono
+  * (hidden from the outputs, not routed) once it was back to stereo, until some unrelated device event. The device list
+  * is read again by the timer (deviceFormatChanged, see sndCheckDeviceChanges()). The processing is not stopped here:
+  * Windows sends bursts of these while a Bluetooth endpoint connects or renegotiates, and some drivers send the
+  * property again unchanged, so each one interrupted every output. A real change of the carrier's format invalidates
+  * its stream (the processing thread ends), and sndCheckDeviceChanges() stops it too when the carrier's format no
+  * longer matches the one it was opened with. Every other property (the mute setting on Windows 8 and later, names,
+  * icons) is still ignored. The virtual device's format is set by the reinit itself.
+  */
+  if( (pwstrDeviceId != NULL) && (cast_handle->ignoreDeviceCallbacks == FALSE) &&
+	  IsEqualGUID(key.fmtid, kSndDevicesAudioEngineDeviceFormatFmtid) && (key.pid == 0) &&
+	  !sndDevicesCallbackIsCaptureEndpoint(pwstrDeviceId) &&
+	  !((cast_handle->dfxDeviceID[0] != L'\0') && (wcsncmp(pwstrDeviceId, cast_handle->dfxDeviceID, PT_MAX_GENERIC_STRLEN) == 0)) )
+  {
+	  SLOUT_FIRST_LINE(L"CsndDevicesMMNotificationClient::OnPropertyValueChanged() a playback device format changed");
+
+	  InterlockedExchange(&(cast_handle->deviceFormatChanged), 1);
+	  InterlockedExchange(&(cast_handle->deviceListIsStale), 1);
+
+	  if (cast_handle->deviceChangeCallback != NULL)
+		  cast_handle->deviceChangeCallback();
+  }
 
 	/*
 	struct sndDevicesHdlType *cast_handle;

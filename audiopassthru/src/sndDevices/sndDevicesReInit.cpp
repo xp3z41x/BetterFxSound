@@ -52,6 +52,7 @@ int PT_DECLSPEC sndDevicesReInit(PT_HANDLE *hp_sndDevices, int i_initType, int *
 	int captureAllocSize, playbackAllocSize;
 	int captureBufferChannelsForAllocation;
 	BOOL captureMuteState;
+	unsigned long masterSequence;
     
 	cast_handle = (struct sndDevicesHdlType *)hp_sndDevices;
 
@@ -64,6 +65,7 @@ int PT_DECLSPEC sndDevicesReInit(PT_HANDLE *hp_sndDevices, int i_initType, int *
 	*ipNumRealDevices = 0;
 	*ipDfxDeviceEnabledFlag = IS_FALSE;
 	cast_handle->function_status = SND_DEVICES_DEVICE_OPERATION_COMPLETED;	// Clear function error status code.
+	cast_handle->playbackSetupFailed = FALSE;	// BetterFxSound: set below when the carrier itself fails
 
 	//cast_handle->ignoreDeviceCallbacks = TRUE;
 	//cast_handle->ignoreVolumeCallbacks = TRUE;
@@ -80,7 +82,12 @@ int PT_DECLSPEC sndDevicesReInit(PT_HANDLE *hp_sndDevices, int i_initType, int *
 	cast_handle->playbackIsActive = SND_DEVICES_PLAYBACK_IS_STOPPED;
 	cast_handle->playbackStreamIsTemporarilyPaused = 0;
 
-	cast_handle->stopAudioCaptureAndPlaybackLoop = 0;
+	// BetterFxSound: the only place the stop flag is cleared, before the devices are enumerated below. A stop requested
+	// from now on (by a device notification or a carrier switch) is kept, and the processing thread started after this
+	// reinit exits at once so another reinit sees it.
+	InterlockedExchange(&(cast_handle->stopAudioCaptureAndPlaybackLoop), 0);
+	// BetterFxSound: the list read below and the outputs refresh that follows the reinit cover any earlier change.
+	InterlockedExchange(&(cast_handle->deviceListIsStale), 0);
 
 	wcscpy(cast_handle->lastDeviceAddCallbackGuid, L"");
 	cast_handle->lastDeviceAddCallbackGuidtype = 0;
@@ -165,6 +172,7 @@ int PT_DECLSPEC sndDevicesReInit(PT_HANDLE *hp_sndDevices, int i_initType, int *
 
 			if (resultFlag != SND_DEVICES_DEVICE_OPERATION_COMPLETED)
 			{
+				cast_handle->playbackSetupFailed = TRUE;
 				*ipDfxDeviceEnabledFlag = IS_FALSE;
 				*ip_status = resultFlag;
 				SND_DEVICES_SET_STATUS_AND_RETURN_OK(SND_DEVICES_RULES_NOT_POSSIBLE);
@@ -174,6 +182,40 @@ int PT_DECLSPEC sndDevicesReInit(PT_HANDLE *hp_sndDevices, int i_initType, int *
 			// publish it as the software gain applied to every output. It is no longer copied to the real
 			// playback device. If the carrier is an enabled output, its real device is set to 100% and unmuted
 			// after the reinit, by AudioPassthruPrivate::applyAdditionalOutputs().
+			// BetterFxSound: at the first reinit after a power off, the carrier being the device that was handed back then
+			// (its own setting is read afresh by sndDevicesInitialSetupPlaybackDevice()): if the user changed its volume or
+			// mute while FxSound was off (the volume keys and the tray act on it then), the master takes that setting.
+			// Otherwise the outputs came back at the master's old level, or silent with the master still muted, once the
+			// device was at 100% again. With no change while off the master is left as it was (muting FxSound and
+			// turning it off and on again stays muted).
+			if( cast_handle->handedBackPlaybackIsPending )
+			{
+				cast_handle->handedBackPlaybackIsPending = FALSE;
+				sndDevicesClearHandedBackRecord(hp_sndDevices);	// BetterFxSound: used, also at the next start of the app.
+
+				if( cast_handle->playbackSettingsAreSaved &&
+					(wcscmp(cast_handle->handedBackPlaybackDeviceID, cast_handle->savedPlaybackDeviceID) == 0) )
+				{
+					const BOOL muteChanged = ((cast_handle->savedPlaybackMute != FALSE) != (cast_handle->handedBackPlaybackMute != FALSE)) ? TRUE : FALSE;
+					const float levelDiff = cast_handle->savedPlaybackLevel - cast_handle->handedBackPlaybackLevel;
+					const BOOL levelChanged = (cast_handle->savedPlaybackLevelIsSaved && cast_handle->handedBackPlaybackLevelIsSaved &&
+						((levelDiff > 0.015f) || (levelDiff < -0.015f))) ? TRUE : FALSE;	// Below one volume key step (2%).
+
+					if( muteChanged || levelChanged )
+					{
+						// The level first, then mute: some drivers clear the mute flag as a side effect of a level change.
+						if( cast_handle->savedPlaybackLevelIsSaved )
+							cast_handle->pEndptVolCapture->SetMasterVolumeLevelScalar(cast_handle->savedPlaybackLevel, &(cast_handle->guidThisApplication));
+						cast_handle->pEndptVolCapture->SetMute(cast_handle->savedPlaybackMute, &(cast_handle->guidThisApplication));
+					}
+				}
+			}
+
+			// BetterFxSound: published below only if the volume callback published nothing since this point (see
+			// masterVolumePublishIfUnchanged()): a change notified meanwhile is newer than the two reads below, and
+			// was overwritten by them.
+			masterSequence = masterVolumeSequence();
+
 			hr = cast_handle->pEndptVolCapture->GetMute(&captureMuteState);
 			if (hr != S_OK)
 			{
@@ -190,7 +232,7 @@ int PT_DECLSPEC sndDevicesReInit(PT_HANDLE *hp_sndDevices, int i_initType, int *
 				SND_DEVICES_SET_STATUS_AND_RETURN_OK(SND_DEVICES_GET_MASTER_VOLUME_FAILED);
 			}
 
-			masterVolumePublish(captureVolScalar, captureMuteState != FALSE);
+			masterVolumePublishIfUnchanged(captureVolScalar, captureMuteState != FALSE, masterSequence);
 
 			// Setup capture and playback buffers
 			cast_handle->bufferSizeMilliSecs = SND_DEVICES_CAPTURE_BUFFER_DEFAULT_SIZE_MILLI_SECS;
@@ -237,7 +279,17 @@ int PT_DECLSPEC sndDevicesReInit(PT_HANDLE *hp_sndDevices, int i_initType, int *
 				captureBufferChannelsForAllocation = cast_handle->wfxCapture.nChannels;
 
 			captureAllocSize = (int)(cast_handle->wfxCapture.nSamplesPerSec  * captureBufferChannelsForAllocation  * (double)cast_handle->bufferSizeMilliSecs * 1.001 / 500.0);
-			playbackAllocSize = (int)(cast_handle->wfxPlayback.nSamplesPerSec * cast_handle->wfxPlayback.nChannels * (double)cast_handle->bufferSizeMilliSecs * 1.001 / 500.0);
+			// BetterFxSound: the processing buffer holds captured frames (capture rate) in the processing format, which
+			// may have more channels (a mono carrier is processed in stereo) and a higher rate than the carrier's.
+			{
+				DWORD allocRate = cast_handle->wfxPlayback.nSamplesPerSec;
+				WORD allocChannels = cast_handle->wfxPlayback.nChannels;
+				if (cast_handle->wfxCapture.nSamplesPerSec > allocRate)
+					allocRate = cast_handle->wfxCapture.nSamplesPerSec;
+				if (cast_handle->wfxDfxProcessing.nChannels > allocChannels)
+					allocChannels = cast_handle->wfxDfxProcessing.nChannels;
+				playbackAllocSize = (int)(allocRate * allocChannels * (double)cast_handle->bufferSizeMilliSecs * 1.001 / 500.0);
+			}
 
 			if (cast_handle->fCaptureBuf != NULL)
 			{
@@ -289,6 +341,7 @@ int PT_DECLSPEC sndDevicesReInit(PT_HANDLE *hp_sndDevices, int i_initType, int *
 
 			if (resultFlag != SND_DEVICES_DEVICE_OPERATION_COMPLETED)
 			{
+				cast_handle->playbackSetupFailed = TRUE;
 				*ipDfxDeviceEnabledFlag = IS_FALSE;
 				*ip_status = resultFlag;
 				SND_DEVICES_SET_STATUS_AND_RETURN_OK(SND_DEVICES_SET_MUTE_FAILED);
@@ -304,6 +357,62 @@ int PT_DECLSPEC sndDevicesReInit(PT_HANDLE *hp_sndDevices, int i_initType, int *
 	return(OKAY);
 }
 
+// BetterFxSound: whether a difference between the device list and the system for this endpoint must stop the
+// processing. Same rule as the device notification callbacks (sndDevicesCallbackChangeStopsProcessing()): the virtual
+// device, the carrier, or any endpoint becoming active while there is no carrier.
+static BOOL sndCheckDeviceChangeStopsProcessing(struct sndDevicesHdlType* cast_handle, const wchar_t* wcp_ID,
+	const wchar_t* wcp_carrier_ID, BOOL b_becomes_active)
+{
+	if ((cast_handle->dfxDeviceID[0] != L'\0') && (wcscmp(wcp_ID, cast_handle->dfxDeviceID) == 0))
+		return(TRUE);
+
+	if (wcp_carrier_ID[0] == L'\0')
+		return(b_becomes_active);
+
+	return(wcscmp(wcp_ID, wcp_carrier_ID) == 0);
+}
+
+/*
+* BetterFxSound: TRUE when the carrier's mix format, read now, has another channel count or rate than the one the
+* carrier was opened with (wfxPlayback). FALSE when it is the same or cannot be read (an invalidated stream ends the
+* processing thread by itself). Timer thread.
+*/
+static BOOL sndCheckCarrierFormatChanged(struct sndDevicesHdlType* cast_handle, IMMDeviceEnumerator* pEnumerator, const wchar_t* wcp_carrier_ID)
+{
+	IMMDevice* pDevice = NULL;
+	IAudioClient* pClient = NULL;
+	WAVEFORMATEX* pwfx = NULL;
+	BOOL changed = FALSE;
+
+	if ((pEnumerator == NULL) || (wcp_carrier_ID[0] == 0) || (cast_handle->wfxPlayback.nChannels == 0))
+		return(FALSE);
+
+	if (SUCCEEDED(pEnumerator->GetDevice(wcp_carrier_ID, &pDevice)) && (pDevice != NULL))
+	{
+		if (SUCCEEDED(pDevice->Activate(cast_handle->IID_IAudioClient, CLSCTX_ALL, NULL, (void**)&pClient)) && (pClient != NULL))
+		{
+			if (SUCCEEDED(pClient->GetMixFormat(&pwfx)) && (pwfx != NULL))
+			{
+				if ((pwfx->nChannels != cast_handle->wfxPlayback.nChannels) || (pwfx->nSamplesPerSec != cast_handle->wfxPlayback.nSamplesPerSec))
+					changed = TRUE;
+				CoTaskMemFree(pwfx);
+			}
+			pClient->Release();
+		}
+		pDevice->Release();
+	}
+
+	return(changed);
+}
+
+/*
+* BetterFxSound: reports any difference between the device list read at the last enumeration and the system (count, IDs,
+* states), so the caller reads the list again. The processing is only stopped when a difference concerns it (see
+* sndCheckDeviceChangeStopsProcessing()), as the device notification callbacks do. Stopping it for any difference
+* interrupted every output, at a moment unrelated to the change (opening the tray menu or the outputs list), for
+* changes the callbacks had deliberately let through. Other differences mark the list stale, so the timer refreshes the
+* outputs while processing.
+*/
 int PT_DECLSPEC sndCheckDeviceChanges(PT_HANDLE* hp_sndDevices, BOOL* bp_deviceChanged)
 {
 	struct sndDevicesHdlType* cast_handle;
@@ -313,7 +422,14 @@ int PT_DECLSPEC sndCheckDeviceChanges(PT_HANDLE* hp_sndDevices, BOOL* bp_deviceC
 	UINT deviceCount = 0;
 	UINT i;
 	int j;
+	int listed_count;
+	int carrier_num;
 	BOOL deviceFound;
+	BOOL stop_processing;
+	BOOL read_all;
+	BOOL list_differs;
+	BOOL listed_seen[SND_DEVICES_MAX_NUM_DEVICES];
+	wchar_t carrier_ID[PT_MAX_GENERIC_STRLEN];
 	LPWSTR pID = NULL;
 
     *bp_deviceChanged = FALSE;
@@ -321,6 +437,23 @@ int PT_DECLSPEC sndCheckDeviceChanges(PT_HANDLE* hp_sndDevices, BOOL* bp_deviceC
 	cast_handle = (struct sndDevicesHdlType*)hp_sndDevices;
 	if (cast_handle == NULL)
 		return(NOT_OKAY);
+
+	listed_count = cast_handle->totalNumDevices;
+	if (listed_count < 0)
+		listed_count = 0;
+	if (listed_count > SND_DEVICES_MAX_NUM_DEVICES)
+		listed_count = SND_DEVICES_MAX_NUM_DEVICES;
+	for (j = 0; j < SND_DEVICES_MAX_NUM_DEVICES; j++)
+		listed_seen[j] = FALSE;
+
+	carrier_ID[0] = L'\0';
+	carrier_num = cast_handle->playbackDeviceNum;
+	if ((carrier_num >= 0) && (carrier_num < listed_count))
+		wcscpy_s(carrier_ID, PT_MAX_GENERIC_STRLEN, cast_handle->pwszID[carrier_num]);
+
+	stop_processing = FALSE;
+	read_all = TRUE;
+	list_differs = FALSE;
 
 	hr = CoCreateInstance(cast_handle->CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL, cast_handle->IID_IMMDeviceEnumerator, (void**)&pEnumerator);
 	if (FAILED(hr)) SND_DEVICES_SET_STATUS_AND_RETURN_OK(SND_DEVICES_INSTANCE_CREATE_FAILED)
@@ -333,63 +466,160 @@ int PT_DECLSPEC sndCheckDeviceChanges(PT_HANDLE* hp_sndDevices, BOOL* bp_deviceC
 	hr = pCollectionAllDevices->GetCount(&deviceCount);
 	if (FAILED(hr)) SND_DEVICES_SET_STATUS_AND_RETURN_OK(SND_DEVICES_GETCOUNT_FAILED)
 
-	// If count is different, trigger stop
-	if (deviceCount != (UINT)cast_handle->totalNumDevices)
+	// BetterFxSound: sndDevices_GetAll() lists only the first SND_DEVICES_MAX_NUM_DEVICES endpoints, so only those are
+	// compared. With more, the count always differed and the endpoints past the limit were never found in the list: the
+	// list was read again on every tick, and stopped the processing on every check when one of them was the virtual device.
+	if (deviceCount > SND_DEVICES_MAX_NUM_DEVICES)
+		deviceCount = SND_DEVICES_MAX_NUM_DEVICES;
+
+	// A different count means a device was added or removed (which one is found below).
+	if (deviceCount != (UINT)listed_count)
 	{
         *bp_deviceChanged = TRUE;
-		cast_handle->stopAudioCaptureAndPlaybackLoop = 1;
-		return(OKAY);
+		list_differs = TRUE;
 	}
 
-	// If count is same, compare device IDs
+	// Compare device IDs and states
 	for (i = 0; i < deviceCount; i++)
 	{
 		IMMDevice* pDevice = NULL;
 		hr = pCollectionAllDevices->Item(i, &pDevice);
 		if (FAILED(hr) || pDevice == NULL)
+		{
+			read_all = FALSE;
 			continue;
+		}
 
 		pID = NULL;
 		hr = pDevice->GetId(&pID);
 		if (FAILED(hr) || pID == NULL)
 		{
 			if (pDevice) pDevice->Release();
+			read_all = FALSE;
 			continue;
 		}
 
+		DWORD currentState = 0;
+		hr = pDevice->GetState(&currentState);
+		if (FAILED(hr))
+			currentState = 0;
+
 		deviceFound = FALSE;
-		for (j = 0; j < cast_handle->totalNumDevices; j++)
+		for (j = 0; j < listed_count; j++)
 		{
 			if (wcscmp(pID, cast_handle->pwszID[j]) == 0)
 			{
 				deviceFound = TRUE;
+				listed_seen[j] = TRUE;
 
 				// Device ID matched - now check if its state has changed
-				DWORD currentState = 0;
-				hr = pDevice->GetState(&currentState);
 				if (SUCCEEDED(hr) && currentState != cast_handle->deviceState[j])
 				{
-					CoTaskMemFree(pID);
-					pDevice->Release();
 					*bp_deviceChanged = TRUE;
-					cast_handle->stopAudioCaptureAndPlaybackLoop = 1;
-					return(OKAY);
+					list_differs = TRUE;
+					if (((currentState == DEVICE_STATE_ACTIVE) || (cast_handle->deviceState[j] == DEVICE_STATE_ACTIVE)) &&
+						sndCheckDeviceChangeStopsProcessing(cast_handle, pID, carrier_ID, (currentState == DEVICE_STATE_ACTIVE)))
+						stop_processing = TRUE;
 				}
 
 				break;
 			}
 		}
 
-		CoTaskMemFree(pID);
-		pDevice->Release();
-
 		if (!deviceFound)
 		{
             *bp_deviceChanged = TRUE;
-			cast_handle->stopAudioCaptureAndPlaybackLoop = 1;
-			return OKAY;
+			list_differs = TRUE;
+			if (sndCheckDeviceChangeStopsProcessing(cast_handle, pID, carrier_ID, (currentState == DEVICE_STATE_ACTIVE)))
+				stop_processing = TRUE;
+		}
+
+		CoTaskMemFree(pID);
+		pDevice->Release();
+	}
+
+	// Listed devices that are gone from the system (removed, or no longer active nor unplugged). When some device could
+	// not be read, one of them may be the unread one, so it is only reported (the caller reads the list again), not
+	// taken for gone: nor does it mark the list stale, as a device that keeps failing to be read would otherwise have
+	// the timer refresh the outputs on every tick.
+	for (j = 0; j < listed_count; j++)
+	{
+		// BetterFxSound: an entry sndDevices_GetAll() could not read has an empty ID and names no device. If its device
+		// can be read now, it was not found in the list above, which reports the difference.
+		if (cast_handle->pwszID[j][0] == L'\0')
+			continue;
+
+		if (!listed_seen[j])
+		{
+			*bp_deviceChanged = TRUE;
+			if (read_all)
+			{
+				list_differs = TRUE;
+				if (sndCheckDeviceChangeStopsProcessing(cast_handle, cast_handle->pwszID[j], carrier_ID, FALSE))
+					stop_processing = TRUE;
+			}
 		}
 	}
 
+	// BetterFxSound: a playback endpoint's format changed since the last enumeration (see deviceFormatChanged): its
+	// channel count may differ from the listed one, so the list is read again. That enumeration clears the flag.
+	// The processing is stopped only when the carrier's format now differs (channel count or rate) from the one it was
+	// opened with: the notification comes in bursts, or unchanged, for which it used to stop the processing every time.
+	if (InterlockedCompareExchange(&(cast_handle->deviceFormatChanged), 0, 0) != 0)
+	{
+		*bp_deviceChanged = TRUE;
+		list_differs = TRUE;
+		if (sndCheckCarrierFormatChanged(cast_handle, pEnumerator, carrier_ID))
+			stop_processing = TRUE;
+	}
+
+	// BetterFxSound: an active device whose channel count the last enumeration could not read is read again (the list
+	// differs from what the system would give now), a few times; see sndDevicesGetChannelProbeIsDue().
+	if (!list_differs)
+	{
+		BOOL probe_is_due = FALSE;
+		if ((sndDevicesGetChannelProbeIsDue(hp_sndDevices, &probe_is_due) == OKAY) && probe_is_due)
+		{
+			*bp_deviceChanged = TRUE;
+			list_differs = TRUE;
+		}
+	}
+
+	if (stop_processing)
+		InterlockedExchange(&(cast_handle->stopAudioCaptureAndPlaybackLoop), 1);
+	else if (list_differs)
+		InterlockedExchange(&(cast_handle->deviceListIsStale), 1);
+
+	return(OKAY);
+}
+
+/*
+* FUNCTION: sndDevicesGetChannelProbeIsDue()
+* DESCRIPTION: BetterFxSound. TRUE when the last enumeration, at least SND_DEVICES_CHANNEL_PROBE_INTERVAL_MS ago, found
+* an active device whose channel count it could not read (and had not read before), and that fewer than
+* SND_DEVICES_MAX_CHANNEL_PROBE_RETRIES due probes have tried to read (counted per device, channelCacheProbeRetries).
+* Its count is then read again: such a device (being reconfigured as it arrives) is left out of the outputs while its
+* count is unknown, and no notification follows once its format can be read. A device that keeps failing is no longer
+* retried until it stops being active (or its count is read); another device still gets its own retries. A TRUE result
+* marks the probe pending, so the next enumeration (the one the caller makes the timer start) counts as a retry.
+*/
+int PT_DECLSPEC sndDevicesGetChannelProbeIsDue(PT_HANDLE* hp_sndDevices, BOOL* bp_isDue)
+{
+	struct sndDevicesHdlType* cast_handle;
+
+	*bp_isDue = FALSE;
+
+	cast_handle = (struct sndDevicesHdlType*)hp_sndDevices;
+	if (cast_handle == NULL)
+		return(NOT_OKAY);
+
+	if (!cast_handle->activeDeviceIsUnprobed)
+		return(OKAY);
+
+	if ((GetTickCount() - cast_handle->lastEnumerationTick) < (DWORD)SND_DEVICES_CHANNEL_PROBE_INTERVAL_MS)
+		return(OKAY);
+
+	InterlockedExchange(&(cast_handle->channelProbeIsPending), 1);
+	*bp_isDue = TRUE;
 	return(OKAY);
 }

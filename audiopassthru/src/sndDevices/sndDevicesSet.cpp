@@ -73,7 +73,8 @@ int PT_DECLSPEC sndDevicesRequestTargetedPlaybackDevice(PT_HANDLE *hp_sndDevices
 
 	*ip_resultFlag = SND_DEVICES_DEVICE_OPERATION_COMPLETED;
 
-	if( sndDevices_UtilsGetIndexFromID(hp_sndDevices, wcp_ID, &device_index_num) != OKAY )
+	// BetterFxSound: only an active device; an unplugged one cannot be opened, the reinit would fail.
+	if( sndDevices_UtilsGetActiveIndexFromID(hp_sndDevices, wcp_ID, &device_index_num) != OKAY )
 		return(NOT_OKAY);
 
 	if( device_index_num == SND_DEVICES_DEVICE_NOT_PRESENT )
@@ -85,8 +86,205 @@ int PT_DECLSPEC sndDevicesRequestTargetedPlaybackDevice(PT_HANDLE *hp_sndDevices
 	if( sndDevicesWriteToRegistry(hp_sndDevices, REG_CURRENT_USER, SND_DEVICES_REGISTRY_MOST_RECENT_PLAYBACK_WIDE, cast_handle->pwszID[device_index_num]) != OKAY )
 		return(NOT_OKAY);
 
+	// BetterFxSound: the device rules take this request before any other rule (a device added meanwhile included).
+	wcscpy_s(cast_handle->requestedPlaybackID, PT_MAX_GENERIC_STRLEN, cast_handle->pwszID[device_index_num]);
+
 	cast_handle->playbackDeviceIsUnavailable = FALSE;
-	cast_handle->stopAudioCaptureAndPlaybackLoop = 1;
+	InterlockedExchange(&(cast_handle->stopAudioCaptureAndPlaybackLoop), 1);
+
+	return(OKAY);
+}
+
+/*
+ * FUNCTION: sndDevicesIsDrivenOutput()
+ * DESCRIPTION: BetterFxSound. TRUE if the device is one of the enabled outputs (sndDevicesHdlType::drivenOutputIDs), the
+ * devices the engine holds at 100% and unmuted while FxSound processes.
+ */
+static BOOL sndDevicesIsDrivenOutput(struct sndDevicesHdlType *cast_handle, const wchar_t *wcp_ID)
+{
+	std::lock_guard<std::mutex> lock(cast_handle->drivenOutputsMutex);
+
+	for( size_t i = 0; i < cast_handle->drivenOutputIDs.size(); i++ )
+	{
+		if( cast_handle->drivenOutputIDs[i] == wcp_ID )
+			return(TRUE);
+	}
+
+	return(FALSE);
+}
+
+/*
+ * FUNCTION: sndDevicesSetCommunicationsDefault()
+ * DESCRIPTION: BetterFxSound. The default device for communications (calls, voice chat) follows the default device the
+ * engine sets. While FxSound processes, every enabled output's real device is held at 100% and unmuted, and the Windows
+ * master volume is applied by the app to the audio it captures from the virtual device. The communications default
+ * stayed a real device (usually the carrier itself), so a call played straight to it at full device level, ignoring the
+ * master volume and mute. When the virtual device is made the default and the communications default is one of the
+ * enabled outputs (sndDevicesIsDrivenOutput()), the virtual device is made the communications default too, and
+ * the user's communications default is kept (in the registry, so a crash does not lose it); when a real device is made
+ * the default again (power off, exit), the communications default goes back to it, or to that real device if it is not
+ * active, unless the user has picked another one meanwhile. A communications default that is not an enabled output (a
+ * headset kept for calls, say) is left alone: the engine does not hold it at 100%, and moving the calls to the virtual
+ * device would play them on the FxSound outputs instead. One that was moved for an output that is no longer enabled goes
+ * back to it. Uses COM: never on the processing thread.
+ */
+static void sndDevicesSetCommunicationsDefault(PT_HANDLE *hp_sndDevices, struct sndDevicesHdlType *cast_handle, IPolicyConfigVista *pPolicyConfig, wchar_t *wcp_newDefaultID)
+{
+	IMMDeviceEnumeratorPtr pEnumerator = NULL;
+	IMMDevicePtr pCommunicationsDevice = NULL;
+	LPWSTR pID = NULL;
+	wchar_t communicationsID[PT_MAX_GENERIC_STRLEN];
+	wchar_t priorCommunicationsID[PT_MAX_GENERIC_STRLEN];
+	wchar_t emptyID[1];
+	BOOL toVirtual;
+	BOOL communicationsIsVirtual;
+	HRESULT hr;
+
+	communicationsID[0] = L'\0';
+	emptyID[0] = L'\0';
+
+	if( (cast_handle->dfxDeviceID[0] == L'\0') || (wcp_newDefaultID == NULL) )
+		return;
+
+	hr = CoCreateInstance(cast_handle->CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL, cast_handle->IID_IMMDeviceEnumerator, (void**)&pEnumerator);
+	if( FAILED(hr) || (pEnumerator == NULL) )
+		return;
+
+	hr = pEnumerator->GetDefaultAudioEndpoint(eRender, eCommunications, &pCommunicationsDevice);
+	if( FAILED(hr) || (pCommunicationsDevice == NULL) )
+		return;
+
+	hr = pCommunicationsDevice->GetId(&pID);
+	if( FAILED(hr) || (pID == NULL) )
+		return;
+	wcscpy_s(communicationsID, PT_MAX_GENERIC_STRLEN, pID);
+	CoTaskMemFree(pID);
+
+	toVirtual = (wcscmp(wcp_newDefaultID, cast_handle->dfxDeviceID) == 0) ? TRUE : FALSE;
+	communicationsIsVirtual = (wcscmp(communicationsID, cast_handle->dfxDeviceID) == 0) ? TRUE : FALSE;
+
+	if( toVirtual )
+	{
+		// Already the virtual device (after a crash, or a reinit while FxSound processes): the user's own is kept as it is,
+		// unless it was moved for a device that is no longer an enabled output: then it goes back to that device.
+		if( communicationsIsVirtual )
+		{
+			int priorIndex = SND_DEVICES_DEVICE_NOT_PRESENT;
+
+			if( (sndDeviceReadFromRegistry(hp_sndDevices, REG_CURRENT_USER, SND_DEVICES_REGISTRY_PRIOR_COMMUNICATIONS_WIDE, priorCommunicationsID) == OKAY) &&
+				(priorCommunicationsID[0] != L'\0') && !sndDevicesIsDrivenOutput(cast_handle, priorCommunicationsID) &&
+				(sndDevices_UtilsGetActiveIndexFromID(hp_sndDevices, priorCommunicationsID, &priorIndex) == OKAY) &&
+				(priorIndex >= 0) && (priorIndex < SND_DEVICES_MAX_NUM_DEVICES) )
+			{
+				hr = pPolicyConfig->SetDefaultEndpoint(priorCommunicationsID, eCommunications);
+				if( SUCCEEDED(hr) )
+					sndDevicesWriteToRegistry(hp_sndDevices, REG_CURRENT_USER, SND_DEVICES_REGISTRY_PRIOR_COMMUNICATIONS_WIDE, emptyID);
+			}
+			return;
+		}
+
+		// BetterFxSound: only a device the engine holds at 100% (see the description).
+		if( !sndDevicesIsDrivenOutput(cast_handle, communicationsID) )
+			return;
+
+		if( sndDevicesWriteToRegistry(hp_sndDevices, REG_CURRENT_USER, SND_DEVICES_REGISTRY_PRIOR_COMMUNICATIONS_WIDE, communicationsID) != OKAY )
+			return;
+
+		pPolicyConfig->SetDefaultEndpoint(cast_handle->dfxDeviceID, eCommunications);
+	}
+	else
+	{
+		if( sndDeviceReadFromRegistry(hp_sndDevices, REG_CURRENT_USER, SND_DEVICES_REGISTRY_PRIOR_COMMUNICATIONS_WIDE, priorCommunicationsID) != OKAY )
+			priorCommunicationsID[0] = L'\0';
+
+		if( communicationsIsVirtual )
+		{
+			int priorIndex = SND_DEVICES_DEVICE_NOT_PRESENT;
+			const wchar_t *target = wcp_newDefaultID;
+
+			if( (priorCommunicationsID[0] != L'\0') &&
+				(sndDevices_UtilsGetActiveIndexFromID(hp_sndDevices, priorCommunicationsID, &priorIndex) == OKAY) &&
+				(priorIndex >= 0) && (priorIndex < SND_DEVICES_MAX_NUM_DEVICES) )
+				target = priorCommunicationsID;
+
+			// Not left on the virtual device: with FxSound off, nothing would play what is sent to it.
+			hr = pPolicyConfig->SetDefaultEndpoint(target, eCommunications);
+			if( FAILED(hr) )
+				return;	// Kept, the next hand-back tries again.
+		}
+
+		if( priorCommunicationsID[0] != L'\0' )
+			sndDevicesWriteToRegistry(hp_sndDevices, REG_CURRENT_USER, SND_DEVICES_REGISTRY_PRIOR_COMMUNICATIONS_WIDE, emptyID);
+	}
+}
+
+/*
+ * FUNCTION: sndDevicesSetDrivenOutputs()
+ * DESCRIPTION: BetterFxSound. Records the devices of the enabled outputs, carrier included (AudioPassthru::setOutputs()),
+ * see sndDevicesHdlType::drivenOutputIDs. While FxSound processes with the virtual device as the default, the
+ * communications default follows the new set at once (sndDevicesSetCommunicationsDefault()): an output enabled on it
+ * takes the calls through FxSound, an output disabled gives them back. Uses COM: UI/timer thread only.
+ */
+int PT_DECLSPEC sndDevicesSetDrivenOutputs(PT_HANDLE *hp_sndDevices, const std::vector<std::wstring> &ids)
+{
+	struct sndDevicesHdlType *cast_handle;
+	IPolicyConfigVista *pPolicyConfig = NULL;
+	int selectionMode = SND_DEVICES_AUTO_SELECT_DEFAULT_DEVICE_ON;
+	BOOL virtualIsDefault = FALSE;
+	HRESULT hr;
+
+	cast_handle = (struct sndDevicesHdlType *)hp_sndDevices;
+
+	if (cast_handle == NULL)
+		return(NOT_OKAY);
+
+	{
+		std::lock_guard<std::mutex> lock(cast_handle->drivenOutputsMutex);
+		// Unchanged set (a volume, delay or channel mode change): nothing to re-evaluate, so a slider move costs no COM
+		// round-trips. Every reinit re-evaluates the communications default anyway (sndDevicesSetDeviceType(DEFAULT)).
+		if( cast_handle->drivenOutputIDs == ids )
+			return(OKAY);
+		cast_handle->drivenOutputIDs = ids;
+	}
+
+	// Only while processing (the guard is armed then), and only when the device rules make the virtual device the default.
+	if( (cast_handle->virtualDefaultGuardHint.load() == FALSE) || (cast_handle->dfxDeviceID[0] == L'\0') )
+		return(OKAY);
+	if( (sndDevicesGetDefaultDeviceSelectionMode(hp_sndDevices, &selectionMode) != OKAY) ||
+		(selectionMode != SND_DEVICES_AUTO_SELECT_DEFAULT_DEVICE_ON) )
+		return(OKAY);
+	if( (sndDevicesGetVirtualDeviceIsDefault(hp_sndDevices, &virtualIsDefault) != OKAY) || !virtualIsDefault )
+		return(OKAY);
+
+	hr = CoCreateInstance(__uuidof(CPolicyConfigVistaClient), NULL, CLSCTX_ALL, __uuidof(IPolicyConfigVista), (LPVOID *)&pPolicyConfig);
+	if( SUCCEEDED(hr) && (pPolicyConfig != NULL) )
+	{
+		sndDevicesSetCommunicationsDefault(hp_sndDevices, cast_handle, pPolicyConfig, cast_handle->dfxDeviceID);
+		pPolicyConfig->Release();
+	}
+
+	return(OKAY);
+}
+
+/*
+ * FUNCTION: sndDevicesSetVirtualDefaultGuard()
+ * DESCRIPTION: BetterFxSound. Arms (while the processing thread runs) or disarms the immediate return of the default
+ * device to the virtual device when a real device is made the default, see sndDevicesHdlType::virtualDefaultMutex.
+ * sndDevicesRestoreDefaultDevice() disarms it itself. UI/timer thread.
+ */
+int PT_DECLSPEC sndDevicesSetVirtualDefaultGuard(PT_HANDLE *hp_sndDevices, BOOL b_armed)
+{
+	struct sndDevicesHdlType *cast_handle;
+
+	cast_handle = (struct sndDevicesHdlType *)hp_sndDevices;
+
+	if (cast_handle == NULL)
+		return(NOT_OKAY);
+
+	std::lock_guard<std::mutex> lock(cast_handle->virtualDefaultMutex);
+	cast_handle->virtualDefaultGuardArmed = b_armed;
+	cast_handle->virtualDefaultGuardHint = b_armed;
+	cast_handle->virtualDefaultGuardEpoch++;	// Work items queued before this no longer act (see virtualDefaultGuardEpoch).
 
 	return(OKAY);
 }
@@ -151,7 +349,20 @@ int PT_DECLSPEC sndDevicesSetDeviceType(PT_HANDLE *hp_sndDevices, int i_deviceTy
 		if (SUCCEEDED(hr))
 		{
 			hr = pPolicyConfig->SetDefaultEndpoint(cast_handle->pwszID[device_index_num], reserved);
+
+			// BetterFxSound: the communications default follows (see sndDevicesSetCommunicationsDefault()).
+			if (SUCCEEDED(hr))
+				sndDevicesSetCommunicationsDefault(hp_sndDevices, cast_handle, pPolicyConfig, cast_handle->pwszID[device_index_num]);
+
 			pPolicyConfig->Release();
+
+			// BetterFxSound: Windows did not change the default (for example during a resume), so the cached default
+			// stays what it is. Recording it anyway made the notification of the real default look like our own change.
+			if (FAILED(hr))
+			{
+				*ip_resultFlag = SND_DEVICES_PROPERTY_SET_FAILED;
+				SND_DEVICES_SET_STATUS_AND_RETURN_OK(SND_DEVICES_PROPERTY_SET_FAILED);
+			}
 
 			// Store the current default device number and set the new one.
 			cast_handle->priorDefaultDeviceNum = cast_handle->defaultDeviceNum;

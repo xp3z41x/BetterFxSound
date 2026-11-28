@@ -108,6 +108,16 @@ bool AudioPassthru::checkDeviceChanges()
     return data_->checkDeviceChanges();
 }
 
+bool AudioPassthru::isCarrierSwitchPending()
+{
+    return data_->isCarrierSwitchPending();
+}
+
+std::wstring AudioPassthru::getFailedCarrierId()
+{
+    return data_->getFailedCarrierId();
+}
+
 void AudioPassthru::restoreDefaultPlaybackDevice()
 {
     data_->restoreDefaultPlaybackDevice();
@@ -116,6 +126,11 @@ void AudioPassthru::restoreDefaultPlaybackDevice()
 void AudioPassthru::setOutputs(const std::vector<OutputConfig>& outputs)
 {
 	data_->setOutputs(outputs);
+}
+
+std::vector<AdditionalOutputStatus> AudioPassthru::getAdditionalOutputStatus()
+{
+	return data_->getAdditionalOutputStatus();
 }
 
 bool AudioPassthru::startDelayCalibration()

@@ -129,3 +129,91 @@ int sndDeviceReadFromRegistry(PT_HANDLE *hp_sndDevices, int i_hkeySection, wchar
 
 	return(OKAY);
 }
+
+/*
+ * FUNCTION: sndDevicesStoreHandedBackRecord()
+ * DESCRIPTION:
+ * BetterFxSound: keeps the handed-back record (handedBackPlaybackDeviceID and the rest, set by
+ * sndDevicesRestoreDefaultDevice()) in the registry, so a hand-back at exit still counts at the next start of the app:
+ * a change the user makes to the device's volume or mute while the app is not running is then taken by the master at
+ * the first reinit, as it is after a power off. One value, "<mute> <level is saved> <level x 100000> <device ID>", so it
+ * is never read half written. The level is stored as an integer, as the C runtime's number format follows the locale.
+ */
+void sndDevicesStoreHandedBackRecord(PT_HANDLE *hp_sndDevices)
+{
+	struct sndDevicesHdlType *cast_handle;
+	wchar_t record[PT_MAX_GENERIC_STRLEN + 64];
+	float level;
+
+	cast_handle = (struct sndDevicesHdlType *)hp_sndDevices;
+
+	if (cast_handle == NULL)
+		return;
+
+	level = cast_handle->handedBackPlaybackLevel;
+	if (!(level >= 0.0f))
+		level = 0.0f;
+	if (level > 1.0f)
+		level = 1.0f;
+
+	if (swprintf_s(record, PT_MAX_GENERIC_STRLEN + 64, L"%d %d %d %s",
+		(cast_handle->handedBackPlaybackMute != FALSE) ? 1 : 0,
+		(cast_handle->handedBackPlaybackLevelIsSaved != FALSE) ? 1 : 0,
+		(int)(level * 100000.0f + 0.5f),
+		cast_handle->handedBackPlaybackDeviceID) < 0)
+		return;
+
+	sndDevicesWriteToRegistry(hp_sndDevices, REG_CURRENT_USER, SND_DEVICES_REGISTRY_HANDED_BACK_PLAYBACK_WIDE, record);
+}
+
+/*
+ * FUNCTION: sndDevicesLoadHandedBackRecord()
+ * DESCRIPTION:
+ * BetterFxSound: makes the record kept by sndDevicesStoreHandedBackRecord() pending again, at the start of the app
+ * (sndDevicesInit(), before its first reinit). A missing or malformed record leaves nothing pending.
+ */
+void sndDevicesLoadHandedBackRecord(PT_HANDLE *hp_sndDevices)
+{
+	struct sndDevicesHdlType *cast_handle;
+	wchar_t record[PT_MAX_PATH_STRLEN];
+	int mute = 0;
+	int levelIsSaved = 0;
+	int level = 0;
+	int idOffset = 0;
+
+	cast_handle = (struct sndDevicesHdlType *)hp_sndDevices;
+
+	if (cast_handle == NULL)
+		return;
+
+	if (sndDeviceReadFromRegistry(hp_sndDevices, REG_CURRENT_USER, SND_DEVICES_REGISTRY_HANDED_BACK_PLAYBACK_WIDE, record) != OKAY)
+		return;
+
+	if (swscanf_s(record, L"%d %d %d %n", &mute, &levelIsSaved, &level, &idOffset) != 3)
+		return;
+
+	if ((idOffset <= 0) || (record[idOffset] == L'\0') || (wcslen(record + idOffset) >= PT_MAX_GENERIC_STRLEN) ||
+		(level < 0) || (level > 100000))
+		return;
+
+	wcscpy_s(cast_handle->handedBackPlaybackDeviceID, PT_MAX_GENERIC_STRLEN, record + idOffset);
+	cast_handle->handedBackPlaybackMute = (mute != 0) ? TRUE : FALSE;
+	cast_handle->handedBackPlaybackLevel = (float)level / 100000.0f;
+	cast_handle->handedBackPlaybackLevelIsSaved = (levelIsSaved != 0) ? TRUE : FALSE;
+	cast_handle->handedBackPlaybackIsPending = TRUE;
+}
+
+/*
+ * FUNCTION: sndDevicesClearHandedBackRecord()
+ * DESCRIPTION:
+ * BetterFxSound: drops the record kept by sndDevicesStoreHandedBackRecord(), once the reinit it was pending for used it.
+ */
+void sndDevicesClearHandedBackRecord(PT_HANDLE *hp_sndDevices)
+{
+	wchar_t emptyRecord[1] = { L'\0' };
+
+	if (hp_sndDevices == NULL)
+		return;
+
+	sndDevicesWriteToRegistry(hp_sndDevices, REG_CURRENT_USER, SND_DEVICES_REGISTRY_HANDED_BACK_PLAYBACK_WIDE, emptyRecord);
+}

@@ -26,6 +26,9 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include <Functiondiscoverykeys_devpkey.h>
 #include <endpointvolume.h>
 #include <atomic>
+#include <mutex>
+#include <string>
+#include <vector>
 #include "slout.h"
 
 #define PT_MAX_GENERIC_STRLEN          512
@@ -47,6 +50,13 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 /* Limit settings */
 #define SND_DEVICES_MAX_NUM_DEVICES 64
+
+/* BetterFxSound: the most channels the carrier's resampler handles (sndDevicesDoPlayback()), a carrier with more is silent */
+#define SND_DEVICES_CARRIER_MAX_CHANNELS 32
+
+/* BetterFxSound: reading again an active device's channel count that could not be read (sndDevicesGetChannelProbeIsDue()) */
+#define SND_DEVICES_MAX_CHANNEL_PROBE_RETRIES		10
+#define SND_DEVICES_CHANNEL_PROBE_INTERVAL_MS		500
 
 /* Device "friendly name" string, used to identify DFX device. */
 #define SND_DEVICES_DFX_DEVICE_STRING L"FxSound Audio Enhancer"
@@ -165,6 +175,10 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #define SND_DEVICES_REGISTRY_USER_SELECTED_PLAYBACK_WIDE		L"user_selected_playback"
 #define SND_DEVICES_REGISTRY_DEFAULT_DEVICE_SELECTION_MODE	L"default_device_mode"
 #define SND_DEVICES_REGISTRY_USER_BUFFER_SIZE					L"user_buffer_size"
+// BetterFxSound: the communications default the user had before the virtual device was made the default for that role too
+#define SND_DEVICES_REGISTRY_PRIOR_COMMUNICATIONS_WIDE		L"prior_communications_default"
+// BetterFxSound: the handed-back record (handedBackPlaybackDeviceID and the rest), kept across a restart of the app
+#define SND_DEVICES_REGISTRY_HANDED_BACK_PLAYBACK_WIDE		L"handed_back_playback"
 
 /* Registry related defines, local machine */
 #define SND_DEVICES_REGISTRY_DFX_GUID								L"dfx_guid"
@@ -403,10 +417,55 @@ struct sndDevicesHdlType {
 	float sigPower;
 	int bufferSizeMilliSecs;		// This is the average delay, actual internal buffers are twice this length.
 	//int playback_has_started;
-	int stopAudioCaptureAndPlaybackLoop;
+	// BetterFxSound: written from the device notification threads, the timer thread and the processing thread, so it
+	// is set with InterlockedExchange() and read as a volatile. Only sndDevicesReInit() clears it, before it enumerates
+	// the devices, so a request made at any later point (a device change, a carrier switch) makes the processing
+	// thread started after that reinit exit at once and run another reinit, instead of being lost.
+	volatile LONG stopAudioCaptureAndPlaybackLoop;
 	int dfxDeviceNum;	// The combo 44.1k and 48k hz. DFX device
 	//int dfx48DeviceNum;	// The 48k hz. DFX device
 	int defaultDeviceNum;
+	// BetterFxSound: the Windows default (eRender, eMultimedia) device as read by the last sndDevices_GetAll(). Unlike
+	// defaultDeviceNum, the device notification callbacks never write it, so the device rules can rely on it.
+	int enumeratedDefaultDeviceNum;
+	// BetterFxSound: the ID of the FxSound virtual device, kept across reinits (dfxDeviceNum is reset during one), so
+	// the device notification callbacks can recognize it at any time.
+	wchar_t dfxDeviceID[PT_MAX_GENERIC_STRLEN];
+	// BetterFxSound: odd while sndDevices_GetAll() rewrites the device list. The device notification callbacks read
+	// the list without a lock, and only trust what they read when this was even and unchanged around the read.
+	// sndDevices_GetAll() makes it odd only from an even value (compare-exchange), and so does a device notification
+	// callback for the moment it publishes defaultDeviceNum, so the two writers never overlap.
+	volatile LONG enumerationSequence;
+	// BetterFxSound: set when a playback endpoint other than the virtual device and the carrier changed (the device
+	// notification callbacks, sndCheckDeviceChanges()). Such a change no longer stops the processing; the timer reads
+	// the device list again and refreshes the outputs instead (AudioPassthruPrivate::processTimer()).
+	volatile LONG deviceListIsStale;
+	// BetterFxSound: set by the device notification callback when a playback endpoint's format changed
+	// (PKEY_AudioEngine_DeviceFormat), for example a Bluetooth headset going mono while its microphone is open and
+	// back to stereo after. Its state does not change, so the comparison with the system (sndCheckDeviceChanges())
+	// would find no difference: this makes it read the list (and the channel counts) again.
+	volatile LONG deviceFormatChanged;
+	// BetterFxSound: the channel count of each device as last read by sndDevices_GetAll() (0 when unknown), by ID. A
+	// device whose format cannot be read for a moment (being reconfigured) keeps the count it had, instead of 0, which
+	// made it look absent to the controller.
+	WCHAR channelCacheID[SND_DEVICES_MAX_NUM_DEVICES][PT_MAX_GENERIC_STRLEN];
+	int channelCacheNumChannel[SND_DEVICES_MAX_NUM_DEVICES];
+	// BetterFxSound: per device, how many enumerations started by a due probe could not read its channel count yet.
+	int channelCacheProbeRetries[SND_DEVICES_MAX_NUM_DEVICES];
+	int channelCacheCount;
+	// BetterFxSound: TRUE when the last enumeration found an active device whose channel count it never read, and that
+	// is still under SND_DEVICES_MAX_CHANNEL_PROBE_RETRIES. The list is then read again (sndDevicesGetChannelProbeIsDue()).
+	BOOL activeDeviceIsUnprobed;
+	// BetterFxSound: set by sndDevicesGetChannelProbeIsDue() when it reports a probe as due, consumed by the next
+	// enumeration, which alone counts as a retry (not the GUI's, a reinit loop pass or a notification's refresh).
+	volatile LONG channelProbeIsPending;
+	DWORD lastEnumerationTick;	// GetTickCount() at the end of the last sndDevices_GetAll()
+	// BetterFxSound: the carrier the controller asked for (sndDevicesRequestTargetedPlaybackDevice()). The next run of the
+	// device rules takes it first, and consumes it.
+	wchar_t requestedPlaybackID[PT_MAX_GENERIC_STRLEN];
+	// BetterFxSound: TRUE once the controller manages the outputs (AudioPassthruPrivate::setOutputs()). It elects the
+	// carrier itself, so the device rules no longer make a newly added device the carrier.
+	BOOL outputsAreManaged;
 	int playbackDeviceNum;
 	int captureDeviceNum;
 	int priorDefaultDeviceNum;
@@ -425,6 +484,29 @@ struct sndDevicesHdlType {
 	int playbackIsActive;		// Will be either SND_DEVICES_PLAYBACK_IS_STOPPED or SND_DEVICES_PLAYBACK_IS_ACTIVE.
 	int playbackStreamIsTemporarilyPaused;	// Used to turn off playback stream when no capture or playback is occuring.
 
+	// BetterFxSound: carrier pacing (sndDevicesDoCapture(), sndDevicesDoPlayback()). Processing thread only, reset by
+	// sndDevicesStartStopCapture() when a processing thread starts, carrierStallCount excepted.
+	DWORD processingStartTick;			// GetTickCount() when this processing thread started.
+	LONGLONG lastCapturePacketQpc;		// QueryPerformanceCounter() when the last loopback packet was read.
+	LONGLONG qpcFrequency;				// QueryPerformanceFrequency().
+	DWORD carrierLastConsumedTick;		// When the running carrier was last seen playing out of its queue.
+	DWORD carrierLastPollTick;			// When sndDevicesDoCapture() last read the carrier's queue.
+	UINT32 carrierLastPadding;			// The carrier's queue (playback frames) as last read, or right after the last write.
+	UINT32 carrierStallCapturedFrames;	// Frames captured since the running carrier last played out of its queue.
+	int carrierStallCount;				// Consecutive stalls of the carrier, each reinit waits longer; it gives up at the max.
+	int timerPeriodRaised;				// sndDevicesDoCapture() raised the timer resolution (sndDevicesReleaseTimerPeriod()).
+	double carrierErrorAvg;				// Averaged offset of the queue from its setpoint right after a write, seconds.
+	double carrierReadPos;				// Resampler: input position of the next output frame, from -2 (see carrierHistory).
+	float carrierHistory[3][SND_DEVICES_CARRIER_MAX_CHANNELS];	// Resampler: the last 3 frames of the previous block.
+	float carrierLowPassState[2][2][SND_DEVICES_CARRIER_MAX_CHANNELS];	// Resampler: anti-alias filter state (2 biquads).
+	// BetterFxSound: the carrier's delay line (AudioPassthruPrivate::applyMainDelay()) still holds this many frames of
+	// audio not played yet. While it does, a pause in the loopback (no packet for SND_DEVICES_TAIL_GAP_MS) makes
+	// sndDevicesDoCapture() hand over silence, as much as the pause lasted, so that audio plays out on time instead of
+	// staying in the line and being played before the next sound. Processing thread only.
+	UINT32 carrierDelayTailFrames;
+	LONGLONG carrierTailSilenceQpc;		// sndDevicesDoCapture(): QPC up to which the pause was handed over as silence.
+	BOOL capturedBlockIsSilenceFill;	// The block sndDevicesDoCapture() handed over is such silence, not captured audio.
+
 	// The mute setting that belongs to the real playback device FxSound is currently rendering to, ie
 	// the setting the device had before FxSound applied its own to it, plus any the user has since made
 	// on the device itself. It is put back on that device when FxSound stops driving it, so a device we
@@ -438,6 +520,45 @@ struct sndDevicesHdlType {
 	float savedPlaybackLevel;		// Its volume level, 0..1 as IAudioEndpointVolume reports it.
 	BOOL savedPlaybackLevelIsSaved;	// FALSE if the level could not be read; then only mute is put back.
 	BOOL playbackSettingsAreSaved;	// TRUE when the values above hold a valid setting.
+	// BetterFxSound: TRUE while the playback volume callback is registered on the device the values above belong to. The
+	// callback used to check that by the device's index in the list (pwszID[playbackDeviceNum]), which a reinit resets and
+	// an enumeration rewrites: a change the user made then was dropped, and an old level was put back later. Set by
+	// sndDevicesInitialSetupPlaybackDevice() before it registers the callback, cleared before the callback is unregistered.
+	std::atomic<BOOL> playbackCallbackIsOnSavedDevice;
+	// BetterFxSound: the own setting put back on the carrier's device at the last power off (sndDevicesRestoreDefaultDevice()),
+	// pending until the next reinit that sets the devices up. If that device is the carrier again and its own setting is
+	// no longer this one (the user changed its volume or mute while FxSound was off), the virtual device (the master) takes
+	// the new one, so FxSound comes back at the level the user was just listening at. UI/timer thread only.
+	// BetterFxSound: also kept in the registry (SND_DEVICES_REGISTRY_HANDED_BACK_PLAYBACK_WIDE), so the hand-back at exit
+	// still counts at the next start of the app (sndDevicesInit() loads it), until the reinit that uses it clears it.
+	wchar_t handedBackPlaybackDeviceID[PT_MAX_GENERIC_STRLEN];
+	BOOL handedBackPlaybackMute;
+	float handedBackPlaybackLevel;
+	BOOL handedBackPlaybackLevelIsSaved;
+	BOOL handedBackPlaybackIsPending;
+	// BetterFxSound: while the processing runs, a real device made the Windows default (in the Windows flyout, or by an app)
+	// played every app's sound straight to it, unprocessed and at the 100% the engine holds it at, until the next reinit
+	// made the virtual device the default again (up to half a second). The device notification now has a worker thread
+	// put the virtual device back at once (sndDevicesDeviceCallbacks.cpp), and records the device picked
+	// (pickedDefaultID), which the next run of the device rules takes as the default the user chose. All of these under
+	// virtualDefaultMutex, which also orders that worker against the hand-back at power off (sndDevicesRestoreDefaultDevice()):
+	// the worker never makes the virtual device the default again once the devices are handed back.
+	std::mutex virtualDefaultMutex;
+	BOOL virtualDefaultGuardArmed;		// TRUE while the processing thread runs (sndDevicesSetVirtualDefaultGuard()).
+	std::atomic<BOOL> virtualDefaultGuardHint;	// Its value, read without the lock by the notification callback.
+	wchar_t pickedDefaultID[PT_MAX_GENERIC_STRLEN];
+	LONG pickedDefaultSequence;			// Sequence of the notification pickedDefaultID came from.
+	volatile LONG defaultPickSequence;	// Counts the notifications that queued the worker.
+	// BetterFxSound: incremented under virtualDefaultMutex each time the guard is armed or disarmed. A work item queued
+	// while the guard was armed acts only if it is still the same arming: one that ran late, after the reinit that the
+	// same notification caused had already taken the device picked and armed the guard again, recorded a stale pick that
+	// the next, unrelated reinit then took for the Windows default the user had just chosen.
+	std::atomic<LONG> virtualDefaultGuardEpoch;
+	// BetterFxSound: the devices of the enabled outputs (carrier included), as passed to AudioPassthru::setOutputs(). While
+	// FxSound processes, the engine holds these devices at 100% and unmuted; the communications default is moved to the
+	// virtual device only when it is one of them (sndDevicesSetCommunicationsDefault()). Under drivenOutputsMutex.
+	std::mutex drivenOutputsMutex;
+	std::vector<std::wstring> drivenOutputIDs;
 	// BetterFxSound: the last level and mute this app set on the playback device, and when (GetTickCount()). Some
 	// drivers (Bluetooth with absolute volume) report such a change back a second time, without this app's event
 	// context; the playback volume callback must not take that for the user's own setting.
@@ -446,18 +567,60 @@ struct sndDevicesHdlType {
 	std::atomic<float> engineSetPlaybackLevel;
 	std::atomic<BOOL> engineSetPlaybackMute;
 	std::atomic<DWORD> engineSetPlaybackTick;
+	// BetterFxSound: the engine writes the level, then the mute, and a driver may report the level change on its own:
+	// the new level with the mute the device had before (engineSetPlaybackFromMute). A late report of the engine's
+	// previous change (engineSetPlaybackPrev*, when the engine changes the device again within a few seconds) is not
+	// the user's either. Written with sndDevicesNoteEngineSetPlayback(), before engineSetPlaybackTick.
+	std::atomic<BOOL> engineSetPlaybackFromMute;
+	std::atomic<float> engineSetPlaybackPrevLevel;
+	std::atomic<BOOL> engineSetPlaybackPrevMute;
+	std::atomic<DWORD> engineSetPlaybackPrevTick;
+	// BetterFxSound: when the engine last set the carrier's device to 100% and unmuted when it started using it, 0 when it
+	// does not hold the device now. A change of the device's own level a few seconds after that (a Bluetooth device with
+	// absolute volume sending its stored level once it is connected) is not taken for the user's: the callback asks for
+	// 100% again (playbackFullVolumeReassert, applied by AudioPassthruPrivate::processTimer()).
+	std::atomic<DWORD> engineTookOverPlaybackTick;
+	std::atomic<BOOL> playbackFullVolumeReassert;
+	// BetterFxSound: a take-over of the carrier's device is under way (from before the reinit that registers the volume
+	// callback, or from when applyAdditionalOutputs() decides on it, until it set 100% or gave up): the callback treats a
+	// change then as it does within engineTookOverPlaybackTick's window. Only set from then on, a level the device sent in
+	// between (a Bluetooth device's stored absolute volume) was taken for the user's (playbackLevelIsUsers), and the
+	// carrier was never set to 100%. A count: applyAdditionalOutputs() may run on another thread during a reinit.
+	std::atomic<LONG> playbackTakeOversPending;
+	// BetterFxSound: the user changed the carrier's own level or mute while the engine held it at 100%: the device keeps
+	// that setting (it is also the owed one) and a reinit does not set it to 100% again, until the engine hands the
+	// device back (sndDevices_RestoreSavedPlaybackDeviceSettings()). The same policy as the additional outputs.
+	std::atomic<BOOL> playbackLevelIsUsers;
 
 	int noBufferCount;			// This is a count of how many times no buffers were available in a DoRecording call.
 	int WindowsSilentBufferCount;				// This is a buffer specified by the Windows flag to be all zeros.
 	int MeasuredVirtualSilentBufferCount;	// This is buffer of measured all very low values, essentially silence.
 	int MeasuredTrueSilentBufferCount;		// This is buffer of measured all true zero values.
     BOOL playbackDeviceIsUnavailable;
+	// BetterFxSound: the last reinit failed on the carrier itself (its format could not be read, or its stream could not
+	// be set up or opened), not on the FxSound virtual device. Written by sndDevicesReInit(), read after it; UI/timer
+	// thread only.
+	BOOL playbackSetupFailed;
 
 	// Module common status flag, set by functions that can't complete their requestion operation
 	int function_status;
 
 	void (*deviceChangeCallback)();
 };
+
+// BetterFxSound: notes a level and mute the engine is about to set on the carrier's device, and the mute the device has
+// before it, so the playback volume callback does not take a driver's report of them for the user's own change. The
+// previous change is kept as well (see engineSetPlaybackPrev*).
+inline void sndDevicesNoteEngineSetPlayback(struct sndDevicesHdlType *cast_handle, float level, BOOL mute, BOOL from_mute)
+{
+	cast_handle->engineSetPlaybackPrevLevel = cast_handle->engineSetPlaybackLevel.load();
+	cast_handle->engineSetPlaybackPrevMute = cast_handle->engineSetPlaybackMute.load();
+	cast_handle->engineSetPlaybackPrevTick = cast_handle->engineSetPlaybackTick.load();
+	cast_handle->engineSetPlaybackLevel = level;
+	cast_handle->engineSetPlaybackMute = mute;
+	cast_handle->engineSetPlaybackFromMute = from_mute;
+	cast_handle->engineSetPlaybackTick = GetTickCount();
+}
 
 _COM_SMARTPTR_TYPEDEF(IMMDevice, __uuidof(IMMDevice));
 _COM_SMARTPTR_TYPEDEF(IMMDeviceEnumerator, __uuidof(IMMDeviceEnumerator));
@@ -492,6 +655,8 @@ int PT_DECLSPEC sndDevicesGetRecommendedBufferSizeMilliSecs(PT_HANDLE *, int *);
 int PT_DECLSPEC sndDevicesGetPlayBackStatus(PT_HANDLE *, int *);
 int PT_DECLSPEC sndDevicesGetNumMonoDevices(PT_HANDLE *, int *);
 int PT_DECLSPEC sndDevicesGetPlaybackDeviceAvialblility(PT_HANDLE*, BOOL*);
+int PT_DECLSPEC sndDevicesGetVirtualDeviceIsDefault(PT_HANDLE*, BOOL*);
+int PT_DECLSPEC sndDevicesGetChannelProbeIsDue(PT_HANDLE*, BOOL*);
 
 /* sndDevicesSet.cpp */
 int PT_DECLSPEC sndDevicesSetDeviceType(PT_HANDLE *, int, wchar_t *, int *);
@@ -499,6 +664,8 @@ int PT_DECLSPEC sndDevicesRequestTargetedPlaybackDevice(PT_HANDLE *, wchar_t *, 
 int PT_DECLSPEC sndDevicesSetIconFileName(PT_HANDLE *, int, wchar_t *, int *);
 int PT_DECLSPEC sndDevicesSetDeviceName(PT_HANDLE *, int, wchar_t *, int *);
 int PT_DECLSPEC sndDevicesSetDefaultDeviceSelectionMode(PT_HANDLE *, int);
+int PT_DECLSPEC sndDevicesSetVirtualDefaultGuard(PT_HANDLE *, BOOL);
+int PT_DECLSPEC sndDevicesSetDrivenOutputs(PT_HANDLE *, const std::vector<std::wstring> &);
 int PT_DECLSPEC sndDevicesSetDeviceEnabledStatus(PT_HANDLE *, int, BOOL, int *);
 int PT_DECLSPEC sndDevicesSetDeviceEnabledStatusFromGuid(PT_HANDLE *, wchar_t *, BOOL, int *);
 int PT_DECLSPEC sndDevicesSetDfxDeviceSampleRateAndChannels(PT_HANDLE *, int, int, int *);
@@ -515,8 +682,9 @@ int PT_DECLSPEC sndDevicesFinalSetupPlaybackDevice(PT_HANDLE *, int *);
 int PT_DECLSPEC sndDevicesRestoreDefaultDevice(PT_HANDLE *, int *);
 
 /* sndDevicesDoCapture.cpp */
-int PT_DECLSPEC sndDevicesDoCapture(PT_HANDLE *, float **, int *, WAVEFORMATEX **, int *);
+int PT_DECLSPEC sndDevicesDoCapture(PT_HANDLE *, float **, int *, WAVEFORMATEX **, int *, HANDLE);
 int PT_DECLSPEC sndDevicesStartStopCapture(PT_HANDLE *, int);
+int PT_DECLSPEC sndDevicesReleaseTimerPeriod(PT_HANDLE *);
 
 /* sndDevicesDoPlayback.cpp */
 int PT_DECLSPEC sndDevicesDoPlayback(PT_HANDLE *, int *);
@@ -524,5 +692,8 @@ int PT_DECLSPEC sndDevicesDoPlayback(PT_HANDLE *, int *);
 /* sndDevicesReg.cpp */
 int sndDevicesWriteToRegistry(PT_HANDLE *, int, wchar_t *, wchar_t *);
 int sndDeviceReadFromRegistry(PT_HANDLE *, int, wchar_t *, wchar_t *);
+void sndDevicesStoreHandedBackRecord(PT_HANDLE *);
+void sndDevicesLoadHandedBackRecord(PT_HANDLE *);
+void sndDevicesClearHandedBackRecord(PT_HANDLE *);
 
 #endif //_SND_DEVICES_H_
