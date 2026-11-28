@@ -261,13 +261,21 @@ HRESULT STDMETHODCALLTYPE CsndDevicesAudioEndpointVolumeCallbackPlayback::OnNoti
 		// BetterFxSound: a few seconds after the engine set the device to 100%, a change away from it is the device's own
 		// (a Bluetooth headset sending its stored absolute volume once connected), not the user's: 100% is asked for again.
 		// It used to be recorded as the user's setting after 3 s, and the carrier then played at that level on top of the
-		// app's gain.
+		// app's gain. BetterFxSound: also while a take-over is under way (playbackTakeOversPending).
 		const DWORD tookOverTick = cast_handle->engineTookOverPlaybackTick.load();
-		if( (tookOverTick != 0) && ((GetTickCount() - tookOverTick) < 5000) && !atFullVolume && !cast_handle->playbackLevelIsUsers.load() )
+		const bool takeOverPending = (cast_handle->playbackTakeOversPending.load() > 0);
+		if( (takeOverPending || ((tookOverTick != 0) && ((GetTickCount() - tookOverTick) < 5000))) && !atFullVolume && !cast_handle->playbackLevelIsUsers.load() )
 		{
 			cast_handle->playbackFullVolumeReassert = TRUE;
 			return S_OK;
 		}
+
+		// BetterFxSound: 100% and unmuted while the engine holds the device there (or is about to) and the user has not set a
+		// level of their own is the engine's own setting (a driver's late echo of it, past the echo guards above), not the
+		// user's: it was recorded as the device's own level, which was then put back at the hand-back, leaving the device at
+		// 100%. The same policy as the additional outputs.
+		if( (takeOverPending || (tookOverTick != 0)) && atFullVolume && !cast_handle->playbackLevelIsUsers.load() )
+			return S_OK;
 
 		cast_handle->savedPlaybackMute = pNotify->bMuted;
 		cast_handle->savedPlaybackLevel = pNotify->fMasterVolume;

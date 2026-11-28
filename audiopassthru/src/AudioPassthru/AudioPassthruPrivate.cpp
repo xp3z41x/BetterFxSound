@@ -566,6 +566,19 @@ int AudioPassthruPrivate::processTimer()
 		/* BetterFxSound: a device notification from here on wakes the engine if this reinit parks it */
 		const LONG change_count_before_reinit = s_device_change_count_.load();
 
+		/*
+		* BetterFxSound: the reinit registers the carrier's volume callback, and applyAdditionalOutputs() below sets the
+		* carrier to 100% only later: a level the device sends in between (a Bluetooth device's stored absolute volume) is
+		* not the user's (sndDevicesHdlType::playbackTakeOversPending), until the end of this block.
+		*/
+		struct TakeOverPending
+		{
+			explicit TakeOverPending(std::atomic<LONG>& count) : count_(count) { count_++; }
+			~TakeOverPending() { count_--; }
+			std::atomic<LONG>& count_;
+		};
+		TakeOverPending take_over_pending(s_sndDevices_.playbackTakeOversPending);
+
 		/* Reinit the sndDevices module */
 		if (sndDevicesReInit(hp_sndDevices_, SND_DEVICES_INIT_FOR_PROCESSING, &numRealDevices, &DfxDeviceEnabledFlag, &statusFlag) != OKAY)
 			return(NOT_OKAY);
@@ -1411,6 +1424,11 @@ void AudioPassthruPrivate::applyAdditionalOutputs()
 				carrier_enabled_.store(true, std::memory_order_release);
 			}
 		}
+
+		/* BetterFxSound: from the decision on, a level the device sends is not the user's, until 100% is set (below) and the
+		   take-over window takes over (sndDevicesHdlType::playbackTakeOversPending) */
+		if (!set_full_volume_id.empty() && !carrier_keeps_users_level)
+			s_sndDevices_.playbackTakeOversPending++;
 	}
 
 	/*
@@ -1436,6 +1454,12 @@ void AudioPassthruPrivate::applyAdditionalOutputs()
 				s_sndDevices_.engineTookOverPlaybackTick = took_over_tick;
 				carrier_reasserts_ = 0;
 			}
+			else
+			{
+				/* BetterFxSound: the device is not held at 100% */
+				s_sndDevices_.engineTookOverPlaybackTick = 0;
+			}
+			s_sndDevices_.playbackTakeOversPending--;
 		}
 
 		{

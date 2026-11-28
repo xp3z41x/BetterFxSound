@@ -535,6 +535,12 @@ struct sndDevicesHdlType {
 	// 100% again (playbackFullVolumeReassert, applied by AudioPassthruPrivate::processTimer()).
 	std::atomic<DWORD> engineTookOverPlaybackTick;
 	std::atomic<BOOL> playbackFullVolumeReassert;
+	// BetterFxSound: a take-over of the carrier's device is under way (from before the reinit that registers the volume
+	// callback, or from when applyAdditionalOutputs() decides on it, until it set 100% or gave up): the callback treats a
+	// change then as it does within engineTookOverPlaybackTick's window. Only set from then on, a level the device sent in
+	// between (a Bluetooth device's stored absolute volume) was taken for the user's (playbackLevelIsUsers), and the
+	// carrier was never set to 100%. A count: applyAdditionalOutputs() may run on another thread during a reinit.
+	std::atomic<LONG> playbackTakeOversPending;
 	// BetterFxSound: the user changed the carrier's own level or mute while the engine held it at 100%: the device keeps
 	// that setting (it is also the owed one) and a reinit does not set it to 100% again, until the engine hands the
 	// device back (sndDevices_RestoreSavedPlaybackDeviceSettings()). The same policy as the additional outputs.

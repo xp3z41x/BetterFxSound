@@ -133,6 +133,7 @@ int PT_DECLSPEC sndDevicesInit(PT_HANDLE *hp_sndDevices, CSlout *hp_slout, int i
 	cast_handle->engineSetPlaybackPrevTick = 0;
 	cast_handle->engineTookOverPlaybackTick = 0;
 	cast_handle->playbackFullVolumeReassert = FALSE;
+	cast_handle->playbackTakeOversPending = 0;
 	cast_handle->playbackLevelIsUsers = FALSE;
 
 	for(i=0; i<SND_DEVICES_MAX_NUM_DEVICES; i++)

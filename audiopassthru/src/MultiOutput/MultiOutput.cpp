@@ -353,63 +353,93 @@ namespace
 	}
 
 	// BetterFxSound: counts the take-overs of each device (an additional output's or the carrier's), so a hand-back that
-	// ran at the same time as a newer take-over of the same device can tell (restoreOwedVolume()). Kept for the process's
-	// lifetime: one entry per device ever taken over. Under owedVolumeMutex().
-	std::vector<std::pair<std::wstring, unsigned>>& volumeGenerationsLocked()
+	// ran at the same time as a newer take-over of the same device can tell (restoreOwedVolume()), and the take-overs of
+	// it running now (between owedVolumeBeginTakeOver() and owedVolumeEndTakeOver()). Kept for the process's lifetime:
+	// one entry per device ever taken over. Under owedVolumeMutex().
+	struct VolumeGeneration
 	{
-		static std::vector<std::pair<std::wstring, unsigned>> generations;
+		std::wstring device_id;
+		unsigned generation;
+		unsigned running;	// Take-overs of the device running now
+	};
+
+	std::vector<VolumeGeneration>& volumeGenerationsLocked()
+	{
+		static std::vector<VolumeGeneration> generations;
 		return generations;
+	}
+
+	// Caller holds owedVolumeMutex(). Null if the device was never taken over.
+	VolumeGeneration* findVolumeGenerationLocked(const std::wstring& device_id)
+	{
+		for (auto& entry : volumeGenerationsLocked())
+		{
+			if (entry.device_id == device_id)
+				return &entry;
+		}
+		return nullptr;
+	}
+
+	// Caller holds owedVolumeMutex().
+	VolumeGeneration& volumeGenerationEntryLocked(const std::wstring& device_id)
+	{
+		VolumeGeneration* entry = findVolumeGenerationLocked(device_id);
+		if (entry != nullptr)
+			return *entry;
+		VolumeGeneration added;
+		added.device_id = device_id;
+		added.generation = 0;
+		added.running = 0;
+		volumeGenerationsLocked().push_back(added);
+		return volumeGenerationsLocked().back();
 	}
 
 	// Caller holds owedVolumeMutex().
 	unsigned volumeGenerationLocked(const std::wstring& device_id)
 	{
-		for (const auto& entry : volumeGenerationsLocked())
-		{
-			if (entry.first == device_id)
-				return entry.second;
-		}
-		return 0;
+		const VolumeGeneration* entry = findVolumeGenerationLocked(device_id);
+		return (entry != nullptr) ? entry->generation : 0;
 	}
 
-	// Caller holds owedVolumeMutex().
-	void bumpVolumeGenerationLocked(const std::wstring& device_id)
-	{
-		for (auto& entry : volumeGenerationsLocked())
-		{
-			if (entry.first == device_id)
-			{
-				entry.second++;
-				return;
-			}
-		}
-		volumeGenerationsLocked().push_back(std::make_pair(device_id, 1u));
-	}
-
-	// BetterFxSound: a take-over's step on the record, in one step under owedVolumeMutex(): the device's generation moves
-	// on, and the setting owed to it is returned in *level and *mute, or, if none is owed and have_setting, *level and
-	// *mute are recorded as owed. False if nothing is owed then. A take-over does it before it sets 100% and again after:
-	// a hand-back that overlapped it then either sees the newer generation (and leaves the device at 100%, still owed),
-	// or erased the record before the second step, which writes it again. The generation used to be read, the record
-	// put back and erased in separate steps, so a take-over that ran between them, or that was already running when the
-	// hand-back started, ended with the device at 100% and nothing owed: the user's level was lost.
-	bool owedVolumeClaim(const std::wstring& device_id, bool have_setting, float* level, BOOL* mute)
+	// BetterFxSound: a take-over of the device starts (an additional output's or the carrier's), before it reads the
+	// device's own setting and sets 100%: the device's generation moves on and the take-over counts as running until
+	// owedVolumeEndTakeOver(), which every call is paired with. The setting owed to the device is returned in *level and
+	// *mute (false if none). While a take-over runs, no hand-back erases the record (owedVolumeEraseIfGeneration()): the
+	// hand-back sets 100% again instead and the device stays owed. The record used to be claimed before and after 100%
+	// was set with nothing in between: a hand-back that read the record after the first claim put the device's own level
+	// back after the take-over set 100%, and erased the record before the second claim wrote it again. The new owner then
+	// believed the device was at 100% while it played at its own level, and nothing corrected it.
+	bool owedVolumeBeginTakeOver(const std::wstring& device_id, float* level, BOOL* mute)
 	{
 		if (device_id.empty())
 			return false;
 		std::lock_guard<std::mutex> lock(owedVolumeMutex());
-		bumpVolumeGenerationLocked(device_id);
+		VolumeGeneration& entry = volumeGenerationEntryLocked(device_id);
+		entry.generation++;
+		entry.running++;
 		OwedSetting setting;
-		if (owedVolumeReadLocked(device_id, &setting))
-		{
-			*level = setting.level;
-			*mute = setting.mute ? TRUE : FALSE;
-			return true;
-		}
-		if (!have_setting)
+		if (!owedVolumeReadLocked(device_id, &setting))
 			return false;
-		owedVolumeWriteLocked(device_id, *level, *mute);
+		*level = setting.level;
+		*mute = setting.mute ? TRUE : FALSE;
 		return true;
+	}
+
+	// BetterFxSound: the take-over started by owedVolumeBeginTakeOver() is done: the generation moves on again (a
+	// hand-back that read the record while it ran keeps it), and, if record, level and mute are recorded as owed unless
+	// a setting is owed already (it was erased meanwhile by a hand-back that does not count the take-overs).
+	void owedVolumeEndTakeOver(const std::wstring& device_id, bool record, float level, BOOL mute)
+	{
+		if (device_id.empty())
+			return;
+		std::lock_guard<std::mutex> lock(owedVolumeMutex());
+		VolumeGeneration& entry = volumeGenerationEntryLocked(device_id);
+		entry.generation++;
+		if (entry.running > 0)
+			entry.running--;
+		OwedSetting setting;
+		if (record && !owedVolumeReadLocked(device_id, &setting))
+			owedVolumeWriteLocked(device_id, level, mute);
 	}
 
 	// BetterFxSound: the setting owed to the device (false if none) and the device's take-over generation, read together.
@@ -426,13 +456,14 @@ namespace
 	}
 
 	// BetterFxSound: erases the record only if no take-over of the device ran since generation was read
-	// (owedVolumeSnapshot()), in one step. False if one did: the record is kept.
+	// (owedVolumeSnapshot()) and none is running now, in one step. False otherwise: the record is kept.
 	bool owedVolumeEraseIfGeneration(const std::wstring& device_id, unsigned generation)
 	{
 		if (device_id.empty())
 			return false;
 		std::lock_guard<std::mutex> lock(owedVolumeMutex());
-		if (volumeGenerationLocked(device_id) != generation)
+		const VolumeGeneration* entry = findVolumeGenerationLocked(device_id);
+		if ((entry != nullptr) && ((entry->generation != generation) || (entry->running > 0)))
 			return false;
 		RegDeleteKeyValueW(HKEY_CURRENT_USER, kOwedVolumeKey, device_id.c_str());
 		return true;
@@ -503,8 +534,8 @@ namespace
 {
 	// BetterFxSound: puts the setting owed to the device back on it and forgets it (true when nothing is owed any more).
 	// If the device or its volume control is not available, it stays owed (false). device may be null, then it is looked
-	// up by its ID. A take-over of the same device that ran meanwhile (an output enabled again, the device made the
-	// carrier: owedVolumeClaim()) wins: the device is set to 100% again and stays owed (false). A hand-back that
+	// up by its ID. A take-over of the same device that ran meanwhile or still runs (an output enabled again, the device
+	// made the carrier: owedVolumeBeginTakeOver()) wins: the device is set to 100% again and stays owed (false). A hand-back that
 	// was slow in a driver call used to undo it, and erase the record the newer owner relied on. The record is erased
 	// only if the generation read with it has not moved, in one step (owedVolumeEraseIfGeneration()).
 	bool restoreOwedVolume(const std::wstring& device_id, IMMDevice* device)
@@ -1332,8 +1363,11 @@ private:
 	// also the carrier for a moment (right after a reinit made it the carrier), the carrier's callback recorded our 100%
 	// as the user's own level. A take-over whose 100% could not be set (the endpoint not ready yet after a connect or a
 	// resume) was marked done all the same and never tried again: it is tried again from the engine's timer
-	// (serviceVolume()), kFullVolumeAttempts times at most. The record is claimed before and after 100% is set
-	// (owedVolumeClaim()), so a hand-back of the device that overlaps it never leaves it at 100% with nothing owed.
+	// (serviceVolume()), kFullVolumeAttempts times at most. The take-over counts as running from before the device's own
+	// setting is read until after 100% is set (owedVolumeBeginTakeOver()), so a hand-back of the device that overlaps it
+	// never leaves it at its own level or with nothing owed. The setting is read only once the take-over started: a
+	// hand-back that finished just before has put the device's own level back by then (it was read first, so our 100%
+	// could be recorded as the device's own).
 	void takeOverVolumeLocked(IMMDevice* device)
 	{
 		bool forced = false;
@@ -1342,15 +1376,24 @@ private:
 		{
 			float level = 1.0f;
 			BOOL mute = FALSE;
-			const bool read = SUCCEEDED(volume->GetMasterVolumeLevelScalar(&level)) && SUCCEEDED(volume->GetMute(&mute));
-			if (!owedVolumeClaim(device_id_, read, &level, &mute))
-				return false;
+			if (!owedVolumeBeginTakeOver(device_id_, &level, &mute))
+			{
+				if (!(SUCCEEDED(volume->GetMasterVolumeLevelScalar(&level)) && SUCCEEDED(volume->GetMute(&mute))))
+				{
+					owedVolumeEndTakeOver(device_id_, false, level, mute);
+					return false;
+				}
+				owedVolumeRecord(device_id_, level, mute);
+			}
 			volume_taken_ = true;
 			if (user_level_)
+			{
+				owedVolumeEndTakeOver(device_id_, false, level, mute);
 				return true;
+			}
 			forced = true;
 			full_volume_set = setFullVolume(volume, &kEngineVolumeEventContext);
-			owedVolumeClaim(device_id_, true, &level, &mute);
+			owedVolumeEndTakeOver(device_id_, true, level, mute);
 			return true;
 		};
 
@@ -1936,16 +1979,15 @@ private:
 bool setDeviceFullVolumeById(const std::wstring& device_id, const GUID* event_context)
 {
 	// BetterFxSound: a take-over (the carrier's): a hand-back of the device running at the same time leaves it at 100%. The
-	// record (written by the caller) is claimed before and after 100% is set, see owedVolumeClaim().
+	// record (written by the caller) is kept while 100% is set, see owedVolumeBeginTakeOver().
 	float level = 1.0f;
 	BOOL mute = FALSE;
-	const bool owed = owedVolumeClaim(device_id, false, &level, &mute);
+	const bool owed = owedVolumeBeginTakeOver(device_id, &level, &mute);
 	const bool result = withEndpointVolumeById(device_id, [event_context](IAudioEndpointVolume* volume) -> bool
 	{
 		return setFullVolume(volume, event_context);
 	});
-	if (owed)
-		owedVolumeClaim(device_id, true, &level, &mute);
+	owedVolumeEndTakeOver(device_id, owed, level, mute);
 	return result;
 }
 
